@@ -20,21 +20,27 @@ class PortfolioUpdate(BaseModel):
 
 class HoldingBase(BaseModel):
     ticker: str
-    allocation_pct: float = Field(..., gt=0, le=100)
+    allocation_pct: float = Field(..., ge=0, le=100)
 
 
 class HoldingCreate(HoldingBase):
-    pass
+    allocation_pct: float = Field(default=0, ge=0, le=100)  # Optional, defaults to 0%
+    investment_date: Optional[datetime] = None  # Optional: when user started tracking
+    investment_price: Optional[float] = None  # Optional: price at investment date
 
 
 class HoldingUpdate(BaseModel):
-    allocation_pct: float = Field(..., gt=0, le=100)
+    allocation_pct: Optional[float] = Field(None, ge=0, le=100)
+    investment_date: Optional[datetime] = None
+    investment_price: Optional[float] = None
 
 
 class HoldingResponse(HoldingBase):
     id: int
     portfolio_id: int
     added_at: datetime
+    investment_date: Optional[datetime] = None
+    investment_price: Optional[float] = None
 
     class Config:
         from_attributes = True
@@ -46,6 +52,8 @@ class HoldingWithData(HoldingResponse):
     ytd_return: Optional[float] = None
     sma_200: Optional[float] = None
     price_vs_sma: Optional[float] = None  # Percentage above/below SMA
+    gain_loss: Optional[float] = None  # Gain/loss since investment_date in dollars
+    gain_loss_pct: Optional[float] = None  # Gain/loss since investment_date in %
 
 
 class PortfolioResponse(PortfolioBase):

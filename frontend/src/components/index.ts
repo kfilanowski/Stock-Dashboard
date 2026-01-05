@@ -7,5 +7,7 @@ export { StockDetailModal } from './StockDetailModal';
 export { ChartPeriodSelector } from './ChartPeriodSelector';
 export { LoadingValue, LoadingSpinner } from './LoadingValue';
 export { RefreshTimer } from './RefreshTimer';
+export { SortSelector } from './SortSelector';
 export type { ChartPeriod } from './ChartPeriodSelector';
+export type { SortField, SortDirection, SortOption } from './SortSelector';
 

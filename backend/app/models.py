@@ -24,6 +24,8 @@ class Holding(Base):
     ticker = Column(String, nullable=False)
     allocation_pct = Column(Float, nullable=False)  # Percentage of portfolio (e.g., 5.0 for 5%)
     added_at = Column(DateTime, default=datetime.utcnow)
+    investment_date = Column(DateTime, nullable=True)  # When user started tracking this stock
+    investment_price = Column(Float, nullable=True)  # Stock price at investment_date for gain/loss calc
 
     portfolio = relationship("Portfolio", back_populates="holdings")
 

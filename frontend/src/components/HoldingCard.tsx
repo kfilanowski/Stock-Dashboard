@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react';
-import { TrendingUp, TrendingDown, Trash2, BarChart3, Edit2, Check, X, RefreshCw } from 'lucide-react';
+import { TrendingUp, TrendingDown, Trash2, BarChart3, Edit2, Check, X, RefreshCw, Calendar, DollarSign } from 'lucide-react';
 import { LineChart, Line, ResponsiveContainer, Tooltip, ReferenceLine, YAxis, ReferenceArea } from 'recharts';
 import type { Holding, HistoryPoint } from '../types';
 
@@ -32,7 +32,9 @@ interface HoldingCardProps {
   onDelete: (id: number) => void;
   onSelect: (ticker: string) => void;
   onUpdateAllocation: (id: number, allocation: number) => Promise<void>;
+  onUpdateInvestment: (id: number, data: { investment_date?: string; investment_price?: number }) => Promise<void>;
   currentTotalAllocation: number;
+  portfolioTotalValue: number;
   isRefreshing?: boolean;
   isHistoryLoading?: boolean;
 }
@@ -55,14 +57,28 @@ export function HoldingCard({
   onDelete, 
   onSelect, 
   onUpdateAllocation,
+  onUpdateInvestment,
   currentTotalAllocation,
+  portfolioTotalValue,
   isRefreshing = false,
   isHistoryLoading = false
 }: HoldingCardProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [newAllocation, setNewAllocation] = useState(holding.allocation_pct.toString());
+  const [newAmount, setNewAmount] = useState('');
+  const [activeInput, setActiveInput] = useState<'percent' | 'amount' | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  
+  // Investment date/price editing
+  const [isEditingInvestment, setIsEditingInvestment] = useState(false);
+  const [investmentDate, setInvestmentDate] = useState(
+    holding.investment_date ? holding.investment_date.split('T')[0] : ''
+  );
+  const [investmentPrice, setInvestmentPrice] = useState(
+    holding.investment_price?.toString() ?? ''
+  );
+  const [savingInvestment, setSavingInvestment] = useState(false);
 
   const isPositive = (holding.ytd_return ?? 0) >= 0;
   const priceVsSMA = holding.price_vs_sma ?? 0;
@@ -139,6 +155,36 @@ export function HoldingCard({
   }, [history]);
 
   const maxAllocation = 100 - currentTotalAllocation + holding.allocation_pct;
+  const maxAmount = portfolioTotalValue * (maxAllocation / 100);
+
+  // Sync allocation and amount when editing
+  const handleAllocationChange = (value: string) => {
+    setActiveInput('percent');
+    setNewAllocation(value);
+    if (value !== '' && portfolioTotalValue > 0) {
+      const pct = parseFloat(value);
+      if (!isNaN(pct)) {
+        const calculatedAmount = (pct / 100) * portfolioTotalValue;
+        setNewAmount(calculatedAmount.toFixed(2));
+      }
+    } else {
+      setNewAmount('');
+    }
+  };
+
+  const handleAmountChange = (value: string) => {
+    setActiveInput('amount');
+    setNewAmount(value);
+    if (value !== '' && portfolioTotalValue > 0) {
+      const amt = parseFloat(value);
+      if (!isNaN(amt)) {
+        const calculatedPct = (amt / portfolioTotalValue) * 100;
+        setNewAllocation(calculatedPct.toFixed(2));
+      }
+    } else {
+      setNewAllocation('');
+    }
+  };
 
   // Convert 24-hour time (HH:MM) to 12-hour format
   const formatTime12Hour = (time24: string): string => {
@@ -187,10 +233,10 @@ export function HoldingCard({
 
   const handleSave = async () => {
     setError('');
-    const value = parseFloat(newAllocation);
+    const value = parseFloat(newAllocation) || 0;
     
-    if (isNaN(value) || value <= 0) {
-      setError('Invalid allocation');
+    if (value < 0) {
+      setError('Cannot be negative');
       return;
     }
     
@@ -203,6 +249,7 @@ export function HoldingCard({
     try {
       await onUpdateAllocation(holding.id, value);
       setIsEditing(false);
+      setActiveInput(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update');
     } finally {
@@ -212,8 +259,59 @@ export function HoldingCard({
 
   const handleCancel = () => {
     setNewAllocation(holding.allocation_pct.toString());
+    setNewAmount(((holding.allocation_pct / 100) * portfolioTotalValue).toFixed(2));
+    setActiveInput(null);
     setError('');
     setIsEditing(false);
+  };
+
+  // Initialize amount when starting to edit
+  const handleStartEditing = () => {
+    setNewAllocation(holding.allocation_pct.toString());
+    setNewAmount(((holding.allocation_pct / 100) * portfolioTotalValue).toFixed(2));
+    setActiveInput(null);
+    setIsEditing(true);
+  };
+
+  const handleSaveInvestment = async () => {
+    setSavingInvestment(true);
+    try {
+      const data: { investment_date?: string; investment_price?: number } = {};
+      
+      if (investmentDate) {
+        data.investment_date = new Date(investmentDate).toISOString();
+      }
+      if (investmentPrice) {
+        const price = parseFloat(investmentPrice);
+        if (!isNaN(price) && price > 0) {
+          data.investment_price = price;
+        }
+      }
+      
+      await onUpdateInvestment(holding.id, data);
+      setIsEditingInvestment(false);
+    } catch (err) {
+      console.error('Failed to save investment info:', err);
+    } finally {
+      setSavingInvestment(false);
+    }
+  };
+
+  const handleCancelInvestment = () => {
+    setInvestmentDate(holding.investment_date ? holding.investment_date.split('T')[0] : '');
+    setInvestmentPrice(holding.investment_price?.toString() ?? '');
+    setIsEditingInvestment(false);
+  };
+
+  // Format investment date for display
+  const formatInvestmentDate = (dateStr: string | null | undefined): string => {
+    if (!dateStr) return '';
+    try {
+      const date = new Date(dateStr);
+      return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    } catch {
+      return '';
+    }
   };
 
   // Custom tooltip with percentage gain
@@ -251,37 +349,57 @@ export function HoldingCard({
               {isRefreshing && <RefreshCw className="w-3 h-3 text-accent-cyan/60 animate-spin" />}
             </div>
             {isEditing ? (
-              <div className="flex items-center gap-1">
-                <input
-                  type="number"
-                  value={newAllocation}
-                  onChange={(e) => setNewAllocation(e.target.value)}
-                  className="w-16 px-2 py-0.5 text-sm bg-white/10 border border-white/20 rounded"
-                  min="0.1"
-                  max={maxAllocation}
-                  step="0.1"
-                  autoFocus
-                />
-                <span className="text-white/50 text-sm">%</span>
-                <button
-                  onClick={handleSave}
-                  disabled={saving}
-                  className="p-1 rounded bg-green-500/20 hover:bg-green-500/30 text-green-400"
-                >
-                  <Check className="w-3 h-3" />
-                </button>
-                <button
-                  onClick={handleCancel}
-                  className="p-1 rounded bg-white/10 hover:bg-white/20 text-white/70"
-                >
-                  <X className="w-3 h-3" />
-                </button>
+              <div className="flex flex-col gap-1.5 mt-1">
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="number"
+                    value={newAllocation}
+                    onChange={(e) => handleAllocationChange(e.target.value)}
+                    className="w-32 px-2 py-1 text-sm bg-white/10 border border-white/20 rounded focus:border-accent-cyan/50 focus:outline-none"
+                    min="0"
+                    max={maxAllocation}
+                    step="0.1"
+                    placeholder="0"
+                    autoFocus={activeInput !== 'amount'}
+                  />
+                  <span className="text-white/50 text-xs">%</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-white/50 text-xs">$</span>
+                  <input
+                    type="number"
+                    value={newAmount}
+                    onChange={(e) => handleAmountChange(e.target.value)}
+                    className="w-36 px-2 py-1 text-sm bg-white/10 border border-white/20 rounded focus:border-accent-cyan/50 focus:outline-none"
+                    min="0"
+                    max={maxAmount}
+                    step="0.01"
+                    placeholder="0.00"
+                    autoFocus={activeInput === 'amount'}
+                  />
+                </div>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={handleSave}
+                    disabled={saving}
+                    className="px-2 py-1 rounded bg-green-500/20 hover:bg-green-500/30 text-green-400 text-xs flex items-center gap-1"
+                  >
+                    <Check className="w-3 h-3" />
+                    Save
+                  </button>
+                  <button
+                    onClick={handleCancel}
+                    className="px-2 py-1 rounded bg-white/10 hover:bg-white/20 text-white/70 text-xs"
+                  >
+                    Cancel
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="flex items-center gap-2">
                 <p className="text-white/50 text-sm">{holding.allocation_pct}% allocation</p>
                 <button
-                  onClick={() => setIsEditing(true)}
+                  onClick={handleStartEditing}
                   className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white/70 transition-colors"
                   title="Edit allocation"
                 >
@@ -361,6 +479,95 @@ export function HoldingCard({
             <p className="text-white/50 font-semibold">—</p>
           )}
         </div>
+      </div>
+
+      {/* Investment Info Section */}
+      <div className="mb-3 p-2.5 rounded-lg bg-white/[0.03] border border-white/5">
+        {isEditingInvestment ? (
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Calendar className="w-3.5 h-3.5 text-white/40" />
+              <input
+                type="date"
+                value={investmentDate}
+                onChange={(e) => setInvestmentDate(e.target.value)}
+                className="flex-1 px-2 py-1 text-xs bg-white/5 border border-white/20 rounded text-white focus:border-accent-cyan/50 focus:outline-none"
+                max={new Date().toISOString().split('T')[0]}
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <DollarSign className="w-3.5 h-3.5 text-white/40" />
+              <input
+                type="number"
+                value={investmentPrice}
+                onChange={(e) => setInvestmentPrice(e.target.value)}
+                placeholder="Price at investment"
+                className="flex-1 px-2 py-1 text-xs bg-white/5 border border-white/20 rounded text-white focus:border-accent-cyan/50 focus:outline-none"
+                min="0.01"
+                step="0.01"
+              />
+              {holding.current_price && (
+                <button
+                  type="button"
+                  onClick={() => setInvestmentPrice(holding.current_price!.toFixed(2))}
+                  className="px-1.5 py-1 text-[10px] rounded bg-white/5 hover:bg-white/10 text-white/50 hover:text-white/70 whitespace-nowrap"
+                  title="Use current price"
+                >
+                  Use ${holding.current_price.toFixed(2)}
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-2 justify-end">
+              <button
+                onClick={handleSaveInvestment}
+                disabled={savingInvestment}
+                className="px-2 py-1 text-xs rounded bg-accent-cyan/20 hover:bg-accent-cyan/30 text-accent-cyan flex items-center gap-1"
+              >
+                <Check className="w-3 h-3" />
+                Save
+              </button>
+              <button
+                onClick={handleCancelInvestment}
+                className="px-2 py-1 text-xs rounded bg-white/5 hover:bg-white/10 text-white/60"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3 text-xs">
+              {holding.investment_date ? (
+                <>
+                  <span className="text-white/40 flex items-center gap-1">
+                    <Calendar className="w-3 h-3" />
+                    {formatInvestmentDate(holding.investment_date)}
+                  </span>
+                  {holding.investment_price && (
+                    <span className="text-white/40 flex items-center gap-1">
+                      <DollarSign className="w-3 h-3" />
+                      ${holding.investment_price.toFixed(2)}
+                    </span>
+                  )}
+                  {holding.gain_loss_pct !== null && holding.gain_loss_pct !== undefined && (
+                    <span className={`font-medium ${holding.gain_loss_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {holding.gain_loss_pct >= 0 ? '+' : ''}{holding.gain_loss_pct.toFixed(1)}%
+                    </span>
+                  )}
+                </>
+              ) : (
+                <span className="text-white/30 italic">No investment date set</span>
+              )}
+            </div>
+            <button
+              onClick={() => setIsEditingInvestment(true)}
+              className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white/70 transition-colors"
+              title="Edit investment info"
+            >
+              <Edit2 className="w-3 h-3" />
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Mini Chart with Reference Line */}

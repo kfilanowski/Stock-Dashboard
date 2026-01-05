@@ -802,16 +802,6 @@ def _get_stock_history_sync(ticker: str, period: str = "1y") -> dict:
     
     # Get stored history from database
     stored_history = _get_stored_history(ticker, start_str, end_str)
-    stored_dates = {h['date'] for h in stored_history}
-    
-    # For very recent data (today, yesterday), always try to fetch fresh
-    today = datetime.now().strftime('%Y-%m-%d')
-    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    needs_fresh = today not in stored_dates or yesterday not in stored_dates
-    
-    # Check if we have enough data points
-    expected_trading_days = int(days * 5 / 7 * 0.8)  # 80% coverage
-    have_enough = len(stored_history) >= expected_trading_days
     
     def calculate_daily_reference(history_data):
         """Calculate reference close from the first day of the chart data."""
@@ -819,64 +809,136 @@ def _get_stock_history_sync(ticker: str, period: str = "1y") -> dict:
             sorted_history = sorted(history_data, key=lambda x: x['date'])
             first_date = sorted_history[0]['date']
             first_date_dt = datetime.strptime(first_date, '%Y-%m-%d')
-            # Get close from trading day before the chart starts
             return _get_reference_close(ticker, first_date_dt - timedelta(days=1))
         return None
     
-    if have_enough and not needs_fresh:
-        print(f"Using {len(stored_history)} stored daily records for {ticker}")
-        reference_close = calculate_daily_reference(stored_history)
-        completeness = check_data_completeness(stored_history, start_date, tolerance_days=10)
-        return {"history": stored_history, "reference_close": reference_close, **completeness}
+    def analyze_coverage(history_data, req_start: str, req_end: str):
+        """Analyze what data we have and what gaps need to be filled."""
+        if not history_data:
+            return {
+                "has_data": False,
+                "actual_start": None,
+                "actual_end": None,
+                "missing_start_range": (req_start, req_end),  # Need everything
+                "missing_end_range": None,
+            }
+        
+        sorted_data = sorted(history_data, key=lambda x: x['date'])
+        actual_start = sorted_data[0]['date']
+        actual_end = sorted_data[-1]['date']
+        
+        # Check gap at the beginning
+        start_gap_days = (datetime.strptime(actual_start, '%Y-%m-%d') - datetime.strptime(req_start, '%Y-%m-%d')).days
+        missing_start_range = None
+        if start_gap_days > 7:  # More than a week gap at start
+            # Fetch from requested start to just before our actual start
+            gap_end = (datetime.strptime(actual_start, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
+            missing_start_range = (req_start, gap_end)
+        
+        # Check gap at the end (need recent data)
+        end_gap_days = (datetime.strptime(req_end, '%Y-%m-%d') - datetime.strptime(actual_end, '%Y-%m-%d')).days
+        missing_end_range = None
+        if end_gap_days > 4:  # More than 4 days gap at end
+            # Fetch from day after our actual end to requested end
+            gap_start = (datetime.strptime(actual_end, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+            missing_end_range = (gap_start, req_end)
+        
+        return {
+            "has_data": True,
+            "actual_start": actual_start,
+            "actual_end": actual_end,
+            "missing_start_range": missing_start_range,
+            "missing_end_range": missing_end_range,
+        }
     
-    # Need to fetch from API
-    try:
-        # Only fetch the missing range if we have some data
-        if stored_history and len(stored_history) > expected_trading_days * 0.5:
-            fetch_start = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
-            print(f"Fetching recent daily data for {ticker} from {fetch_start}")
-        else:
-            fetch_start = start_str
-            print(f"Fetching full daily history for {ticker} from {fetch_start}")
-        
-        with _yfinance_lock:
-            hist = yf.download(
-                ticker,
-                start=fetch_start,
-                end=end_str,
-                progress=False,
-                auto_adjust=True,
-                timeout=10
-            )
-        
-        if not hist.empty:
-            new_history = _dataframe_to_history(hist)
-            # Store new data
-            _store_history(ticker, new_history)
-            
-            # Combine with stored data
-            all_history = {h['date']: h for h in stored_history}
-            for h in new_history:
-                all_history[h['date']] = h
-            
-            # Sort by date and return
-            result = sorted(all_history.values(), key=lambda x: x['date'])
-            # Filter to requested range
-            result = [h for h in result if start_str <= h['date'] <= end_str]
-            reference_close = calculate_daily_reference(result)
-            completeness = check_data_completeness(result, start_date, tolerance_days=10)
-            return {"history": result, "reference_close": reference_close, **completeness}
-        
+    coverage = analyze_coverage(stored_history, start_str, end_str)
+    
+    # If we have complete coverage, just return what we have
+    if coverage["has_data"] and not coverage["missing_start_range"] and not coverage["missing_end_range"]:
+        print(f"Using {len(stored_history)} stored daily records for {ticker} (complete coverage)")
         reference_close = calculate_daily_reference(stored_history)
-        completeness = check_data_completeness(stored_history, start_date, tolerance_days=10)
-        return {"history": stored_history, "reference_close": reference_close, **completeness}
+        return {
+            "history": stored_history, 
+            "reference_close": reference_close,
+            "is_complete": True,
+            "expected_start": start_str,
+            "actual_start": coverage["actual_start"]
+        }
+    
+    # Need to fetch missing data - only fetch the gaps, not data we already have
+    all_history = {h['date']: h for h in stored_history}
+    fetched_something = False
+    fetch_error = False
+    
+    try:
+        # Fetch missing start range (historical gap)
+        if coverage["missing_start_range"]:
+            gap_start, gap_end = coverage["missing_start_range"]
+            print(f"Fetching historical gap for {ticker} from {gap_start} to {gap_end}")
+            
+            with _yfinance_lock:
+                hist = yf.download(
+                    ticker,
+                    start=gap_start,
+                    end=gap_end,
+                    progress=False,
+                    auto_adjust=True,
+                    timeout=15
+                )
+            
+            if not hist.empty:
+                new_history = _dataframe_to_history(hist)
+                _store_history(ticker, new_history)
+                for h in new_history:
+                    all_history[h['date']] = h
+                fetched_something = True
         
+        # Fetch missing end range (recent data)
+        if coverage["missing_end_range"]:
+            gap_start, gap_end = coverage["missing_end_range"]
+            print(f"Fetching recent data for {ticker} from {gap_start} to {gap_end}")
+            
+            with _yfinance_lock:
+                hist = yf.download(
+                    ticker,
+                    start=gap_start,
+                    end=gap_end,
+                    progress=False,
+                    auto_adjust=True,
+                    timeout=15
+                )
+            
+            if not hist.empty:
+                new_history = _dataframe_to_history(hist)
+                _store_history(ticker, new_history)
+                for h in new_history:
+                    all_history[h['date']] = h
+                fetched_something = True
+                
     except Exception as e:
         print(f"Error fetching daily history for {ticker}: {e}")
-        history = stored_history if stored_history else []
-        reference_close = calculate_daily_reference(history)
-        completeness = check_data_completeness(history, start_date, tolerance_days=10)
-        return {"history": history, "reference_close": reference_close, **completeness}
+        fetch_error = True
+    
+    # Sort and filter to requested range
+    result = sorted(all_history.values(), key=lambda x: x['date'])
+    result = [h for h in result if start_str <= h['date'] <= end_str]
+    
+    reference_close = calculate_daily_reference(result)
+    result_start = result[0]['date'] if result else None
+    
+    # Determine completeness:
+    # - If we successfully fetched (or attempted to fetch) from yfinance, mark complete
+    #   (whatever yfinance returns IS all available data for this stock)
+    # - Only mark incomplete if there was an error, so we retry later
+    is_complete = not fetch_error
+    
+    return {
+        "history": result, 
+        "reference_close": reference_close,
+        "is_complete": is_complete,
+        "expected_start": start_str,
+        "actual_start": result_start
+    }
 
 
 async def get_stock_history(ticker: str, period: str = "1y") -> dict:

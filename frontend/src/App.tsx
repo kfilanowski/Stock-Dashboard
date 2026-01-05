@@ -1,119 +1,149 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Plus, Briefcase } from 'lucide-react';
 import { 
   Header, 
   PortfolioSummary, 
   HoldingCard, 
   AddHoldingModal, 
-  PortfolioSettings,
   StockDetailModal,
   ChartPeriodSelector,
-  RefreshTimer,
-  type ChartPeriod
+  SortSelector,
+  type ChartPeriod,
+  type SortOption
 } from './components';
-import { usePortfolio } from './hooks/usePortfolio';
-import type { HistoryPoint } from './types';
-import * as api from './services/api';
-
-interface HoldingChartData {
-  history: HistoryPoint[];
-  referenceClose: number | null;
-  isComplete: boolean;
-  expectedStart: string | null;
-  actualStart: string | null;
-}
-
-const REFRESH_INTERVAL = 10000; // 10 seconds
+import { usePortfolio, type HoldingChartData } from './hooks/usePortfolio';
 
 function App() {
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
+  const [holdingChartData, setHoldingChartData] = useState<Record<string, HoldingChartData>>({});
+  const [chartPeriod, setChartPeriod] = useState<ChartPeriod>('1d');
+  const [sortOption, setSortOption] = useState<SortOption>({ field: 'allocation', direction: 'desc' });
+
+  // Callback for when the portfolio hook fetches new history data
+  const handleHistoryUpdate = useCallback((ticker: string, data: HoldingChartData) => {
+    setHoldingChartData(prev => ({
+      ...prev,
+      [ticker]: data
+    }));
+  }, []);
+
   const { 
     portfolio, 
     loading, 
-    refreshing,
-    error, 
+    error,
     lastFetched,
     refresh, 
     updatePortfolioValue, 
     addHolding, 
     removeHolding,
     updateHolding 
-  } = usePortfolio(REFRESH_INTERVAL);
-
-  const [showAddModal, setShowAddModal] = useState(false);
-  const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
-  const [holdingChartData, setHoldingChartData] = useState<Record<string, HoldingChartData>>({});
-  const [chartPeriod, setChartPeriod] = useState<ChartPeriod>('1d');
-  const [loadingHistories, setLoadingHistories] = useState(false);
+  } = usePortfolio({
+    chartPeriod,
+    onHistoryUpdate: handleHistoryUpdate
+  });
   
-  // Track tickers to only refetch when tickers actually change
+  // Track tickers to detect changes
   const tickersKey = useMemo(() => {
     return portfolio?.holdings.map(h => h.ticker).sort().join(',') ?? '';
   }, [portfolio?.holdings]);
   
-  const prevTickersRef = useRef(tickersKey);
   const prevPeriodRef = useRef(chartPeriod);
 
-  // Fetch histories only when period or tickers change (not on every portfolio refresh)
+  // Reset chart data when period changes
   useEffect(() => {
-    const tickersChanged = prevTickersRef.current !== tickersKey;
-    const periodChanged = prevPeriodRef.current !== chartPeriod;
-    
-    prevTickersRef.current = tickersKey;
-    prevPeriodRef.current = chartPeriod;
-    
-    // Only fetch if period or tickers changed
-    if (!tickersChanged && !periodChanged && Object.keys(holdingChartData).length > 0) {
-      return;
-    }
-    
-    if (!portfolio?.holdings.length) {
+    if (prevPeriodRef.current !== chartPeriod) {
       setHoldingChartData({});
-      return;
+      prevPeriodRef.current = chartPeriod;
     }
+  }, [chartPeriod]);
 
-    const fetchHistories = async () => {
-      setLoadingHistories(true);
-      const chartData: Record<string, HoldingChartData> = {};
-      
-      await Promise.all(
-        portfolio.holdings.map(async (holding) => {
-          try {
-            const data = await api.getStockHistory(holding.ticker, chartPeriod);
-            chartData[holding.ticker] = {
-              history: data.history,
-              referenceClose: data.reference_close,
-              isComplete: data.is_complete,
-              expectedStart: data.expected_start,
-              actualStart: data.actual_start
-            };
-          } catch {
-            chartData[holding.ticker] = { 
-              history: [], 
-              referenceClose: null, 
-              isComplete: false,
-              expectedStart: null,
-              actualStart: null
-            };
-          }
-        })
-      );
-      
-      setHoldingChartData(chartData);
-      setLoadingHistories(false);
-    };
+  // Clean up chart data when tickers change (remove data for deleted stocks)
+  useEffect(() => {
+    const currentTickers = new Set(portfolio?.holdings.map(h => h.ticker) ?? []);
+    setHoldingChartData(prev => {
+      const newData: Record<string, HoldingChartData> = {};
+      for (const ticker of Object.keys(prev)) {
+        if (currentTickers.has(ticker)) {
+          newData[ticker] = prev[ticker];
+        }
+      }
+      return newData;
+    });
+  }, [tickersKey]);
 
-    fetchHistories();
-  }, [tickersKey, chartPeriod, portfolio?.holdings]);
+  // Calculate period gain for a holding (% change from reference close)
+  const getPeriodGain = useCallback((ticker: string): number | null => {
+    const chartData = holdingChartData[ticker];
+    if (!chartData?.history?.length || chartData.referenceClose === null || chartData.referenceClose === 0) {
+      return null;
+    }
+    const latestClose = chartData.history[chartData.history.length - 1]?.close ?? 0;
+    return ((latestClose - chartData.referenceClose) / chartData.referenceClose) * 100;
+  }, [holdingChartData]);
+
+  // Sort holdings based on current sort option
+  const sortedHoldings = useMemo(() => {
+    if (!portfolio?.holdings) return [];
+    
+    const holdings = [...portfolio.holdings];
+    const { field, direction } = sortOption;
+    const multiplier = direction === 'asc' ? 1 : -1;
+
+    holdings.sort((a, b) => {
+      let comparison = 0;
+
+      switch (field) {
+        case 'ticker':
+          comparison = a.ticker.localeCompare(b.ticker);
+          break;
+        case 'daily_change': {
+          // Use absolute value for daily change sorting
+          const gainA = getPeriodGain(a.ticker);
+          const gainB = getPeriodGain(b.ticker);
+          // Put null values at the end
+          if (gainA === null && gainB === null) comparison = 0;
+          else if (gainA === null) comparison = 1;
+          else if (gainB === null) comparison = -1;
+          else comparison = Math.abs(gainA) - Math.abs(gainB);
+          break;
+        }
+        case 'allocation':
+          comparison = a.allocation_pct - b.allocation_pct;
+          break;
+        case 'equity':
+          comparison = (a.current_value ?? 0) - (b.current_value ?? 0);
+          break;
+        case 'ytd':
+          comparison = (a.ytd_return ?? 0) - (b.ytd_return ?? 0);
+          break;
+        default:
+          comparison = 0;
+      }
+
+      return comparison * multiplier;
+    });
+
+    return holdings;
+  }, [portfolio?.holdings, sortOption, getPeriodGain]);
 
   const handleAddHolding = async (ticker: string, allocation: number) => {
     await addHolding(ticker, allocation);
   };
 
   const handleUpdateAllocation = async (holdingId: number, allocation: number) => {
-    await updateHolding(holdingId, allocation);
+    await updateHolding(holdingId, { allocation_pct: allocation });
+  };
+
+  const handleUpdateInvestment = async (holdingId: number, data: { investment_date?: string; investment_price?: number }) => {
+    await updateHolding(holdingId, data);
   };
 
   const currentAllocation = portfolio?.holdings.reduce((sum, h) => sum + h.allocation_pct, 0) ?? 0;
+
+  // Check if all holdings have loaded their stock data (have current_price)
+  const allDataLoaded = !portfolio?.holdings.length || 
+    portfolio.holdings.every(h => h.current_price !== undefined && h.current_price !== null);
 
   if (loading && !portfolio) {
     return (
@@ -147,17 +177,15 @@ function App() {
       
       <div className="max-w-7xl mx-auto">
         <Header 
-          totalValue={portfolio?.total_value ?? 0}
-          onRefresh={refresh}
-          loading={loading || refreshing}
+          totalValue={(portfolio?.total_value ?? 0) + (portfolio?.total_gain_loss ?? 0)}
           lastUpdated={lastFetched ?? undefined}
+          isDataReady={allDataLoaded}
         />
 
         {portfolio && (
           <>
             <PortfolioSummary 
               portfolio={portfolio} 
-              isRefreshing={refreshing} 
               onUpdateValue={updatePortfolioValue}
             />
 
@@ -170,40 +198,34 @@ function App() {
                   <span className="text-white/40 text-sm">
                     ({portfolio.holdings.length} stocks)
                   </span>
-                  <span className="text-white/20">•</span>
-                  <RefreshTimer 
-                    lastFetched={lastFetched} 
-                    refreshInterval={REFRESH_INTERVAL}
-                    isRefreshing={refreshing}
-                  />
                 </div>
                 
-                <div className="flex items-center gap-3">
-                  <PortfolioSettings 
-                    currentValue={portfolio.total_value}
-                    onUpdate={updatePortfolioValue}
-                  />
-                  <button 
+                <button 
                     onClick={() => setShowAddModal(true)}
                     className="btn-primary flex items-center gap-2"
                   >
                     <Plus className="w-5 h-5" />
                     Add Stock
                   </button>
-                </div>
               </div>
 
-              {/* Chart Period Selector */}
+              {/* Chart Period & Sort Selectors */}
               {portfolio.holdings.length > 0 && (
-                <div className="mb-4 flex items-center gap-3">
-                  <span className="text-white/50 text-sm">Chart period:</span>
-                  <ChartPeriodSelector 
-                    selected={chartPeriod} 
-                    onSelect={setChartPeriod} 
-                  />
-                  {loadingHistories && (
-                    <div className="w-4 h-4 border-2 border-white/20 border-t-accent-cyan rounded-full animate-spin" />
-                  )}
+                <div className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-3">
+                  <div className="flex items-center gap-3">
+                    <span className="text-white/50 text-sm">Chart period:</span>
+                    <ChartPeriodSelector 
+                      selected={chartPeriod} 
+                      onSelect={setChartPeriod} 
+                    />
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="text-white/50 text-sm">Sort by:</span>
+                    <SortSelector
+                      value={sortOption}
+                      onChange={setSortOption}
+                    />
+                  </div>
                 </div>
               )}
 
@@ -224,7 +246,7 @@ function App() {
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {portfolio.holdings.map((holding, index) => {
+                  {sortedHoldings.map((holding, index) => {
                     const chartData = holdingChartData[holding.ticker];
                     return (
                       <div 
@@ -242,9 +264,11 @@ function App() {
                           onDelete={removeHolding}
                           onSelect={setSelectedTicker}
                           onUpdateAllocation={handleUpdateAllocation}
+                          onUpdateInvestment={handleUpdateInvestment}
                           currentTotalAllocation={currentAllocation}
-                          isRefreshing={refreshing}
-                          isHistoryLoading={loadingHistories}
+                          portfolioTotalValue={portfolio?.total_value ?? 0}
+                          isRefreshing={false}
+                          isHistoryLoading={!chartData}
                         />
                       </div>
                     );
@@ -262,6 +286,7 @@ function App() {
         onClose={() => setShowAddModal(false)}
         onAdd={handleAddHolding}
         currentAllocation={currentAllocation}
+        portfolioTotalValue={portfolio?.total_value ?? 0}
       />
 
       <StockDetailModal

@@ -1,34 +1,72 @@
-import { useState } from 'react';
-import { X, Plus, AlertCircle } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { X, Plus, AlertCircle, Percent, DollarSign } from 'lucide-react';
 
 interface AddHoldingModalProps {
   isOpen: boolean;
   onClose: () => void;
   onAdd: (ticker: string, allocation: number) => Promise<void>;
   currentAllocation: number;
+  portfolioTotalValue: number;
 }
 
-export function AddHoldingModal({ isOpen, onClose, onAdd, currentAllocation }: AddHoldingModalProps) {
+export function AddHoldingModal({ isOpen, onClose, onAdd, currentAllocation, portfolioTotalValue }: AddHoldingModalProps) {
   const [ticker, setTicker] = useState('');
   const [allocation, setAllocation] = useState('');
+  const [amount, setAmount] = useState('');
+  const [activeInput, setActiveInput] = useState<'percent' | 'amount' | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
   const remainingAllocation = 100 - currentAllocation;
+  const remainingAmount = portfolioTotalValue * (remainingAllocation / 100);
+
+  // Sync allocation and amount based on which one was edited
+  useEffect(() => {
+    if (activeInput === 'percent' && allocation !== '') {
+      const pct = parseFloat(allocation);
+      if (!isNaN(pct) && portfolioTotalValue > 0) {
+        const calculatedAmount = (pct / 100) * portfolioTotalValue;
+        setAmount(calculatedAmount.toFixed(2));
+      }
+    } else if (activeInput === 'amount' && amount !== '') {
+      const amt = parseFloat(amount);
+      if (!isNaN(amt) && portfolioTotalValue > 0) {
+        const calculatedPct = (amt / portfolioTotalValue) * 100;
+        setAllocation(calculatedPct.toFixed(2));
+      }
+    }
+  }, [allocation, amount, activeInput, portfolioTotalValue]);
+
+  const handleAllocationChange = (value: string) => {
+    setActiveInput('percent');
+    setAllocation(value);
+    if (value === '') {
+      setAmount('');
+    }
+  };
+
+  const handleAmountChange = (value: string) => {
+    setActiveInput('amount');
+    setAmount(value);
+    if (value === '') {
+      setAllocation('');
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     
-    const allocationNum = parseFloat(allocation);
+    const allocationNum = parseFloat(allocation) || 0;
     
     if (!ticker.trim()) {
       setError('Please enter a ticker symbol');
       return;
     }
     
-    if (isNaN(allocationNum) || allocationNum <= 0) {
-      setError('Please enter a valid allocation percentage');
+    // Allow 0% allocation
+    if (allocationNum < 0) {
+      setError('Allocation cannot be negative');
       return;
     }
     
@@ -42,6 +80,8 @@ export function AddHoldingModal({ isOpen, onClose, onAdd, currentAllocation }: A
       await onAdd(ticker.toUpperCase(), allocationNum);
       setTicker('');
       setAllocation('');
+      setAmount('');
+      setActiveInput(null);
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add holding');
@@ -49,6 +89,17 @@ export function AddHoldingModal({ isOpen, onClose, onAdd, currentAllocation }: A
       setLoading(false);
     }
   };
+
+  // Reset state when modal closes
+  useEffect(() => {
+    if (!isOpen) {
+      setTicker('');
+      setAllocation('');
+      setAmount('');
+      setActiveInput(null);
+      setError('');
+    }
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -88,22 +139,57 @@ export function AddHoldingModal({ isOpen, onClose, onAdd, currentAllocation }: A
 
             <div>
               <label className="block text-white/70 text-sm mb-2">
-                Allocation (%)
+                Allocation
                 <span className="text-white/40 ml-2">
-                  Max: {remainingAllocation.toFixed(1)}%
+                  (optional)
                 </span>
               </label>
-              <input
-                type="number"
-                value={allocation}
-                onChange={(e) => setAllocation(e.target.value)}
-                placeholder="e.g., 5"
-                min="0.1"
-                max={remainingAllocation}
-                step="0.1"
-                className="w-full"
-                disabled={loading}
-              />
+              <div className="space-y-3">
+                {/* Percentage Input */}
+                <div>
+                  <div className="flex items-center gap-2">
+                    <Percent className="w-4 h-4 text-white/40 flex-shrink-0" />
+                    <input
+                      type="number"
+                      value={allocation}
+                      onChange={(e) => handleAllocationChange(e.target.value)}
+                      placeholder="0"
+                      min="0"
+                      max={remainingAllocation}
+                      step="0.1"
+                      className="flex-1"
+                      disabled={loading}
+                    />
+                    <span className="text-white/30 text-xs whitespace-nowrap">
+                      max {remainingAllocation.toFixed(1)}%
+                    </span>
+                  </div>
+                </div>
+                
+                {/* Amount Input */}
+                <div>
+                  <div className="flex items-center gap-2">
+                    <DollarSign className="w-4 h-4 text-white/40 flex-shrink-0" />
+                    <input
+                      type="number"
+                      value={amount}
+                      onChange={(e) => handleAmountChange(e.target.value)}
+                      placeholder="0.00"
+                      min="0"
+                      max={remainingAmount}
+                      step="0.01"
+                      className="flex-1"
+                      disabled={loading}
+                    />
+                    <span className="text-white/30 text-xs whitespace-nowrap">
+                      max ${remainingAmount.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <p className="text-white/30 text-xs mt-2">
+                Enter either — the other is calculated automatically
+              </p>
             </div>
 
             {error && (

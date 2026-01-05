@@ -1,13 +1,12 @@
-import { RefreshCw, TrendingUp } from 'lucide-react';
+import { TrendingUp } from 'lucide-react';
 
 interface HeaderProps {
   totalValue: number;
-  onRefresh: () => void;
-  loading: boolean;
   lastUpdated?: Date;
+  isDataReady: boolean;
 }
 
-export function Header({ totalValue, onRefresh, loading, lastUpdated }: HeaderProps) {
+export function Header({ totalValue, lastUpdated, isDataReady }: HeaderProps) {
   return (
     <header className="flex items-center justify-between mb-8 fade-in">
       <div className="flex items-center gap-4">
@@ -22,21 +21,15 @@ export function Header({ totalValue, onRefresh, loading, lastUpdated }: HeaderPr
         </div>
       </div>
       
-      <div className="flex items-center gap-6">
-        <div className="text-right">
-          <p className="text-white/50 text-sm">Total Portfolio Value</p>
+      <div className="text-right">
+        <p className="text-white/50 text-sm">Total Portfolio Value</p>
+        {isDataReady ? (
           <p className="text-2xl font-bold text-white">
             ${totalValue.toLocaleString('en-US', { minimumFractionDigits: 2 })}
           </p>
-        </div>
-        
-        <button
-          onClick={onRefresh}
-          disabled={loading}
-          className="p-3 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition-all duration-200 disabled:opacity-50"
-        >
-          <RefreshCw className={`w-5 h-5 text-white/70 ${loading ? 'animate-spin' : ''}`} />
-        </button>
+        ) : (
+          <p className="text-2xl font-bold text-white/30">Loading...</p>
+        )}
       </div>
     </header>
   );

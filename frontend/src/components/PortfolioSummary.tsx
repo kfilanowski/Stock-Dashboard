@@ -1,21 +1,29 @@
 import { useState } from 'react';
-import { TrendingUp, TrendingDown, DollarSign, PieChart, Pencil, Check, X } from 'lucide-react';
+import { TrendingUp, TrendingDown, DollarSign, PieChart, Pencil, Check, X, Wallet } from 'lucide-react';
 import type { Portfolio } from '../types';
-import { LoadingValue, LoadingSpinner } from './LoadingValue';
+import { LoadingSpinner } from './LoadingValue';
 
 interface PortfolioSummaryProps {
   portfolio: Portfolio;
-  isRefreshing?: boolean;
   onUpdateValue?: (value: number) => Promise<void>;
 }
 
-export function PortfolioSummary({ portfolio, isRefreshing = false, onUpdateValue }: PortfolioSummaryProps) {
+export function PortfolioSummary({ portfolio, onUpdateValue }: PortfolioSummaryProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [editValue, setEditValue] = useState(portfolio.total_value.toString());
   const [isSaving, setIsSaving] = useState(false);
 
-  const isPositive = (portfolio.total_gain_loss_pct ?? 0) >= 0;
   const totalAllocated = portfolio.holdings.reduce((sum, h) => sum + h.allocation_pct, 0);
+  const buyingPower = portfolio.total_value * ((100 - totalAllocated) / 100);
+  const currentInvested = portfolio.total_value * (totalAllocated / 100);
+  
+  // Check if all holdings have loaded their stock data (have current_price)
+  const allDataLoaded = portfolio.holdings.length === 0 || 
+    portfolio.holdings.every(h => h.current_price !== undefined && h.current_price !== null);
+  
+  // Only show gain/loss if we have investment prices for all holdings
+  const hasGainLossData = portfolio.total_gain_loss !== undefined && portfolio.total_gain_loss !== null;
+  const isPositive = (portfolio.total_gain_loss_pct ?? 0) >= 0;
 
   const handleStartEdit = () => {
     setEditValue(portfolio.total_value.toString());
@@ -49,7 +57,7 @@ export function PortfolioSummary({ portfolio, isRefreshing = false, onUpdateValu
   };
   
   return (
-    <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
       {/* Base Investment */}
       <div className="glass-card p-5 fade-in fade-in-delay-1 group">
         <div className="flex items-center gap-3 mb-3">
@@ -107,44 +115,63 @@ export function PortfolioSummary({ portfolio, isRefreshing = false, onUpdateValu
         )}
       </div>
 
-      {/* Current Value */}
+      {/* Current Invested */}
       <div className="glass-card p-5 fade-in fade-in-delay-2">
         <div className="flex items-center gap-3 mb-3">
-          <div className={`p-2 rounded-lg ${isPositive ? 'bg-green-500/20' : 'bg-red-500/20'}`}>
-            {isPositive ? (
-              <TrendingUp className="w-5 h-5 text-green-400" />
-            ) : (
-              <TrendingDown className="w-5 h-5 text-red-400" />
-            )}
+          <div className="p-2 rounded-lg bg-accent-cyan/20">
+            <PieChart className="w-5 h-5 text-accent-cyan" />
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-white/50 text-sm">Current Value</span>
-            {isRefreshing && <LoadingSpinner size="sm" />}
+            <span className="text-white/50 text-sm">Current Invested</span>
+            {!allDataLoaded && <LoadingSpinner size="sm" />}
           </div>
         </div>
-        <LoadingValue loading={isRefreshing} size="lg">
-          <p className="text-2xl font-bold text-white">
-            ${(portfolio.current_total_value ?? portfolio.total_value).toLocaleString('en-US', { minimumFractionDigits: 2 })}
-          </p>
-        </LoadingValue>
+        {allDataLoaded ? (
+          <div>
+            <p className="text-2xl font-bold text-white">
+              ${currentInvested.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+            </p>
+            <span className="text-white/40 text-sm">{totalAllocated.toFixed(1)}% allocated</span>
+          </div>
+        ) : (
+          <p className="text-2xl font-bold text-white/30">Loading...</p>
+        )}
       </div>
 
-      {/* Total Gain/Loss */}
+      {/* Buying Power */}
       <div className="glass-card p-5 fade-in fade-in-delay-3">
         <div className="flex items-center gap-3 mb-3">
-          <div className={`p-2 rounded-lg ${isPositive ? 'bg-green-500/20' : 'bg-red-500/20'}`}>
-            {isPositive ? (
+          <div className="p-2 rounded-lg bg-emerald-500/20">
+            <Wallet className="w-5 h-5 text-emerald-400" />
+          </div>
+          <span className="text-white/50 text-sm">Buying Power</span>
+        </div>
+        <div>
+          <p className="text-2xl font-bold text-emerald-400">
+            ${buyingPower.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+          </p>
+          <span className="text-white/40 text-sm">{(100 - totalAllocated).toFixed(1)}% available</span>
+        </div>
+      </div>
+
+      {/* Portfolio Gain/Loss */}
+      <div className="glass-card p-5 fade-in fade-in-delay-4">
+        <div className="flex items-center gap-3 mb-3">
+          <div className={`p-2 rounded-lg ${hasGainLossData && isPositive ? 'bg-green-500/20' : hasGainLossData ? 'bg-red-500/20' : 'bg-white/10'}`}>
+            {hasGainLossData && isPositive ? (
               <TrendingUp className="w-5 h-5 text-green-400" />
-            ) : (
+            ) : hasGainLossData ? (
               <TrendingDown className="w-5 h-5 text-red-400" />
+            ) : (
+              <TrendingUp className="w-5 h-5 text-white/30" />
             )}
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-white/50 text-sm">Total Gain/Loss</span>
-            {isRefreshing && <LoadingSpinner size="sm" />}
+            <span className="text-white/50 text-sm">Portfolio Gain/Loss</span>
+            {!allDataLoaded && <LoadingSpinner size="sm" />}
           </div>
         </div>
-        <LoadingValue loading={isRefreshing} size="lg">
+        {hasGainLossData && allDataLoaded ? (
           <div className="flex items-baseline gap-2">
             <p className={`text-2xl font-bold ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
               {isPositive ? '+' : ''}{(portfolio.total_gain_loss_pct ?? 0).toFixed(2)}%
@@ -153,27 +180,14 @@ export function PortfolioSummary({ portfolio, isRefreshing = false, onUpdateValu
               ({isPositive ? '+' : ''}${(portfolio.total_gain_loss ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2 })})
             </span>
           </div>
-        </LoadingValue>
-      </div>
-
-      {/* Allocation */}
-      <div className="glass-card p-5 fade-in fade-in-delay-4">
-        <div className="flex items-center gap-3 mb-3">
-          <div className="p-2 rounded-lg bg-accent-cyan/20">
-            <PieChart className="w-5 h-5 text-accent-cyan" />
+        ) : allDataLoaded ? (
+          <div>
+            <p className="text-lg text-white/40">Set investment dates</p>
+            <span className="text-white/30 text-sm">to track gain/loss</span>
           </div>
-          <span className="text-white/50 text-sm">Allocated</span>
-        </div>
-        <div className="flex items-baseline gap-2">
-          <p className="text-2xl font-bold text-white">{totalAllocated.toFixed(1)}%</p>
-          <span className="text-white/50 text-sm">of portfolio</span>
-        </div>
-        <div className="mt-2 h-2 bg-white/10 rounded-full overflow-hidden">
-          <div 
-            className="h-full bg-gradient-to-r from-accent-cyan to-accent-purple rounded-full transition-all duration-500"
-            style={{ width: `${Math.min(totalAllocated, 100)}%` }}
-          />
-        </div>
+        ) : (
+          <p className="text-2xl font-bold text-white/30">Loading...</p>
+        )}
       </div>
     </div>
   );

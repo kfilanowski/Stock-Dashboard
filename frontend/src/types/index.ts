@@ -4,11 +4,15 @@ export interface Holding {
   ticker: string;
   allocation_pct: number;
   added_at: string;
+  investment_date?: string | null;
+  investment_price?: number | null;
   current_price?: number;
   current_value?: number;
   ytd_return?: number;
   sma_200?: number;
   price_vs_sma?: number;
+  gain_loss?: number | null;  // Gain/loss since investment_date in dollars
+  gain_loss_pct?: number | null;  // Gain/loss since investment_date in %
 }
 
 export interface Portfolio {

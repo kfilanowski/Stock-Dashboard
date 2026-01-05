@@ -77,8 +77,8 @@ app.add_middleware(
 # ============ Portfolio Endpoints ============
 
 @app.get("/api/portfolio", response_model=PortfolioWithData)
-async def get_portfolio(db: AsyncSession = Depends(get_db)):
-    """Get the portfolio with live stock data for all holdings."""
+async def get_portfolio(db: AsyncSession = Depends(get_db), lite: bool = False):
+    """Get the portfolio. Use lite=true for fast load without live stock data."""
     result = await db.execute(
         select(Portfolio).options(selectinload(Portfolio.holdings)).limit(1)
     )
@@ -91,9 +91,43 @@ async def get_portfolio(db: AsyncSession = Depends(get_db)):
         await db.commit()
         await db.refresh(portfolio)
     
-    # Fetch live data for all holdings
+    # For lite mode, return portfolio structure without live stock data (instant)
+    if lite:
+        holdings_with_data = [
+            HoldingWithData(
+                id=h.id,
+                portfolio_id=h.portfolio_id,
+                ticker=h.ticker,
+                allocation_pct=h.allocation_pct,
+                added_at=h.added_at,
+                investment_date=h.investment_date,
+                investment_price=h.investment_price,
+                current_price=None,
+                current_value=None,
+                ytd_return=None,
+                sma_200=None,
+                price_vs_sma=None,
+                gain_loss=None,
+                gain_loss_pct=None
+            )
+            for h in portfolio.holdings
+        ]
+        return PortfolioWithData(
+            id=portfolio.id,
+            name=portfolio.name,
+            total_value=portfolio.total_value,
+            created_at=portfolio.created_at,
+            updated_at=portfolio.updated_at,
+            holdings=holdings_with_data,
+            current_total_value=None,
+            total_gain_loss=None,
+            total_gain_loss_pct=None
+        )
+    
+    # Full mode: Fetch live data for all holdings (slower)
     holdings_with_data = []
     current_total_value = 0
+    total_portfolio_gain_loss = 0
     
     if portfolio.holdings:
         tickers = [h.ticker for h in portfolio.holdings]
@@ -104,10 +138,22 @@ async def get_portfolio(db: AsyncSession = Depends(get_db)):
             allocated_value = portfolio.total_value * (holding.allocation_pct / 100)
             current_price = data.get('current_price', 0)
             
-            # Calculate current value based on price movement
+            # Calculate current value based on price movement (using YTD for display)
             ytd_return = data.get('ytd_return', 0)
             current_value = allocated_value * (1 + ytd_return / 100)
             current_total_value += current_value
+            
+            # Calculate gain/loss since investment date (if we have investment_price)
+            gain_loss = None
+            gain_loss_pct = None
+            if holding.investment_price and holding.investment_price > 0 and current_price > 0:
+                # How many shares would we have bought at investment_price?
+                shares = allocated_value / holding.investment_price
+                # What's the current value of those shares?
+                value_now = shares * current_price
+                gain_loss = value_now - allocated_value
+                gain_loss_pct = ((current_price - holding.investment_price) / holding.investment_price) * 100
+                total_portfolio_gain_loss += gain_loss
             
             holdings_with_data.append(HoldingWithData(
                 id=holding.id,
@@ -115,20 +161,32 @@ async def get_portfolio(db: AsyncSession = Depends(get_db)):
                 ticker=holding.ticker,
                 allocation_pct=holding.allocation_pct,
                 added_at=holding.added_at,
+                investment_date=holding.investment_date,
+                investment_price=holding.investment_price,
                 current_price=current_price,
                 current_value=round(current_value, 2),
                 ytd_return=ytd_return,
                 sma_200=data.get('sma_200'),
-                price_vs_sma=data.get('price_vs_sma')
+                price_vs_sma=data.get('price_vs_sma'),
+                gain_loss=round(gain_loss, 2) if gain_loss is not None else None,
+                gain_loss_pct=round(gain_loss_pct, 2) if gain_loss_pct is not None else None
             ))
     else:
         current_total_value = portfolio.total_value
     
-    # Calculate total gain/loss
+    # Calculate total gain/loss based on investment dates
     total_allocated = sum(h.allocation_pct for h in portfolio.holdings) if portfolio.holdings else 0
     base_invested = portfolio.total_value * (total_allocated / 100)
-    total_gain_loss = current_total_value - base_invested if base_invested > 0 else 0
-    total_gain_loss_pct = (total_gain_loss / base_invested * 100) if base_invested > 0 else 0
+    
+    # Only show portfolio gain/loss if we have investment prices for all holdings
+    all_have_investment_price = all(h.investment_price for h in portfolio.holdings) if portfolio.holdings else False
+    
+    if all_have_investment_price and base_invested > 0:
+        total_gain_loss = total_portfolio_gain_loss
+        total_gain_loss_pct = (total_gain_loss / base_invested * 100)
+    else:
+        total_gain_loss = None
+        total_gain_loss_pct = None
     
     return PortfolioWithData(
         id=portfolio.id,
@@ -218,7 +276,9 @@ async def add_holding(
     new_holding = Holding(
         portfolio_id=portfolio.id,
         ticker=holding.ticker.upper(),
-        allocation_pct=holding.allocation_pct
+        allocation_pct=holding.allocation_pct,
+        investment_date=holding.investment_date,
+        investment_price=holding.investment_price
     )
     db.add(new_holding)
     await db.commit()
@@ -248,30 +308,40 @@ async def update_holding(
     holding_update: HoldingUpdate,
     db: AsyncSession = Depends(get_db)
 ):
-    """Update a holding's allocation percentage."""
+    """Update a holding's allocation percentage, investment date, or investment price."""
     result = await db.execute(select(Holding).where(Holding.id == holding_id))
     holding = result.scalar_one_or_none()
     
     if not holding:
         raise HTTPException(status_code=404, detail="Holding not found")
     
-    # Check total allocation
-    result = await db.execute(
-        select(Holding).where(
-            Holding.portfolio_id == holding.portfolio_id,
-            Holding.id != holding_id
+    # Check total allocation if allocation is being updated
+    if holding_update.allocation_pct is not None:
+        result = await db.execute(
+            select(Holding).where(
+                Holding.portfolio_id == holding.portfolio_id,
+                Holding.id != holding_id
+            )
         )
-    )
-    other_holdings = result.scalars().all()
-    total_allocated = sum(h.allocation_pct for h in other_holdings)
+        other_holdings = result.scalars().all()
+        total_allocated = sum(h.allocation_pct for h in other_holdings)
+        
+        if total_allocated + holding_update.allocation_pct > 100:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Total allocation would exceed 100%. Other holdings: {total_allocated}%"
+            )
+        
+        holding.allocation_pct = holding_update.allocation_pct
     
-    if total_allocated + holding_update.allocation_pct > 100:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Total allocation would exceed 100%. Other holdings: {total_allocated}%"
-        )
+    # Update investment date if provided
+    if holding_update.investment_date is not None:
+        holding.investment_date = holding_update.investment_date
     
-    holding.allocation_pct = holding_update.allocation_pct
+    # Update investment price if provided
+    if holding_update.investment_price is not None:
+        holding.investment_price = holding_update.investment_price
+    
     await db.commit()
     await db.refresh(holding)
     
@@ -289,6 +359,26 @@ async def get_stock(ticker: str):
         raise HTTPException(status_code=404, detail=f"Stock not found: {ticker}")
     
     return StockData(**data)
+
+
+@app.get("/api/stock/{ticker}/quote")
+async def get_stock_quote(ticker: str):
+    """Get just the current price data for a single stock (lightweight refresh)."""
+    data = await get_stock_data(ticker)
+    
+    if data['current_price'] == 0:
+        raise HTTPException(status_code=404, detail=f"Stock not found: {ticker}")
+    
+    return {
+        "ticker": ticker.upper(),
+        "current_price": data['current_price'],
+        "previous_close": data['previous_close'],
+        "change": data['change'],
+        "change_pct": data['change_pct'],
+        "ytd_return": data['ytd_return'],
+        "sma_200": data.get('sma_200'),
+        "price_vs_sma": data.get('price_vs_sma'),
+    }
 
 
 @app.get("/api/stock/{ticker}/history")
@@ -310,6 +400,36 @@ async def get_stock_history_endpoint(ticker: str, period: str = "1y"):
         "expected_start": result.get("expected_start"),
         "actual_start": result.get("actual_start")
     }
+
+
+@app.post("/api/stocks/history")
+async def get_multiple_stock_histories(tickers: list[str], period: str = "1y"):
+    """Get historical data for multiple stocks at once.
+    
+    More efficient than calling individual endpoints - processes sequentially
+    to avoid yfinance data corruption but returns all results in one response.
+    """
+    results = {}
+    for ticker in tickers:
+        try:
+            result = await get_stock_history(ticker, period)
+            results[ticker.upper()] = {
+                "history": result.get("history", []),
+                "reference_close": result.get("reference_close"),
+                "is_complete": result.get("is_complete", True),
+                "expected_start": result.get("expected_start"),
+                "actual_start": result.get("actual_start")
+            }
+        except Exception as e:
+            print(f"Error fetching history for {ticker}: {e}")
+            results[ticker.upper()] = {
+                "history": [],
+                "reference_close": None,
+                "is_complete": False,
+                "expected_start": None,
+                "actual_start": None
+            }
+    return results
 
 
 # ============ Portfolio History ============

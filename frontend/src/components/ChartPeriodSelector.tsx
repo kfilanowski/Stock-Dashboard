@@ -12,8 +12,8 @@ const periods: { value: ChartPeriod; label: string }[] = [
   { value: '1mo', label: '1M' },
   { value: '3mo', label: '3M' },
   { value: '6mo', label: '6M' },
-  { value: '1y', label: '1Y' },
   { value: 'ytd', label: 'YTD' },
+  { value: '1y', label: '1Y' },
   { value: '2y', label: '2Y' },
 ];
 

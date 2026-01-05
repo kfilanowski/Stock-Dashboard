@@ -11,8 +11,9 @@ async function handleResponse<T>(response: Response): Promise<T> {
 }
 
 // Portfolio API
-export async function getPortfolio(): Promise<Portfolio> {
-  const response = await fetch(`${API_BASE}/portfolio`);
+export async function getPortfolio(lite = false): Promise<Portfolio> {
+  const url = lite ? `${API_BASE}/portfolio?lite=true` : `${API_BASE}/portfolio`;
+  const response = await fetch(url);
   return handleResponse<Portfolio>(response);
 }
 
@@ -26,11 +27,18 @@ export async function updatePortfolio(data: { name?: string; total_value?: numbe
 }
 
 // Holdings API
-export async function addHolding(ticker: string, allocation_pct: number): Promise<void> {
+export interface AddHoldingData {
+  ticker: string;
+  allocation_pct: number;
+  investment_date?: string | null;
+  investment_price?: number | null;
+}
+
+export async function addHolding(data: AddHoldingData): Promise<void> {
   const response = await fetch(`${API_BASE}/holdings`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ticker, allocation_pct }),
+    body: JSON.stringify(data),
   });
   return handleResponse<void>(response);
 }
@@ -42,11 +50,17 @@ export async function deleteHolding(holdingId: number): Promise<void> {
   return handleResponse<void>(response);
 }
 
-export async function updateHolding(holdingId: number, allocation_pct: number): Promise<void> {
+export interface UpdateHoldingData {
+  allocation_pct?: number;
+  investment_date?: string | null;
+  investment_price?: number | null;
+}
+
+export async function updateHolding(holdingId: number, data: UpdateHoldingData): Promise<void> {
   const response = await fetch(`${API_BASE}/holdings/${holdingId}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ allocation_pct }),
+    body: JSON.stringify(data),
   });
   return handleResponse<void>(response);
 }
@@ -57,9 +71,37 @@ export async function getStock(ticker: string): Promise<StockData> {
   return handleResponse<StockData>(response);
 }
 
+export interface StockQuote {
+  ticker: string;
+  current_price: number;
+  previous_close: number;
+  change: number;
+  change_pct: number;
+  ytd_return: number;
+  sma_200: number | null;
+  price_vs_sma: number | null;
+}
+
+export async function getStockQuote(ticker: string): Promise<StockQuote> {
+  const response = await fetch(`${API_BASE}/stock/${ticker}/quote`);
+  return handleResponse<StockQuote>(response);
+}
+
 export async function getStockHistory(ticker: string, period: string = '1y'): Promise<StockHistoryResponse> {
   const response = await fetch(`${API_BASE}/stock/${ticker}/history?period=${period}`);
   return handleResponse<StockHistoryResponse>(response);
+}
+
+export async function getMultipleStockHistories(
+  tickers: string[], 
+  period: string = '1y'
+): Promise<Record<string, StockHistoryResponse>> {
+  const response = await fetch(`${API_BASE}/stocks/history?period=${period}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(tickers),
+  });
+  return handleResponse<Record<string, StockHistoryResponse>>(response);
 }
 
 // Portfolio History
