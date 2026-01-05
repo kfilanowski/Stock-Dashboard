@@ -1,0 +1,53 @@
+services:
+  backend:
+    build: ./backend
+    container_name: stock-dashboard-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - sqlite_data:/app/data
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./data/portfolio.db
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: stock-dashboard-frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  sqlite-browser:
+    image: datasetteproject/datasette:latest
+    container_name: stock-dashboard-sqlite-browser
+    ports:
+      - "8001:8001"
+    volumes:
+      - sqlite_data:/data:ro
+    command: datasette /data/portfolio.db --host 0.0.0.0 --port 8001
+    depends_on:
+      - backend
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  sqlite_data:
+    driver: local
