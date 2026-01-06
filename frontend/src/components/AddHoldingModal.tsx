@@ -134,6 +134,7 @@ export function AddHoldingModal({ isOpen, onClose, onAdd, currentAllocation, por
                 placeholder="e.g., AAPL, ONDS"
                 className="w-full"
                 disabled={loading}
+                autoFocus
               />
             </div>
 

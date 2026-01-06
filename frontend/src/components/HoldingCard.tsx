@@ -1,6 +1,7 @@
-import { Trash2, BarChart3, RefreshCw } from 'lucide-react';
+import { useMemo } from 'react';
+import { Trash2, BarChart3, RefreshCw, TrendingUp, TrendingDown } from 'lucide-react';
 import type { Holding, HistoryPoint } from '../types';
-import { AllocationEditor, InvestmentInfoEditor, MiniStockChart, HoldingMetrics } from './holding';
+import { AllocationEditor, InvestmentInfoEditor, MiniStockChart } from './holding';
 
 interface HoldingCardProps {
   holding: Holding;
@@ -37,19 +38,67 @@ export function HoldingCard({
   isHistoryLoading = false,
   lastPricesFetched
 }: HoldingCardProps) {
+  // Calculate period gain for display under price
+  const periodGain = useMemo(() => {
+    if (!history.length || referenceClose === null || referenceClose === 0) return null;
+    const latestClose = history[history.length - 1]?.close ?? 0;
+    return ((latestClose - referenceClose) / referenceClose) * 100;
+  }, [history, referenceClose]);
+
+  const isPeriodPositive = periodGain !== null ? periodGain >= 0 : true;
+  const isYtdPositive = (holding.ytd_return ?? 0) >= 0;
+
   return (
     <div className="glass-card p-5 hover:border-white/20 transition-all duration-300 group">
-      {/* Header with ticker and actions */}
+      {/* Header with ticker, price, YTD, and actions */}
       <div className="flex items-start justify-between mb-4">
-        <div className="flex items-center gap-3">
-          <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-accent-cyan/30 to-accent-purple/30 flex items-center justify-center border border-white/10">
-            <span className="font-bold text-white text-sm">{holding.ticker.slice(0, 3)}</span>
+        {/* Left: Name/Price/Period column */}
+        <div className="flex flex-col">
+          <div className="flex items-center gap-2">
+            <h3 className="font-bold text-white text-xl">{holding.ticker}</h3>
+            {isRefreshing && <RefreshCw className="w-3 h-3 text-accent-cyan/60 animate-spin" />}
           </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <h3 className="font-bold text-white text-lg">{holding.ticker}</h3>
-              {isRefreshing && <RefreshCw className="w-3 h-3 text-accent-cyan/60 animate-spin" />}
+          <p className="text-white font-semibold text-lg">
+            ${holding.current_price?.toFixed(2) ?? '—'}
+          </p>
+          {!isDataComplete ? (
+            <span className="text-yellow-500/70 text-xs">Loading...</span>
+          ) : periodGain !== null ? (
+            <div className="flex items-center gap-1">
+              {isPeriodPositive ? (
+                <TrendingUp className="w-3 h-3 text-green-400" />
+              ) : (
+                <TrendingDown className="w-3 h-3 text-red-400" />
+              )}
+              <span className={`text-sm ${isPeriodPositive ? 'text-green-400' : 'text-red-400'}`}>
+                {periodGain >= 0 ? '+' : ''}{periodGain.toFixed(2)}%
+              </span>
             </div>
+          ) : null}
+        </div>
+
+        {/* Right: Actions + Allocation/Value/YTD stacked */}
+        <div className="flex flex-col items-end gap-1">
+          {/* Action buttons */}
+          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            <button
+              onClick={() => onSelect(holding.ticker)}
+              className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 transition-colors"
+              title="View details"
+            >
+              <BarChart3 className="w-4 h-4 text-white/70" />
+            </button>
+            <button
+              onClick={() => onDelete(holding.id)}
+              className="p-1.5 rounded-lg bg-red-500/10 hover:bg-red-500/20 transition-colors"
+              title="Remove holding"
+            >
+              <Trash2 className="w-4 h-4 text-red-400" />
+            </button>
+          </div>
+          
+          {/* Allocation, Value, and YTD stacked */}
+          <div className="text-right">
             <AllocationEditor
               holdingId={holding.id}
               currentAllocation={holding.allocation_pct}
@@ -57,35 +106,23 @@ export function HoldingCard({
               currentTotalAllocation={currentTotalAllocation}
               onSave={onUpdateAllocation}
             />
+            <p className="text-white font-medium text-sm">
+              ${holding.current_value?.toLocaleString('en-US', { minimumFractionDigits: 2 }) ?? '—'}
+            </p>
+            <div className="flex items-center gap-1 justify-end mt-0.5">
+              <span className="text-white/40 text-xs">YTD</span>
+              {isYtdPositive ? (
+                <TrendingUp className="w-3 h-3 text-green-400" />
+              ) : (
+                <TrendingDown className="w-3 h-3 text-red-400" />
+              )}
+              <span className={`text-xs font-medium ${isYtdPositive ? 'text-green-400' : 'text-red-400'}`}>
+                {isYtdPositive ? '+' : ''}{holding.ytd_return?.toFixed(2) ?? 0}%
+              </span>
+            </div>
           </div>
         </div>
-        
-        <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-          <button
-            onClick={() => onSelect(holding.ticker)}
-            className="p-2 rounded-lg bg-white/5 hover:bg-white/10 transition-colors"
-            title="View details"
-          >
-            <BarChart3 className="w-4 h-4 text-white/70" />
-          </button>
-          <button
-            onClick={() => onDelete(holding.id)}
-            className="p-2 rounded-lg bg-red-500/10 hover:bg-red-500/20 transition-colors"
-            title="Remove holding"
-          >
-            <Trash2 className="w-4 h-4 text-red-400" />
-          </button>
-        </div>
       </div>
-
-      {/* Metrics grid */}
-      <HoldingMetrics
-        holding={holding}
-        history={history}
-        referenceClose={referenceClose}
-        isDataComplete={isDataComplete}
-        isRefreshing={isRefreshing}
-      />
 
       {/* Investment info */}
       <InvestmentInfoEditor
