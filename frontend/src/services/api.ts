@@ -186,3 +186,90 @@ export async function getBatchPrices(tickers: string[]): Promise<Record<string, 
   const response = await fetch(`${API_BASE}/prices?tickers=${encodeURIComponent(tickerStr)}`);
   return handleResponse<Record<string, BatchPriceData>>(response);
 }
+
+// ============================================================================
+// Stock Analysis API (Fundamentals, Options, Sector Data)
+// ============================================================================
+
+export interface StockFundamentals {
+  ticker: string;
+  sector: string | null;
+  industry: string | null;
+  roic: number | null;        // Return on Invested Capital (%)
+  roe: number | null;         // Return on Equity (%)
+  roa: number | null;         // Return on Assets (%)
+  profit_margin: number | null;
+  operating_margin: number | null;
+  beta: number | null;
+  market_cap: number | null;
+  forward_pe: number | null;
+  dividend_yield: number | null;
+}
+
+export interface StockOptionsData {
+  ticker: string;
+  call_open_interest: number | null;
+  put_open_interest: number | null;
+  total_open_interest: number | null;
+  call_volume: number | null;
+  put_volume: number | null;
+  total_volume: number | null;
+  call_put_ratio_oi: number | null;      // Call/Put ratio by open interest
+  call_put_ratio_volume: number | null;   // Call/Put ratio by volume
+  avg_implied_volatility: number | null;  // Average IV (%)
+  iv_percentile: number | null;           // IV percentile (0-100)
+  options_sentiment: 'bullish' | 'bearish' | 'neutral' | null;
+  has_options: boolean;
+}
+
+export interface SectorCorrelation {
+  ticker: string;
+  sector: string | null;
+  industry: string | null;
+  sector_etf: string | null;      // ETF used for correlation (e.g., XLK)
+  correlation: number | null;      // -1 to 1
+  beta_to_sector: number | null;   // Beta relative to sector
+}
+
+export interface StockAnalysisData {
+  ticker: string;
+  fundamentals: StockFundamentals;
+  options: StockOptionsData;
+  fetched_at: string;
+}
+
+/**
+ * Get comprehensive analysis data for a stock.
+ * Combines fundamentals and options data in one call.
+ */
+export async function getStockAnalysis(ticker: string): Promise<StockAnalysisData> {
+  const response = await fetch(`${API_BASE}/stock/${ticker}/analysis`);
+  return handleResponse<StockAnalysisData>(response);
+}
+
+/**
+ * Get fundamental data for a stock.
+ * Includes ROIC, ROE, ROA, sector, industry, margins, beta.
+ */
+export async function getStockFundamentals(ticker: string): Promise<StockFundamentals> {
+  const response = await fetch(`${API_BASE}/stock/${ticker}/fundamentals`);
+  return handleResponse<StockFundamentals>(response);
+}
+
+/**
+ * Get options data for a stock.
+ * Includes call/put ratios, open interest, implied volatility.
+ */
+export async function getStockOptions(ticker: string): Promise<StockOptionsData> {
+  const response = await fetch(`${API_BASE}/stock/${ticker}/options`);
+  return handleResponse<StockOptionsData>(response);
+}
+
+/**
+ * Get sector correlation data for a stock.
+ * Includes correlation with sector ETF and beta to sector.
+ */
+export async function getSectorCorrelation(ticker: string, days: number = 60): Promise<SectorCorrelation> {
+  const response = await fetch(`${API_BASE}/stock/${ticker}/sector-correlation?days=${days}`);
+  return handleResponse<SectorCorrelation>(response);
+}

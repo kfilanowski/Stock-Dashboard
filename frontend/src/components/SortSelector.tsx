@@ -6,7 +6,8 @@ export type SortField =
   | 'daily_change' 
   | 'allocation' 
   | 'equity' 
-  | 'ytd';
+  | 'ytd'
+  | 'confidence';
 
 export type SortDirection = 'asc' | 'desc';
 
@@ -21,6 +22,7 @@ const SORT_OPTIONS: { field: SortField; label: string; defaultDirection: SortDir
   { field: 'allocation', label: 'Allocation %', defaultDirection: 'desc' },
   { field: 'equity', label: 'Equity Value', defaultDirection: 'desc' },
   { field: 'ytd', label: 'YTD Returns', defaultDirection: 'desc' },
+  { field: 'confidence', label: 'Action Score', defaultDirection: 'desc' },
 ];
 
 interface SortSelectorProps {

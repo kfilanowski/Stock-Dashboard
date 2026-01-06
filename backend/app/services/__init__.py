@@ -9,6 +9,7 @@ from .stock_fetcher import StockFetcher, get_stock_fetcher
 from .calculations import StockCalculations
 from .portfolio_service import PortfolioService, get_portfolio_service
 from .candle_aggregator import CandleAggregator, get_candle_aggregator
+from .stock_analysis import StockAnalysisService, get_stock_analysis_service
 
 __all__ = [
     "StockCache",
@@ -22,5 +23,7 @@ __all__ = [
     "get_portfolio_service",
     "CandleAggregator",
     "get_candle_aggregator",
+    "StockAnalysisService",
+    "get_stock_analysis_service",
 ]
 

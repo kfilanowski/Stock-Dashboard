@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
-import { Trash2, BarChart3, RefreshCw, TrendingUp, TrendingDown } from 'lucide-react';
+import { Trash2, BarChart3, RefreshCw, TrendingUp, TrendingDown, Activity } from 'lucide-react';
 import type { Holding, HistoryPoint } from '../types';
-import { AllocationEditor, InvestmentInfoEditor, MiniStockChart } from './holding';
+import { AllocationEditor, InvestmentInfoEditor, MiniStockChart, ActionScoreBadge } from './holding';
 
 interface HoldingCardProps {
   holding: Holding;
@@ -12,6 +12,7 @@ interface HoldingCardProps {
   actualStart?: string | null;
   onDelete: (id: number) => void;
   onSelect: (ticker: string) => void;
+  onAnalyze: (ticker: string) => void;
   onUpdateAllocation: (id: number, allocation: number) => Promise<void>;
   onUpdateInvestment: (id: number, data: { investment_date?: string; investment_price?: number }) => Promise<void>;
   currentTotalAllocation: number;
@@ -19,6 +20,8 @@ interface HoldingCardProps {
   isRefreshing?: boolean;
   isHistoryLoading?: boolean;
   lastPricesFetched?: Date | null;
+  high52w?: number | null;
+  low52w?: number | null;
 }
 
 export function HoldingCard({ 
@@ -29,14 +32,17 @@ export function HoldingCard({
   expectedStart,
   actualStart,
   onDelete, 
-  onSelect, 
+  onSelect,
+  onAnalyze,
   onUpdateAllocation,
   onUpdateInvestment,
   currentTotalAllocation,
   portfolioTotalValue,
   isRefreshing = false,
   isHistoryLoading = false,
-  lastPricesFetched
+  lastPricesFetched,
+  high52w,
+  low52w
 }: HoldingCardProps) {
   // Calculate period gain for display under price
   const periodGain = useMemo(() => {
@@ -57,6 +63,16 @@ export function HoldingCard({
           <div className="flex items-center gap-2">
             <h3 className="font-bold text-white text-xl">{holding.ticker}</h3>
             {isRefreshing && <RefreshCw className="w-3 h-3 text-accent-cyan/60 animate-spin" />}
+            {/* Action Score Badge */}
+            {history.length > 0 && holding.current_price && (
+              <ActionScoreBadge
+                history={history}
+                currentPrice={holding.current_price}
+                high52w={high52w}
+                low52w={low52w}
+                onClick={() => onAnalyze(holding.ticker)}
+              />
+            )}
           </div>
           <p className="text-white font-semibold text-lg">
             ${holding.current_price?.toFixed(2) ?? '—'}
@@ -81,6 +97,13 @@ export function HoldingCard({
         <div className="flex flex-col items-end gap-1">
           {/* Action buttons */}
           <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            <button
+              onClick={() => onAnalyze(holding.ticker)}
+              className="p-1.5 rounded-lg bg-accent-cyan/10 hover:bg-accent-cyan/20 transition-colors"
+              title="Analyze actions"
+            >
+              <Activity className="w-4 h-4 text-accent-cyan" />
+            </button>
             <button
               onClick={() => onSelect(holding.ticker)}
               className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 transition-colors"

@@ -22,7 +22,8 @@ from .schemas import (
 )
 from .services import (
     PortfolioService, get_portfolio_service,
-    StockFetcher, get_stock_fetcher
+    StockFetcher, get_stock_fetcher,
+    StockAnalysisService, get_stock_analysis_service
 )
 
 # Setup logging
@@ -312,6 +313,61 @@ async def clear_stock_cache(
         "message": f"Cleared intraday cache for {ticker.upper()}",
         "deleted_records": deleted_count
     }
+
+
+# ============ Stock Analysis Endpoints ============
+
+@app.get("/api/v1/stock/{ticker}/analysis")
+async def get_stock_analysis(
+    ticker: str,
+    analysis_service: StockAnalysisService = Depends(get_stock_analysis_service)
+):
+    """
+    Get comprehensive analysis data for a stock.
+    
+    Returns fundamentals (ROIC, sector, margins) and options data (call/put ratio, IV).
+    """
+    return await analysis_service.get_analysis_data(ticker)
+
+
+@app.get("/api/v1/stock/{ticker}/fundamentals")
+async def get_stock_fundamentals(
+    ticker: str,
+    analysis_service: StockAnalysisService = Depends(get_stock_analysis_service)
+):
+    """
+    Get fundamental data for a stock.
+    
+    Returns ROIC, ROE, ROA, sector, industry, profit margins, beta, etc.
+    """
+    return await analysis_service.get_fundamentals(ticker)
+
+
+@app.get("/api/v1/stock/{ticker}/options")
+async def get_stock_options(
+    ticker: str,
+    analysis_service: StockAnalysisService = Depends(get_stock_analysis_service)
+):
+    """
+    Get options data for a stock.
+    
+    Returns call/put ratio, open interest, implied volatility, options sentiment.
+    """
+    return await analysis_service.get_options_data(ticker)
+
+
+@app.get("/api/v1/stock/{ticker}/sector-correlation")
+async def get_stock_sector_correlation(
+    ticker: str,
+    days: int = 60,
+    analysis_service: StockAnalysisService = Depends(get_stock_analysis_service)
+):
+    """
+    Get sector correlation data for a stock.
+    
+    Returns correlation with sector ETF, beta to sector, and sector/industry info.
+    """
+    return await analysis_service.get_sector_correlation(ticker, days)
 
 
 # ============ Health Check ============

@@ -6,6 +6,7 @@ import {
   HoldingCard, 
   AddHoldingModal, 
   StockDetailModal,
+  StockAnalysisModal,
   ChartPeriodSelector,
   SortSelector,
   ErrorBoundary,
@@ -15,10 +16,12 @@ import {
 } from './components';
 import { usePortfolio, type HoldingChartData } from './hooks/usePortfolio';
 import * as api from './services/api';
+import { getQuickAnalysis } from './services/stockScoring';
 
 function App() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
+  const [analyzeTicker, setAnalyzeTicker] = useState<string | null>(null);
   const [holdingChartData, setHoldingChartData] = useState<Record<string, HoldingChartData>>({});
   const [chartPeriod, setChartPeriod] = useState<ChartPeriod>('1d');
   const [sortOption, setSortOption] = useState<SortOption>({ field: 'allocation', direction: 'desc' });
@@ -125,6 +128,17 @@ function App() {
     return ((latestClose - chartData.referenceClose) / chartData.referenceClose) * 100;
   }, [holdingChartData]);
 
+  // Helper to get action score for a holding
+  const getActionScore = useCallback((ticker: string): number | null => {
+    const chartData = holdingChartData[ticker];
+    const holding = portfolio?.holdings.find(h => h.ticker === ticker);
+    if (!chartData?.history?.length || !holding?.current_price) {
+      return null;
+    }
+    const analysis = getQuickAnalysis(chartData.history, holding.current_price, null, null);
+    return analysis?.score ?? null;
+  }, [holdingChartData, portfolio?.holdings]);
+
   // Sort holdings based on current sort option
   const sortedHoldings = useMemo(() => {
     if (!portfolio?.holdings) return [];
@@ -160,6 +174,17 @@ function App() {
         case 'ytd':
           comparison = (a.ytd_return ?? 0) - (b.ytd_return ?? 0);
           break;
+        case 'confidence': {
+          // Sort by action score (0-100)
+          const scoreA = getActionScore(a.ticker);
+          const scoreB = getActionScore(b.ticker);
+          // Put null values at the end
+          if (scoreA === null && scoreB === null) comparison = 0;
+          else if (scoreA === null) comparison = 1;
+          else if (scoreB === null) comparison = -1;
+          else comparison = scoreA - scoreB;
+          break;
+        }
         default:
           comparison = 0;
       }
@@ -168,7 +193,7 @@ function App() {
     });
 
     return holdings;
-  }, [portfolio?.holdings, sortOption, getPeriodGain]);
+  }, [portfolio?.holdings, sortOption, getPeriodGain, getActionScore]);
 
   const handleAddHolding = async (ticker: string, allocation: number) => {
     await addHolding(ticker, allocation);
@@ -310,6 +335,7 @@ function App() {
                               actualStart={chartData?.actualStart ?? null}
                               onDelete={removeHolding}
                               onSelect={setSelectedTicker}
+                              onAnalyze={setAnalyzeTicker}
                               onUpdateAllocation={handleUpdateAllocation}
                               onUpdateInvestment={handleUpdateInvestment}
                               currentTotalAllocation={currentAllocation}
@@ -353,6 +379,16 @@ function App() {
             actualStart: holdingChartData[selectedTicker].actualStart
           } : null}
         />
+
+        {/* Stock Analysis Modal */}
+        {analyzeTicker && (
+          <StockAnalysisModal
+            ticker={analyzeTicker}
+            onClose={() => setAnalyzeTicker(null)}
+            currentPrice={portfolio?.holdings.find(h => h.ticker === analyzeTicker)?.current_price}
+            history={holdingChartData[analyzeTicker]?.history}
+          />
+        )}
       </div>
     </ErrorBoundary>
   );

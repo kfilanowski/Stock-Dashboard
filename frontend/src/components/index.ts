@@ -3,6 +3,7 @@ export { PortfolioSummary } from './PortfolioSummary';
 export { HoldingCard } from './HoldingCard';
 export { AddHoldingModal } from './AddHoldingModal';
 export { StockDetailModal } from './StockDetailModal';
+export { StockAnalysisModal } from './StockAnalysisModal';
 export { ChartPeriodSelector } from './ChartPeriodSelector';
 export { LoadingValue, LoadingSpinner } from './LoadingValue';
 export { SortSelector } from './SortSelector';
