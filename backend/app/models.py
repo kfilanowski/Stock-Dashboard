@@ -12,6 +12,11 @@ class Portfolio(Base):
     total_value = Column(Float, default=10000.0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # User preferences (persisted)
+    chart_period = Column(String, default="1d")  # 1d, 3d, 1w, 1mo, 3mo, 6mo, ytd, 1y, 2y
+    sort_field = Column(String, default="allocation")  # ticker, daily_change, allocation, equity, ytd
+    sort_direction = Column(String, default="desc")  # asc, desc
 
     holdings = relationship("Holding", back_populates="portfolio", cascade="all, delete-orphan")
 

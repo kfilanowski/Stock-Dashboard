@@ -1,48 +1,68 @@
+"""
+Stock Portfolio Dashboard API
+
+Main FastAPI application with versioned API endpoints.
+"""
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
 from contextlib import asynccontextmanager
-from typing import Optional
+import asyncio
 import os
 
+from .config import settings
+from .logging_config import setup_logging, get_logger
 from .database import get_db, init_db, engine
-from .models import Portfolio, Holding, PortfolioSnapshot
+from .models import Portfolio
 from .schemas import (
-    PortfolioCreate, PortfolioUpdate, PortfolioResponse, PortfolioWithData,
-    HoldingCreate, HoldingUpdate, HoldingResponse, HoldingWithData,
-    StockData, PortfolioHistory, PortfolioHistoryPoint
+    PortfolioUpdate, PortfolioResponse, PortfolioWithData,
+    HoldingCreate, HoldingUpdate, HoldingResponse,
+    StockData, PortfolioHistory, PortfolioHistoryPoint,
+    IncrementalHistoryRequest
 )
-from .stock_service import get_stock_data, get_multiple_stocks, get_stock_history, validate_ticker, cleanup_old_data, clear_intraday_cache
-import asyncio
+from .services import (
+    PortfolioService, get_portfolio_service,
+    StockFetcher, get_stock_fetcher
+)
+
+# Setup logging
+setup_logging()
+logger = get_logger(__name__)
 
 
-async def periodic_cleanup():
+async def periodic_cleanup(stock_fetcher: StockFetcher):
     """Run data cleanup every 24 hours."""
     while True:
         await asyncio.sleep(86400)  # 24 hours
         try:
-            cleanup_old_data()
+            daily, intraday = stock_fetcher.cleanup_old_data()
+            logger.info(f"Periodic cleanup complete: {daily} daily, {intraday} intraday")
         except Exception as e:
-            print(f"Error during periodic cleanup: {e}")
+            logger.error(f"Error during periodic cleanup: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create data directory if it doesn't exist
+    """Application lifespan handler."""
+    # Create data directory
     os.makedirs("data", exist_ok=True)
+    
     # Initialize database
     await init_db()
+    logger.info("Database initialized")
     
     # Run cleanup on startup
+    stock_fetcher = get_stock_fetcher()
     try:
-        cleanup_old_data()
+        daily, intraday = stock_fetcher.cleanup_old_data()
+        if daily or intraday:
+            logger.info(f"Startup cleanup: {daily} daily, {intraday} intraday records")
     except Exception as e:
-        print(f"Error during startup cleanup: {e}")
+        logger.error(f"Error during startup cleanup: {e}")
     
     # Start background cleanup task
-    cleanup_task = asyncio.create_task(periodic_cleanup())
+    cleanup_task = asyncio.create_task(periodic_cleanup(stock_fetcher))
     
     yield
     
@@ -53,160 +73,58 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     
-    # Cleanup
+    # Cleanup database connection
     await engine.dispose()
+    logger.info("Application shutdown complete")
 
 
 app = FastAPI(
-    title="Stock Portfolio Dashboard API",
+    title=settings.app_name,
     description="API for managing a mock stock portfolio with live market data",
-    version="1.0.0",
+    version=settings.app_version,
     lifespan=lifespan
 )
 
-# CORS middleware for React frontend
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ============================================================================
+# API v1 Endpoints
+# ============================================================================
+
 # ============ Portfolio Endpoints ============
 
-@app.get("/api/portfolio", response_model=PortfolioWithData)
-async def get_portfolio(db: AsyncSession = Depends(get_db), lite: bool = False):
-    """Get the portfolio. Use lite=true for fast load without live stock data."""
-    result = await db.execute(
-        select(Portfolio).options(selectinload(Portfolio.holdings)).limit(1)
-    )
-    portfolio = result.scalar_one_or_none()
+@app.get("/api/v1/portfolio", response_model=PortfolioWithData)
+@app.get("/api/portfolio", response_model=PortfolioWithData, include_in_schema=False)  # Legacy
+async def get_portfolio(
+    db: AsyncSession = Depends(get_db),
+    portfolio_service: PortfolioService = Depends(get_portfolio_service),
+    lite: bool = False
+):
+    """
+    Get the portfolio with holdings and calculated values.
     
-    # Create default portfolio if none exists
-    if not portfolio:
-        portfolio = Portfolio(name="My Portfolio", total_value=10000.0)
-        db.add(portfolio)
-        await db.commit()
-        await db.refresh(portfolio)
-    
-    # For lite mode, return portfolio structure without live stock data (instant)
-    if lite:
-        holdings_with_data = [
-            HoldingWithData(
-                id=h.id,
-                portfolio_id=h.portfolio_id,
-                ticker=h.ticker,
-                allocation_pct=h.allocation_pct,
-                added_at=h.added_at,
-                investment_date=h.investment_date,
-                investment_price=h.investment_price,
-                current_price=None,
-                current_value=None,
-                ytd_return=None,
-                sma_200=None,
-                price_vs_sma=None,
-                gain_loss=None,
-                gain_loss_pct=None
-            )
-            for h in portfolio.holdings
-        ]
-        return PortfolioWithData(
-            id=portfolio.id,
-            name=portfolio.name,
-            total_value=portfolio.total_value,
-            created_at=portfolio.created_at,
-            updated_at=portfolio.updated_at,
-            holdings=holdings_with_data,
-            current_total_value=None,
-            total_gain_loss=None,
-            total_gain_loss_pct=None
-        )
-    
-    # Full mode: Fetch live data for all holdings (slower)
-    holdings_with_data = []
-    current_total_value = 0
-    total_portfolio_gain_loss = 0
-    
-    if portfolio.holdings:
-        tickers = [h.ticker for h in portfolio.holdings]
-        stock_data = await get_multiple_stocks(tickers)
-        
-        for holding in portfolio.holdings:
-            data = stock_data.get(holding.ticker.upper(), {})
-            allocated_value = portfolio.total_value * (holding.allocation_pct / 100)
-            current_price = data.get('current_price', 0)
-            
-            # Calculate current value based on price movement (using YTD for display)
-            ytd_return = data.get('ytd_return', 0)
-            current_value = allocated_value * (1 + ytd_return / 100)
-            current_total_value += current_value
-            
-            # Calculate gain/loss since investment date (if we have investment_price)
-            gain_loss = None
-            gain_loss_pct = None
-            if holding.investment_price and holding.investment_price > 0 and current_price > 0:
-                # How many shares would we have bought at investment_price?
-                shares = allocated_value / holding.investment_price
-                # What's the current value of those shares?
-                value_now = shares * current_price
-                gain_loss = value_now - allocated_value
-                gain_loss_pct = ((current_price - holding.investment_price) / holding.investment_price) * 100
-                total_portfolio_gain_loss += gain_loss
-            
-            holdings_with_data.append(HoldingWithData(
-                id=holding.id,
-                portfolio_id=holding.portfolio_id,
-                ticker=holding.ticker,
-                allocation_pct=holding.allocation_pct,
-                added_at=holding.added_at,
-                investment_date=holding.investment_date,
-                investment_price=holding.investment_price,
-                current_price=current_price,
-                current_value=round(current_value, 2),
-                ytd_return=ytd_return,
-                sma_200=data.get('sma_200'),
-                price_vs_sma=data.get('price_vs_sma'),
-                gain_loss=round(gain_loss, 2) if gain_loss is not None else None,
-                gain_loss_pct=round(gain_loss_pct, 2) if gain_loss_pct is not None else None
-            ))
-    else:
-        current_total_value = portfolio.total_value
-    
-    # Calculate total gain/loss based on investment dates
-    total_allocated = sum(h.allocation_pct for h in portfolio.holdings) if portfolio.holdings else 0
-    base_invested = portfolio.total_value * (total_allocated / 100)
-    
-    # Only show portfolio gain/loss if we have investment prices for all holdings
-    all_have_investment_price = all(h.investment_price for h in portfolio.holdings) if portfolio.holdings else False
-    
-    if all_have_investment_price and base_invested > 0:
-        total_gain_loss = total_portfolio_gain_loss
-        total_gain_loss_pct = (total_gain_loss / base_invested * 100)
-    else:
-        total_gain_loss = None
-        total_gain_loss_pct = None
-    
-    return PortfolioWithData(
-        id=portfolio.id,
-        name=portfolio.name,
-        total_value=portfolio.total_value,
-        created_at=portfolio.created_at,
-        updated_at=portfolio.updated_at,
-        holdings=holdings_with_data,
-        current_total_value=round(current_total_value, 2),
-        total_gain_loss=round(total_gain_loss, 2),
-        total_gain_loss_pct=round(total_gain_loss_pct, 2)
-    )
+    Use `lite=true` for fast load without live stock data.
+    """
+    return await portfolio_service.get_portfolio(db, lite)
 
 
-@app.put("/api/portfolio", response_model=PortfolioResponse)
+@app.put("/api/v1/portfolio", response_model=PortfolioResponse)
+@app.put("/api/portfolio", response_model=PortfolioResponse, include_in_schema=False)  # Legacy
 async def update_portfolio(
     portfolio_update: PortfolioUpdate,
     db: AsyncSession = Depends(get_db)
 ):
-    """Update portfolio settings (name, total value)."""
+    """Update portfolio settings (name, total value, chart period, sort options)."""
+    from sqlalchemy.orm import selectinload
+    
     result = await db.execute(
         select(Portfolio).options(selectinload(Portfolio.holdings)).limit(1)
     )
@@ -220,140 +138,82 @@ async def update_portfolio(
         portfolio.name = portfolio_update.name
     if portfolio_update.total_value is not None:
         portfolio.total_value = portfolio_update.total_value
+    if portfolio_update.chart_period is not None:
+        portfolio.chart_period = portfolio_update.chart_period
+    if portfolio_update.sort_field is not None:
+        portfolio.sort_field = portfolio_update.sort_field
+    if portfolio_update.sort_direction is not None:
+        portfolio.sort_direction = portfolio_update.sort_direction
     
     await db.commit()
     await db.refresh(portfolio)
+    # Reload with holdings relationship for response serialization
+    result = await db.execute(
+        select(Portfolio).options(selectinload(Portfolio.holdings)).where(Portfolio.id == portfolio.id)
+    )
+    portfolio = result.scalar_one()
     
+    logger.info(f"Updated portfolio: {portfolio.name}, ${portfolio.total_value:,.2f}")
     return portfolio
 
 
 # ============ Holdings Endpoints ============
 
-@app.post("/api/holdings", response_model=HoldingResponse)
+@app.post("/api/v1/holdings", response_model=HoldingResponse)
+@app.post("/api/holdings", response_model=HoldingResponse, include_in_schema=False)  # Legacy
 async def add_holding(
     holding: HoldingCreate,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    portfolio_service: PortfolioService = Depends(get_portfolio_service)
 ):
     """Add a stock holding to the portfolio."""
-    # Get or create portfolio
-    result = await db.execute(select(Portfolio).limit(1))
-    portfolio = result.scalar_one_or_none()
-    
-    if not portfolio:
-        portfolio = Portfolio()
-        db.add(portfolio)
-        await db.commit()
-        await db.refresh(portfolio)
-    
-    # Check if ticker already exists
-    existing = await db.execute(
-        select(Holding).where(
-            Holding.portfolio_id == portfolio.id,
-            Holding.ticker == holding.ticker.upper()
-        )
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail=f"Holding for {holding.ticker} already exists")
-    
-    # Check total allocation doesn't exceed 100%
-    result = await db.execute(
-        select(Holding).where(Holding.portfolio_id == portfolio.id)
-    )
-    current_holdings = result.scalars().all()
-    total_allocated = sum(h.allocation_pct for h in current_holdings)
-    
-    if total_allocated + holding.allocation_pct > 100:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Total allocation would exceed 100%. Currently allocated: {total_allocated}%"
-        )
-    
-    # Validate ticker exists (fast validation)
-    is_valid, _ = await validate_ticker(holding.ticker)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail=f"Invalid ticker: {holding.ticker}")
-    
-    new_holding = Holding(
-        portfolio_id=portfolio.id,
-        ticker=holding.ticker.upper(),
-        allocation_pct=holding.allocation_pct,
-        investment_date=holding.investment_date,
-        investment_price=holding.investment_price
-    )
-    db.add(new_holding)
-    await db.commit()
-    await db.refresh(new_holding)
-    
-    return new_holding
+    try:
+        return await portfolio_service.add_holding(db, holding)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.delete("/api/holdings/{holding_id}")
-async def delete_holding(holding_id: int, db: AsyncSession = Depends(get_db)):
-    """Remove a holding from the portfolio."""
-    result = await db.execute(select(Holding).where(Holding.id == holding_id))
-    holding = result.scalar_one_or_none()
-    
-    if not holding:
-        raise HTTPException(status_code=404, detail="Holding not found")
-    
-    await db.delete(holding)
-    await db.commit()
-    
-    return {"message": "Holding deleted successfully"}
-
-
-@app.put("/api/holdings/{holding_id}", response_model=HoldingResponse)
+@app.put("/api/v1/holdings/{holding_id}", response_model=HoldingResponse)
+@app.put("/api/holdings/{holding_id}", response_model=HoldingResponse, include_in_schema=False)  # Legacy
 async def update_holding(
     holding_id: int,
     holding_update: HoldingUpdate,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    portfolio_service: PortfolioService = Depends(get_portfolio_service)
 ):
-    """Update a holding's allocation percentage, investment date, or investment price."""
-    result = await db.execute(select(Holding).where(Holding.id == holding_id))
-    holding = result.scalar_one_or_none()
-    
-    if not holding:
+    """Update a holding's allocation or investment info."""
+    try:
+        return await portfolio_service.update_holding(db, holding_id, holding_update)
+    except ValueError as e:
+        if "not found" in str(e).lower():
+            raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/v1/holdings/{holding_id}")
+@app.delete("/api/holdings/{holding_id}", include_in_schema=False)  # Legacy
+async def delete_holding(
+    holding_id: int,
+    db: AsyncSession = Depends(get_db),
+    portfolio_service: PortfolioService = Depends(get_portfolio_service)
+):
+    """Remove a holding from the portfolio."""
+    deleted = await portfolio_service.delete_holding(db, holding_id)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Holding not found")
-    
-    # Check total allocation if allocation is being updated
-    if holding_update.allocation_pct is not None:
-        result = await db.execute(
-            select(Holding).where(
-                Holding.portfolio_id == holding.portfolio_id,
-                Holding.id != holding_id
-            )
-        )
-        other_holdings = result.scalars().all()
-        total_allocated = sum(h.allocation_pct for h in other_holdings)
-        
-        if total_allocated + holding_update.allocation_pct > 100:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Total allocation would exceed 100%. Other holdings: {total_allocated}%"
-            )
-        
-        holding.allocation_pct = holding_update.allocation_pct
-    
-    # Update investment date if provided
-    if holding_update.investment_date is not None:
-        holding.investment_date = holding_update.investment_date
-    
-    # Update investment price if provided
-    if holding_update.investment_price is not None:
-        holding.investment_price = holding_update.investment_price
-    
-    await db.commit()
-    await db.refresh(holding)
-    
-    return holding
+    return {"message": "Holding deleted successfully"}
 
 
 # ============ Stock Data Endpoints ============
 
-@app.get("/api/stock/{ticker}", response_model=StockData)
-async def get_stock(ticker: str):
+@app.get("/api/v1/stock/{ticker}", response_model=StockData)
+@app.get("/api/stock/{ticker}", response_model=StockData, include_in_schema=False)  # Legacy
+async def get_stock(
+    ticker: str,
+    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
+):
     """Get detailed stock data including price, YTD, SMA(200), and history."""
-    data = await get_stock_data(ticker)
+    data = await stock_fetcher.get_stock_data(ticker)
     
     if data['current_price'] == 0:
         raise HTTPException(status_code=404, detail=f"Stock not found: {ticker}")
@@ -361,10 +221,14 @@ async def get_stock(ticker: str):
     return StockData(**data)
 
 
-@app.get("/api/stock/{ticker}/quote")
-async def get_stock_quote(ticker: str):
+@app.get("/api/v1/stock/{ticker}/quote")
+@app.get("/api/stock/{ticker}/quote", include_in_schema=False)  # Legacy
+async def get_stock_quote(
+    ticker: str,
+    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
+):
     """Get just the current price data for a single stock (lightweight refresh)."""
-    data = await get_stock_data(ticker)
+    data = await stock_fetcher.get_stock_data(ticker)
     
     if data['current_price'] == 0:
         raise HTTPException(status_code=404, detail=f"Stock not found: {ticker}")
@@ -381,13 +245,19 @@ async def get_stock_quote(ticker: str):
     }
 
 
-@app.get("/api/stock/{ticker}/history")
-async def get_stock_history_endpoint(ticker: str, period: str = "1y"):
-    """Get extended historical data for a stock.
+@app.get("/api/v1/stock/{ticker}/history")
+@app.get("/api/stock/{ticker}/history", include_in_schema=False)  # Legacy
+async def get_stock_history(
+    ticker: str,
+    period: str = "1y",
+    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
+):
+    """
+    Get extended historical data for a stock.
     
     Returns history data, reference_close, and data completeness info.
     """
-    result = await get_stock_history(ticker, period)
+    result = await stock_fetcher.get_stock_history(ticker, period)
     
     if not result.get("history"):
         raise HTTPException(status_code=404, detail=f"No history found for: {ticker}")
@@ -402,17 +272,22 @@ async def get_stock_history_endpoint(ticker: str, period: str = "1y"):
     }
 
 
-@app.post("/api/stocks/history")
-async def get_multiple_stock_histories(tickers: list[str], period: str = "1y"):
-    """Get historical data for multiple stocks at once.
+@app.post("/api/v1/stocks/history")
+@app.post("/api/stocks/history", include_in_schema=False)  # Legacy
+async def get_multiple_stock_histories(
+    tickers: list[str],
+    period: str = "1y",
+    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
+):
+    """
+    Get historical data for multiple stocks at once.
     
-    More efficient than calling individual endpoints - processes sequentially
-    to avoid yfinance data corruption but returns all results in one response.
+    Processes sequentially to avoid yfinance data corruption.
     """
     results = {}
     for ticker in tickers:
         try:
-            result = await get_stock_history(ticker, period)
+            result = await stock_fetcher.get_stock_history(ticker, period)
             results[ticker.upper()] = {
                 "history": result.get("history", []),
                 "reference_close": result.get("reference_close"),
@@ -421,7 +296,7 @@ async def get_multiple_stock_histories(tickers: list[str], period: str = "1y"):
                 "actual_start": result.get("actual_start")
             }
         except Exception as e:
-            print(f"Error fetching history for {ticker}: {e}")
+            logger.warning(f"Error fetching history for {ticker}: {e}")
             results[ticker.upper()] = {
                 "history": [],
                 "reference_close": None,
@@ -432,52 +307,108 @@ async def get_multiple_stock_histories(tickers: list[str], period: str = "1y"):
     return results
 
 
+# ============ Batch & Incremental Endpoints ============
+
+@app.get("/api/v1/prices")
+async def get_batch_prices(
+    tickers: str,
+    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
+):
+    """
+    Get current prices for multiple tickers in one efficient batch call.
+    
+    This is optimized for frequent polling - only fetches price data,
+    not historical data or other metadata.
+    
+    Args:
+        tickers: Comma-separated list of ticker symbols (e.g., "AAPL,MSFT,GOOG")
+    
+    Returns:
+        Dict of ticker -> price data with current_price, change, change_pct, market_state
+    """
+    ticker_list = [t.strip().upper() for t in tickers.split(',') if t.strip()]
+    
+    if not ticker_list:
+        return {}
+    
+    return await stock_fetcher.get_batch_prices(ticker_list)
+
+
+@app.post("/api/v1/stocks/history/incremental")
+async def get_incremental_history(
+    request: IncrementalHistoryRequest,
+    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
+):
+    """
+    Get only NEW intraday history data since the provided timestamps.
+    
+    This is the key endpoint for efficient chart updates:
+    - Frontend tracks the latest timestamp it has for each ticker
+    - On refresh, sends those timestamps here
+    - Backend fetches only new data points
+    - Returns minimal data for chart updates
+    
+    Example request:
+    ```json
+    {
+        "tickers": ["AAPL", "MSFT"],
+        "interval": "1m",
+        "since_timestamps": {
+            "AAPL": "2024-01-15T10:30:00",
+            "MSFT": "2024-01-15T10:30:00"
+        }
+    }
+    ```
+    
+    Returns:
+        Dict of ticker -> {new_points: [...], latest_timestamp: str, count: int}
+    """
+    return await stock_fetcher.get_incremental_intraday(
+        tickers=request.tickers,
+        interval=request.interval,
+        since_timestamps=request.since_timestamps
+    )
+
+
 # ============ Portfolio History ============
 
-@app.get("/api/portfolio/history", response_model=PortfolioHistory)
-async def get_portfolio_history(db: AsyncSession = Depends(get_db)):
+@app.get("/api/v1/portfolio/history", response_model=PortfolioHistory)
+@app.get("/api/portfolio/history", response_model=PortfolioHistory, include_in_schema=False)  # Legacy
+async def get_portfolio_history(
+    db: AsyncSession = Depends(get_db),
+    portfolio_service: PortfolioService = Depends(get_portfolio_service)
+):
     """Get portfolio value history over time."""
-    result = await db.execute(
-        select(PortfolioSnapshot).order_by(PortfolioSnapshot.timestamp)
-    )
-    snapshots = result.scalars().all()
-    
+    history = await portfolio_service.get_history(db)
     return PortfolioHistory(
-        history=[
-            PortfolioHistoryPoint(timestamp=s.timestamp, total_value=s.total_value)
-            for s in snapshots
-        ]
+        history=[PortfolioHistoryPoint(**h) for h in history]
     )
 
 
-@app.post("/api/portfolio/snapshot")
-async def create_portfolio_snapshot(db: AsyncSession = Depends(get_db)):
+@app.post("/api/v1/portfolio/snapshot")
+@app.post("/api/portfolio/snapshot", include_in_schema=False)  # Legacy
+async def create_portfolio_snapshot(
+    db: AsyncSession = Depends(get_db),
+    portfolio_service: PortfolioService = Depends(get_portfolio_service)
+):
     """Create a snapshot of the current portfolio value."""
-    # Get portfolio with live data
-    portfolio_data = await get_portfolio(db)
+    value = await portfolio_service.create_snapshot(db)
     
-    result = await db.execute(select(Portfolio).limit(1))
-    portfolio = result.scalar_one_or_none()
-    
-    if portfolio:
-        snapshot = PortfolioSnapshot(
-            portfolio_id=portfolio.id,
-            total_value=portfolio_data.current_total_value or portfolio.total_value
-        )
-        db.add(snapshot)
-        await db.commit()
-        
-        return {"message": "Snapshot created", "value": snapshot.total_value}
-    
+    if value is not None:
+        return {"message": "Snapshot created", "value": value}
     return {"message": "No portfolio found"}
 
 
 # ============ Cache Management ============
 
-@app.delete("/api/stock/{ticker}/cache")
-async def clear_stock_cache(ticker: str):
-    """Clear the intraday cache for a specific stock. Forces fresh data fetch on next request."""
-    deleted_count = clear_intraday_cache(ticker)
+@app.delete("/api/v1/stock/{ticker}/cache")
+@app.delete("/api/stock/{ticker}/cache", include_in_schema=False)  # Legacy
+async def clear_stock_cache(
+    ticker: str,
+    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
+):
+    """Clear the intraday cache for a specific stock."""
+    deleted_count = stock_fetcher.clear_ticker_cache(ticker)
     return {
         "message": f"Cleared intraday cache for {ticker.upper()}",
         "deleted_records": deleted_count
@@ -486,8 +417,12 @@ async def clear_stock_cache(ticker: str):
 
 # ============ Health Check ============
 
-@app.get("/api/health")
+@app.get("/api/v1/health")
+@app.get("/api/health", include_in_schema=False)  # Legacy
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "service": "stock-dashboard-api"}
-
+    return {
+        "status": "healthy",
+        "service": settings.app_name,
+        "version": settings.app_version
+    }

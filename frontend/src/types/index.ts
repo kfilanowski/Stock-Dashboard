@@ -25,6 +25,10 @@ export interface Portfolio {
   current_total_value?: number;
   total_gain_loss?: number;
   total_gain_loss_pct?: number;
+  // User preferences (persisted in database)
+  chart_period?: string;
+  sort_field?: string;
+  sort_direction?: string;
 }
 
 export interface StockData {

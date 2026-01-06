@@ -8,6 +8,7 @@ export { ChartPeriodSelector } from './ChartPeriodSelector';
 export { LoadingValue, LoadingSpinner } from './LoadingValue';
 export { RefreshTimer } from './RefreshTimer';
 export { SortSelector } from './SortSelector';
+export { ErrorBoundary, SectionErrorBoundary } from './ErrorBoundary';
 export type { ChartPeriod } from './ChartPeriodSelector';
 export type { SortField, SortDirection, SortOption } from './SortSelector';
 

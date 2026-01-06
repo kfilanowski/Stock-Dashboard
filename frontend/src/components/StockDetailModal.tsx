@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useRef } from 'react';
 import { X, TrendingUp, TrendingDown, Calendar, BarChart2 } from 'lucide-react';
 import { 
   Line, XAxis, YAxis, Tooltip, ResponsiveContainer, 
@@ -7,6 +7,10 @@ import {
 import type { StockData, HistoryPoint } from '../types';
 import * as api from '../services/api';
 import { ChartPeriodSelector, type ChartPeriod } from './ChartPeriodSelector';
+
+// Extended hours trading window (4 AM to 8 PM Eastern)
+const EXTENDED_START_MINUTES = 4 * 60;    // 4:00 AM = 240 minutes
+const EXTENDED_END_MINUTES = 20 * 60;     // 8:00 PM = 1200 minutes
 
 // Market hours in Eastern Time (24-hour format)
 const MARKET_OPEN = 9 * 60 + 30;  // 9:30 AM = 570 minutes
@@ -27,21 +31,86 @@ function isMarketHours(dateStr: string): boolean {
   return minutes >= MARKET_OPEN && minutes < MARKET_CLOSE;
 }
 
+// Check if this is intraday data (has time component)
+function isIntradayData(history: HistoryPoint[]): boolean {
+  if (!history.length) return false;
+  return history[0].date.includes(' ');
+}
+
+// Convert date string to minutes since midnight (for X-axis positioning)
+function dateToMinutes(dateStr: string): number {
+  if (!dateStr.includes(' ')) return 0;
+  const timePart = dateStr.split(' ')[1];
+  return parseTimeToMinutes(timePart);
+}
+
+// Get the trading day from a date string
+function getTradingDay(dateStr: string): string {
+  if (dateStr.includes(' ')) {
+    return dateStr.split(' ')[0];
+  }
+  return dateStr;
+}
+
+// Convert xValue (minutes since start of chart) to time string for X-axis labels
+function minutesToTimeLabel(minutes: number, numDays: number): string {
+  const minutesPerDay = EXTENDED_END_MINUTES - EXTENDED_START_MINUTES; // 960 (4AM to 8PM)
+  
+  // Calculate which day and minute within day
+  // For values at exact day boundaries (960, 1920, etc), treat as end of previous day
+  let dayIndex: number;
+  let minuteWithinDay: number;
+  
+  if (minutes > 0 && minutes % minutesPerDay === 0) {
+    // Exact end of a day (8PM) - belongs to the previous day
+    dayIndex = (minutes / minutesPerDay) - 1;
+    minuteWithinDay = minutesPerDay; // 960 = 8PM position
+  } else {
+    dayIndex = Math.floor(minutes / minutesPerDay);
+    minuteWithinDay = minutes % minutesPerDay;
+  }
+  
+  // Convert to actual clock time (minuteWithinDay is 0-960, representing 4AM-8PM)
+  // 0 = 4AM (240 min from midnight), 960 = 8PM (1200 min from midnight)
+  const minutesSinceMidnight = minuteWithinDay + EXTENDED_START_MINUTES;
+  
+  const hours = Math.floor(minutesSinceMidnight / 60);
+  const mins = minutesSinceMidnight % 60;
+  const ampm = hours >= 12 ? 'PM' : 'AM';
+  const hours12 = hours % 12 || 12;
+  
+  // For clean hour marks, don't show minutes
+  const timeStr = mins === 0 ? `${hours12}${ampm}` : `${hours12}:${mins.toString().padStart(2, '0')}${ampm}`;
+  
+  if (numDays > 1) {
+    return `D${dayIndex + 1} ${timeStr}`;
+  }
+  return timeStr;
+}
+
 interface StockDetailModalProps {
   ticker: string | null;
   onClose: () => void;
+  chartPeriod: ChartPeriod;
+  onChartPeriodChange: (period: ChartPeriod) => void;
+  lastPricesFetched?: Date | null;
 }
 
-export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
+export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodChange, lastPricesFetched }: StockDetailModalProps) {
   const [stock, setStock] = useState<StockData | null>(null);
   const [loading, setLoading] = useState(false);
-  const [period, setPeriod] = useState<ChartPeriod>('1d');
   const [chartHistory, setChartHistory] = useState<HistoryPoint[]>([]);
   const [referenceClose, setReferenceClose] = useState<number | null>(null);
   const [chartLoading, setChartLoading] = useState(false);
   const [isDataComplete, setIsDataComplete] = useState(true);
   const [expectedStart, setExpectedStart] = useState<string | null>(null);
   const [actualStart, setActualStart] = useState<string | null>(null);
+  
+  // Ping animation state - triggers when prices API returns
+  const [pingKey, setPingKey] = useState(0);
+  const [showPing, setShowPing] = useState(false);
+  const prevTimestampRef = useRef<number | null>(null);
+  const isFirstPricesFetch = useRef(true);
 
   // Fetch stock data on mount
   useEffect(() => {
@@ -69,10 +138,14 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
   useEffect(() => {
     if (!ticker) return;
 
+    // Clear old data immediately when period changes to avoid stale display
+    setChartHistory([]);
+    setReferenceClose(null);
+
     const fetchHistory = async () => {
       setChartLoading(true);
       try {
-        const result = await api.getStockHistory(ticker, period);
+        const result = await api.getStockHistory(ticker, chartPeriod);
         setChartHistory(result.history);
         setReferenceClose(result.reference_close);
         setIsDataComplete(result.is_complete);
@@ -91,7 +164,34 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
     };
 
     fetchHistory();
-  }, [ticker, period]);
+  }, [ticker, chartPeriod]);
+
+  // Trigger ping when prices API returns (not just when data changes)
+  useEffect(() => {
+    const currentTimestamp = lastPricesFetched?.getTime() ?? null;
+    
+    // Skip the first render
+    if (isFirstPricesFetch.current) {
+      isFirstPricesFetch.current = false;
+      prevTimestampRef.current = currentTimestamp;
+      return;
+    }
+    
+    // Trigger ping when prices API returns with data
+    if (currentTimestamp !== null && currentTimestamp !== prevTimestampRef.current) {
+      setPingKey(prev => prev + 1);
+      setShowPing(true);
+      const timer = setTimeout(() => setShowPing(false), 1200);
+      prevTimestampRef.current = currentTimestamp;
+      return () => clearTimeout(timer);
+    }
+    
+    prevTimestampRef.current = currentTimestamp;
+  }, [lastPricesFetched]);
+
+  // Check if this is an intraday period
+  const isIntraday = ['1d', '3d', '1w'].includes(chartPeriod);
+  const hasIntradayData = useMemo(() => isIntradayData(chartHistory), [chartHistory]);
 
   // Calculate period gain
   const periodGain = useMemo(() => {
@@ -109,9 +209,6 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
   // Line and gradient colors based on performance
   const lineColor = isAboveReference ? '#22c55e' : '#ef4444'; // green-500 or red-500
   const gradientId = `colorClose-${isAboveReference ? 'green' : 'red'}`;
-
-  // Check if this is an intraday period
-  const isIntraday = ['1d', '3d', '1w'].includes(period);
 
   // Calculate Y-axis domain to include reference close
   const yAxisDomain = useMemo(() => {
@@ -140,33 +237,105 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
     return [min - padding, max + padding] as [number, number];
   }, [chartHistory, referenceClose, isIntraday, stock?.sma_200]);
 
-  // Process data to find extended hours ranges (for intraday charts)
-  const extendedHoursRanges = useMemo(() => {
-    if (!isIntraday || !chartHistory.length) return [];
+  // Process chart data with time-based positioning for intraday
+  const { processedHistory, extendedHoursRanges, xDomain, numTradingDays } = useMemo(() => {
+    if (!chartHistory.length) {
+      return { 
+        processedHistory: [], 
+        extendedHoursRanges: [], 
+        xDomain: [0, 100] as [number, number],
+        numTradingDays: 1
+      };
+    }
     
-    const ranges: { startDate: string; endDate: string }[] = [];
-    let rangeStart: string | null = null;
+    if (!hasIntradayData) {
+      // For daily data, use simple index-based positioning
+      const processed = chartHistory.map((h, idx) => ({
+        ...h,
+        xValue: idx,
+        isExtendedHours: false
+      }));
+      // Ensure domain has width even with single data point
+      const maxIdx = Math.max(chartHistory.length - 1, 1);
+      return { 
+        processedHistory: processed, 
+        extendedHoursRanges: [], 
+        xDomain: [0, maxIdx] as [number, number],
+        numTradingDays: 0
+      };
+    }
     
-    for (let i = 0; i < chartHistory.length; i++) {
-      const point = chartHistory[i];
-      const isExtended = !isMarketHours(point.date);
+    // For intraday data, use time-based positioning
+    const tradingDays = [...new Set(chartHistory.map(h => getTradingDay(h.date)))].sort();
+    const numDays = tradingDays.length;
+    const minutesPerDay = EXTENDED_END_MINUTES - EXTENDED_START_MINUTES; // 960 minutes (4 AM to 8 PM)
+    
+    const processed = chartHistory.map((h) => {
+      const dayIndex = tradingDays.indexOf(getTradingDay(h.date));
+      const minuteOfDay = dateToMinutes(h.date);
+      // Position within the full time range: dayIndex * dayWidth + position within day
+      const xValue = (dayIndex * minutesPerDay) + (minuteOfDay - EXTENDED_START_MINUTES);
       
-      if (isExtended) {
-        if (rangeStart === null) rangeStart = point.date;
+      return {
+        ...h,
+        xValue,
+        minuteOfDay,
+        isExtendedHours: !isMarketHours(h.date)
+      };
+    });
+    
+    // FIXED domain: Always show full trading day(s) from 4 AM to 8 PM
+    const domain: [number, number] = [0, numDays * minutesPerDay];
+    
+    // Find extended hours ranges (for shading) using xValue
+    const ranges: { start: number; end: number }[] = [];
+    let rangeStart: number | null = null;
+    
+    for (let i = 0; i < processed.length; i++) {
+      if (processed[i].isExtendedHours) {
+        if (rangeStart === null) rangeStart = processed[i].xValue;
       } else {
         if (rangeStart !== null) {
-          ranges.push({ startDate: rangeStart, endDate: chartHistory[i - 1].date });
+          ranges.push({ start: rangeStart, end: processed[i - 1].xValue });
           rangeStart = null;
         }
       }
     }
-    // Close any open range
-    if (rangeStart !== null) {
-      ranges.push({ startDate: rangeStart, endDate: chartHistory[chartHistory.length - 1].date });
+    if (rangeStart !== null && processed.length > 0) {
+      ranges.push({ start: rangeStart, end: processed[processed.length - 1].xValue });
     }
     
-    return ranges;
-  }, [chartHistory, isIntraday]);
+    return { processedHistory: processed, extendedHoursRanges: ranges, xDomain: domain, numTradingDays: numDays };
+  }, [chartHistory, hasIntradayData]);
+
+  // Generate nice tick values for intraday X-axis
+  const xAxisTicks = useMemo(() => {
+    if (!hasIntradayData || numTradingDays === 0) return undefined;
+    
+    const minutesPerDay = EXTENDED_END_MINUTES - EXTENDED_START_MINUTES; // 960 minutes
+    const ticks: number[] = [];
+    
+    if (numTradingDays === 1) {
+      // 1 day: Show 4AM, 8AM, 12PM, 4PM, 8PM (5 ticks)
+      [4, 8, 12, 16, 20].forEach(hour => {
+        ticks.push((hour * 60) - EXTENDED_START_MINUTES);
+      });
+    } else if (numTradingDays <= 3) {
+      // 3 days: Show 4AM and 12PM per day only (6 ticks max)
+      for (let day = 0; day < numTradingDays; day++) {
+        ticks.push(day * minutesPerDay); // 4AM
+        ticks.push(day * minutesPerDay + (12 * 60 - EXTENDED_START_MINUTES)); // 12PM
+      }
+    } else {
+      // 1 week (5 days): Show only 9AM per day (market open-ish)
+      for (let day = 0; day < numTradingDays; day++) {
+        ticks.push(day * minutesPerDay + (9 * 60 - EXTENDED_START_MINUTES)); // 9AM
+      }
+    }
+    
+    console.log('xAxisTicks:', { numTradingDays, ticks, hasIntradayData });
+    return ticks;
+  }, [hasIntradayData, numTradingDays]);
 
   // Convert 24-hour time (HH:MM) to 12-hour format
   const formatTime12Hour = (time24: string): string => {
@@ -177,48 +346,59 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
     return `${hours12}:${minutes.toString().padStart(2, '0')} ${ampm}`;
   };
 
-  // Format date/time properly
+  // Format date/time properly for tooltip
+  // Parse manually to avoid timezone issues (new Date("YYYY-MM-DD") is UTC, causes day-off errors)
   const formatDate = (dateStr: string, includeTime: boolean): string => {
     if (!dateStr) return '';
+    
+    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const currentYear = new Date().getFullYear();
     
     // Check if it contains time (format: "YYYY-MM-DD HH:MM")
     if (dateStr.includes(' ')) {
       const [datePart, timePart] = dateStr.split(' ');
-      try {
-        const date = new Date(datePart);
-        if (isNaN(date.getTime())) return dateStr;
-        const time12 = formatTime12Hour(timePart);
-        if (includeTime) {
-          const formattedDate = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-          return `${formattedDate} ${time12}`;
-        }
-        return time12; // Just time for X-axis
-      } catch {
-        return dateStr;
+      const [year, month, day] = datePart.split('-').map(Number);
+      if (isNaN(year) || isNaN(month) || isNaN(day)) return dateStr;
+      
+      const time12 = formatTime12Hour(timePart);
+      if (includeTime) {
+        // Include year if different from current year
+        const formattedDate = year !== currentYear
+          ? `${year} ${monthNames[month - 1]} ${day}`
+          : `${monthNames[month - 1]} ${day}`;
+        return `${formattedDate} ${time12}`;
       }
+      return time12; // Just time for X-axis
     }
     
     // Daily format (YYYY-MM-DD)
-    try {
-      const date = new Date(dateStr);
-      if (isNaN(date.getTime())) return dateStr;
-      if (includeTime) {
-        return date.toLocaleDateString('en-US', { 
-          weekday: 'short', 
-          month: 'short', 
-          day: 'numeric',
-          year: 'numeric'
-        });
-      }
-      return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-    } catch {
-      return dateStr;
+    const [year, month, day] = dateStr.split('-').map(Number);
+    if (isNaN(year) || isNaN(month) || isNaN(day)) return dateStr;
+    
+    if (includeTime) {
+      // Create date in local time for weekday calculation
+      const localDate = new Date(year, month - 1, day);
+      const weekday = dayNames[localDate.getDay()];
+      // Always include year for daily data in tooltip
+      return `${weekday}, ${monthNames[month - 1]} ${day}, ${year}`;
     }
+    // Include year if different from current year (for X-axis labels)
+    return year !== currentYear 
+      ? `${year} ${monthNames[month - 1]} ${day}`
+      : `${monthNames[month - 1]} ${day}`;
   };
 
-  // Format X-axis labels based on period
-  const formatXAxis = (dateStr: string) => {
-    return formatDate(dateStr, false);
+  // Format X-axis labels
+  const formatXAxis = (value: number | string) => {
+    if (hasIntradayData && typeof value === 'number') {
+      return minutesToTimeLabel(value, numTradingDays);
+    }
+    // Daily data - value is the date string
+    if (typeof value === 'string') {
+      return formatDate(value, false);
+    }
+    return '';
   };
 
   // Calculate gain % for a specific price point
@@ -230,16 +410,18 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
   };
 
   // Custom tooltip with percentage gain
-  const CustomTooltip = ({ active, payload, label }: any) => {
+  const CustomTooltip = ({ active, payload }: any) => {
     if (!active || !payload || !payload.length) return null;
     
+    const dataPoint = payload[0]?.payload;
     const price = payload[0]?.value;
     const gainStr = calculateGainFromRef(price);
+    const dateStr = dataPoint?.date ?? '';
     
     return (
       <div className="bg-[rgba(10,10,15,0.95)] border border-white/10 rounded-lg px-3 py-2 shadow-xl">
-        <p className="text-white/60 text-xs mb-1">{formatDate(String(label), true)}</p>
-        <p className="text-white font-medium text-sm">${price?.toFixed(2)}</p>
+        <p className="text-white/60 text-xs">{formatDate(dateStr, true)}</p>
+        <p className="text-white font-medium text-sm mt-1">${price?.toFixed(2)}</p>
         {gainStr && (
           <p className={`text-xs mt-0.5 ${price >= (referenceClose ?? 0) ? 'text-green-400' : 'text-red-400'}`}>
             {gainStr} vs prev close
@@ -252,7 +434,6 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
   if (!ticker) return null;
 
   const isPositive = (stock?.ytd_return ?? 0) >= 0;
-  const isAboveSMA = (stock?.price_vs_sma ?? 0) >= 0;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -356,7 +537,7 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
 
             {/* Period Selector */}
             <div className="mb-4">
-              <ChartPeriodSelector selected={period} onSelect={setPeriod} />
+              <ChartPeriodSelector selected={chartPeriod} onSelect={onChartPeriodChange} />
             </div>
 
             {/* Reference Close Info */}
@@ -376,8 +557,16 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
                   <div className="w-8 h-8 border-2 border-white/20 border-t-accent-cyan rounded-full animate-spin" />
                 </div>
               )}
+              {/* Limited data notice */}
+              {!chartLoading && processedHistory.length > 0 && processedHistory.length <= 3 && (
+                <div className="absolute top-4 right-4 z-10 bg-yellow-500/20 border border-yellow-500/30 rounded-lg px-3 py-1.5">
+                  <span className="text-yellow-400 text-xs">
+                    Limited data ({processedHistory.length} {processedHistory.length === 1 ? 'point' : 'points'})
+                  </span>
+                </div>
+              )}
               {/* Missing data indicator - gray left section */}
-              {!isDataComplete && chartHistory.length > 0 && !chartLoading && (
+              {!isDataComplete && processedHistory.length > 0 && !chartLoading && (
                 <div 
                   className="absolute left-4 top-4 bottom-4 bg-gradient-to-r from-gray-500/20 to-transparent pointer-events-none z-[1] rounded-l-lg"
                   style={{ width: '15%' }}
@@ -389,7 +578,7 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
                 </div>
               )}
               <ResponsiveContainer width="100%" height="100%">
-                <ComposedChart data={chartHistory}>
+                <ComposedChart data={processedHistory}>
                   <defs>
                     <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
                       <stop offset="5%" stopColor={lineColor} stopOpacity={0.3}/>
@@ -401,14 +590,28 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
-                  <XAxis 
-                    dataKey="date" 
-                    stroke="rgba(255,255,255,0.3)"
-                    tick={{ fill: 'rgba(255,255,255,0.5)', fontSize: 11 }}
-                    tickFormatter={formatXAxis}
-                    interval="preserveStartEnd"
-                    minTickGap={isIntraday ? 60 : 40}
-                  />
+                  
+                  {/* X-axis: numeric for intraday, category for daily */}
+                  {hasIntradayData ? (
+                    <XAxis 
+                      dataKey="xValue"
+                      type="number"
+                      domain={xDomain}
+                      stroke="rgba(255,255,255,0.3)"
+                      tick={{ fill: 'rgba(255,255,255,0.5)', fontSize: 11 }}
+                      tickFormatter={formatXAxis}
+                      ticks={xAxisTicks}
+                    />
+                  ) : (
+                    <XAxis 
+                      dataKey="date"
+                      stroke="rgba(255,255,255,0.3)"
+                      tick={{ fill: 'rgba(255,255,255,0.5)', fontSize: 11 }}
+                      tickFormatter={formatXAxis}
+                      interval="preserveStartEnd"
+                      tickCount={6}
+                    />
+                  )}
                   <YAxis 
                     stroke="rgba(255,255,255,0.3)"
                     tick={{ fill: 'rgba(255,255,255,0.5)', fontSize: 12 }}
@@ -416,16 +619,18 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
                     tickFormatter={(value) => `$${value.toFixed(0)}`}
                   />
                   <Tooltip content={<CustomTooltip />} />
+                  
                   {/* Extended hours shading (pre-market & after-hours) */}
                   {extendedHoursRanges.map((range, idx) => (
                     <ReferenceArea
                       key={idx}
-                      x1={range.startDate}
-                      x2={range.endDate}
+                      x1={range.start}
+                      x2={range.end}
                       fill="url(#extendedHoursGradient)"
                       strokeOpacity={0}
                     />
                   ))}
+                  
                   {/* Reference Line - Previous Close */}
                   {referenceClose !== null && (
                     <ReferenceLine 
@@ -435,6 +640,7 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
                       strokeWidth={1.5}
                     />
                   )}
+                  
                   {/* SMA Reference Line (only for longer periods) */}
                   {!isIntraday && stock.sma_200 && (
                     <ReferenceLine 
@@ -449,6 +655,7 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
                       }}
                     />
                   )}
+                  
                   <Area
                     type="monotone"
                     dataKey="close"
@@ -461,8 +668,40 @@ export function StockDetailModal({ ticker, onClose }: StockDetailModalProps) {
                     dataKey="close"
                     stroke={lineColor}
                     strokeWidth={2}
-                    dot={false}
-                    activeDot={{ r: 5, fill: lineColor, stroke: '#0a0a0f', strokeWidth: 2 }}
+                    dot={(props: any) => {
+                      const { cx, cy, index } = props;
+                      const isLastPoint = index === processedHistory.length - 1;
+                      const showAllDots = processedHistory.length <= 5;
+                      
+                      if (!isLastPoint && !showAllDots) return null;
+                      
+                      // Render dot (with ping effect for last point using CSS animation)
+                      return (
+                        <g key={isLastPoint ? `dot-${index}-${pingKey}` : `dot-${index}`}>
+                          {/* Ping circle on last point - only show when data updates */}
+                          {isLastPoint && showPing && (
+                            <circle 
+                              cx={cx} 
+                              cy={cy} 
+                              r={5} 
+                              fill={lineColor}
+                              className="chart-ping-dot-large"
+                              style={{ transformOrigin: `${cx}px ${cy}px` }}
+                            />
+                          )}
+                          {/* Static dot */}
+                          <circle
+                            cx={cx}
+                            cy={cy}
+                            r={isLastPoint ? 5 : 4}
+                            fill={lineColor}
+                            stroke="#0a0a0f"
+                            strokeWidth={2}
+                          />
+                        </g>
+                      );
+                    }}
+                    activeDot={{ r: 6, fill: lineColor, stroke: '#0a0a0f', strokeWidth: 2 }}
                     isAnimationActive={false}
                   />
                 </ComposedChart>

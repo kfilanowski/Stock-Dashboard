@@ -7,6 +7,9 @@ from typing import Optional
 class PortfolioBase(BaseModel):
     name: str = "My Portfolio"
     total_value: float = 10000.0
+    chart_period: Optional[str] = "1d"
+    sort_field: Optional[str] = "allocation"
+    sort_direction: Optional[str] = "desc"
 
 
 class PortfolioCreate(PortfolioBase):
@@ -16,6 +19,9 @@ class PortfolioCreate(PortfolioBase):
 class PortfolioUpdate(BaseModel):
     name: Optional[str] = None
     total_value: Optional[float] = None
+    chart_period: Optional[str] = None
+    sort_field: Optional[str] = None
+    sort_direction: Optional[str] = None
 
 
 class HoldingBase(BaseModel):
@@ -103,4 +109,12 @@ class PortfolioHistoryPoint(BaseModel):
 
 class PortfolioHistory(BaseModel):
     history: list[PortfolioHistoryPoint]
+
+
+# Incremental History Request
+class IncrementalHistoryRequest(BaseModel):
+    """Request for incremental intraday history updates."""
+    tickers: list[str]
+    interval: str = "1m"  # '1m', '5m', '15m'
+    since_timestamps: Optional[dict[str, Optional[str]]] = None  # ticker -> ISO timestamp
 

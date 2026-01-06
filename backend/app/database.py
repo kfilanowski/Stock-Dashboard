@@ -34,6 +34,30 @@ async def migrate_db(conn):
     if 'investment_price' not in columns:
         await conn.execute(text("ALTER TABLE holdings ADD COLUMN investment_price FLOAT"))
         print("Added investment_price column to holdings table")
+    
+    # Check and add user preference columns to portfolios table
+    result = await conn.execute(text("PRAGMA table_info(portfolios)"))
+    portfolio_columns = [row[1] for row in result.fetchall()]
+    
+    if 'chart_period' not in portfolio_columns:
+        await conn.execute(text("ALTER TABLE portfolios ADD COLUMN chart_period VARCHAR DEFAULT '1d'"))
+        await conn.execute(text("UPDATE portfolios SET chart_period = '1d' WHERE chart_period IS NULL"))
+        print("Added chart_period column to portfolios table")
+    
+    if 'sort_field' not in portfolio_columns:
+        await conn.execute(text("ALTER TABLE portfolios ADD COLUMN sort_field VARCHAR DEFAULT 'allocation'"))
+        await conn.execute(text("UPDATE portfolios SET sort_field = 'allocation' WHERE sort_field IS NULL"))
+        print("Added sort_field column to portfolios table")
+    
+    if 'sort_direction' not in portfolio_columns:
+        await conn.execute(text("ALTER TABLE portfolios ADD COLUMN sort_direction VARCHAR DEFAULT 'desc'"))
+        await conn.execute(text("UPDATE portfolios SET sort_direction = 'desc' WHERE sort_direction IS NULL"))
+        print("Added sort_direction column to portfolios table")
+    
+    # Ensure defaults are set for any null values (in case migration ran before this fix)
+    await conn.execute(text("UPDATE portfolios SET chart_period = '1d' WHERE chart_period IS NULL"))
+    await conn.execute(text("UPDATE portfolios SET sort_field = 'allocation' WHERE sort_field IS NULL"))
+    await conn.execute(text("UPDATE portfolios SET sort_direction = 'desc' WHERE sort_direction IS NULL"))
 
 
 async def init_db():

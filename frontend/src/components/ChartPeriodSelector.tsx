@@ -1,4 +1,4 @@
-export type ChartPeriod = '1d' | '3d' | '1w' | '1mo' | '3mo' | '6mo' | 'ytd' | '1y' | '2y';
+export type ChartPeriod = '1d' | '3d' | '1w' | '1mo' | '3mo' | '6mo' | 'ytd' | '1y' | '2y' | '5y';
 
 interface ChartPeriodSelectorProps {
   selected: ChartPeriod;
@@ -15,6 +15,7 @@ const periods: { value: ChartPeriod; label: string }[] = [
   { value: 'ytd', label: 'YTD' },
   { value: '1y', label: '1Y' },
   { value: '2y', label: '2Y' },
+  { value: '5y', label: '5Y' },
 ];
 
 export function ChartPeriodSelector({ selected, onSelect }: ChartPeriodSelectorProps) {

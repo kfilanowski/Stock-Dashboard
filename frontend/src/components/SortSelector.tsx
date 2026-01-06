@@ -73,24 +73,24 @@ export function SortSelector({ value, onChange }: SortSelectorProps) {
   };
 
   return (
-    <div className="relative" ref={dropdownRef}>
+    <div className="relative flex items-center gap-1" ref={dropdownRef}>
       <button
         onClick={() => setIsOpen(!isOpen)}
         className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 hover:border-white/20 hover:bg-white/10 transition-all text-sm"
       >
         <ArrowUpDown className="w-4 h-4 text-white/50" />
         <span className="text-white/70">{currentOption?.label}</span>
-        <button
-          onClick={toggleDirection}
-          className="p-1 -mr-1 rounded hover:bg-white/10 transition-colors"
-          title={`Sort ${value.direction === 'asc' ? 'ascending' : 'descending'}`}
-        >
-          {value.direction === 'asc' ? (
-            <ArrowUp className="w-3.5 h-3.5 text-accent-cyan" />
-          ) : (
-            <ArrowDown className="w-3.5 h-3.5 text-accent-cyan" />
-          )}
-        </button>
+      </button>
+      <button
+        onClick={toggleDirection}
+        className="p-1.5 rounded-lg bg-white/5 border border-white/10 hover:border-white/20 hover:bg-white/10 transition-colors"
+        title={`Sort ${value.direction === 'asc' ? 'ascending' : 'descending'}`}
+      >
+        {value.direction === 'asc' ? (
+          <ArrowUp className="w-3.5 h-3.5 text-accent-cyan" />
+        ) : (
+          <ArrowDown className="w-3.5 h-3.5 text-accent-cyan" />
+        )}
       </button>
 
       {isOpen && (

@@ -8,10 +8,13 @@ import {
   StockDetailModal,
   ChartPeriodSelector,
   SortSelector,
+  ErrorBoundary,
+  SectionErrorBoundary,
   type ChartPeriod,
   type SortOption
 } from './components';
 import { usePortfolio, type HoldingChartData } from './hooks/usePortfolio';
+import * as api from './services/api';
 
 function App() {
   const [showAddModal, setShowAddModal] = useState(false);
@@ -19,6 +22,7 @@ function App() {
   const [holdingChartData, setHoldingChartData] = useState<Record<string, HoldingChartData>>({});
   const [chartPeriod, setChartPeriod] = useState<ChartPeriod>('1d');
   const [sortOption, setSortOption] = useState<SortOption>({ field: 'allocation', direction: 'desc' });
+  const [settingsInitialized, setSettingsInitialized] = useState(false);
 
   // Callback for when the portfolio hook fetches new history data
   const handleHistoryUpdate = useCallback((ticker: string, data: HoldingChartData) => {
@@ -33,6 +37,7 @@ function App() {
     loading, 
     error,
     lastFetched,
+    lastPricesFetched,
     refresh, 
     updatePortfolioValue, 
     addHolding, 
@@ -42,6 +47,46 @@ function App() {
     chartPeriod,
     onHistoryUpdate: handleHistoryUpdate
   });
+
+  // Load settings from portfolio on first load
+  useEffect(() => {
+    if (portfolio && !settingsInitialized) {
+      // Initialize chart period from saved setting (use default if null)
+      const savedPeriod = portfolio.chart_period as ChartPeriod | null;
+      if (savedPeriod) {
+        setChartPeriod(savedPeriod);
+      }
+      // Initialize sort option from saved settings (use defaults if null)
+      const savedField = portfolio.sort_field as SortOption['field'] | null;
+      const savedDirection = portfolio.sort_direction as SortOption['direction'] | null;
+      if (savedField || savedDirection) {
+        setSortOption({
+          field: savedField || 'allocation',
+          direction: savedDirection || 'desc'
+        });
+      }
+      setSettingsInitialized(true);
+    }
+  }, [portfolio, settingsInitialized]);
+
+  // Save chart period when it changes (after initial load)
+  const handleChartPeriodChange = useCallback((period: ChartPeriod) => {
+    setChartPeriod(period);
+    if (settingsInitialized) {
+      api.updatePortfolio({ chart_period: period }).catch(console.error);
+    }
+  }, [settingsInitialized]);
+
+  // Save sort option when it changes (after initial load)
+  const handleSortOptionChange = useCallback((option: SortOption) => {
+    setSortOption(option);
+    if (settingsInitialized) {
+      api.updatePortfolio({ 
+        sort_field: option.field, 
+        sort_direction: option.direction 
+      }).catch(console.error);
+    }
+  }, [settingsInitialized]);
   
   // Track tickers to detect changes
   const tickersKey = useMemo(() => {
@@ -50,12 +95,10 @@ function App() {
   
   const prevPeriodRef = useRef(chartPeriod);
 
-  // Reset chart data when period changes
+  // Track period changes - DON'T clear chart data immediately
+  // Keep showing old data until new data arrives for smoother transitions
   useEffect(() => {
-    if (prevPeriodRef.current !== chartPeriod) {
-      setHoldingChartData({});
-      prevPeriodRef.current = chartPeriod;
-    }
+    prevPeriodRef.current = chartPeriod;
   }, [chartPeriod]);
 
   // Clean up chart data when tickers change (remove data for deleted stocks)
@@ -172,128 +215,138 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen p-6 md:p-8">
-      <div className="animated-bg" />
-      
-      <div className="max-w-7xl mx-auto">
-        <Header 
-          totalValue={(portfolio?.total_value ?? 0) + (portfolio?.total_gain_loss ?? 0)}
-          lastUpdated={lastFetched ?? undefined}
-          isDataReady={allDataLoaded}
+    <ErrorBoundary>
+      <div className="min-h-screen p-6 md:p-8">
+        <div className="animated-bg" />
+        
+        <div className="max-w-7xl mx-auto">
+          <Header 
+            totalValue={(portfolio?.total_value ?? 0) + (portfolio?.total_gain_loss ?? 0)}
+            lastUpdated={lastFetched ?? undefined}
+            isDataReady={allDataLoaded}
+          />
+
+          {portfolio && (
+            <>
+              <SectionErrorBoundary sectionName="portfolio summary">
+                <PortfolioSummary 
+                  portfolio={portfolio} 
+                  onUpdateValue={updatePortfolioValue}
+                />
+              </SectionErrorBoundary>
+
+              {/* Holdings Section */}
+              <div className="fade-in" style={{ animationDelay: '0.3s' }}>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
+                  <div className="flex items-center gap-3">
+                    <Briefcase className="w-5 h-5 text-accent-cyan" />
+                    <h2 className="text-xl font-semibold text-white">Holdings</h2>
+                    <span className="text-white/40 text-sm">
+                      ({portfolio.holdings.length} stocks)
+                    </span>
+                  </div>
+                  
+                  <button 
+                      onClick={() => setShowAddModal(true)}
+                      className="btn-primary flex items-center gap-2"
+                    >
+                      <Plus className="w-5 h-5" />
+                      Add Stock
+                    </button>
+                </div>
+
+                {/* Chart Period & Sort Selectors */}
+                {portfolio.holdings.length > 0 && (
+                  <div className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-3">
+                    <div className="flex items-center gap-3">
+                      <span className="text-white/50 text-sm">Chart period:</span>
+                      <ChartPeriodSelector 
+                        selected={chartPeriod} 
+                        onSelect={handleChartPeriodChange} 
+                      />
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="text-white/50 text-sm">Sort by:</span>
+                      <SortSelector
+                        value={sortOption}
+                        onChange={handleSortOptionChange}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {portfolio.holdings.length === 0 ? (
+                  <div className="glass-card p-12 text-center">
+                    <Briefcase className="w-16 h-16 text-white/20 mx-auto mb-4" />
+                    <h3 className="text-xl font-semibold text-white mb-2">No holdings yet</h3>
+                    <p className="text-white/50 mb-6">
+                      Add your first stock to start tracking your portfolio
+                    </p>
+                    <button 
+                      onClick={() => setShowAddModal(true)}
+                      className="btn-primary inline-flex items-center gap-2"
+                    >
+                      <Plus className="w-5 h-5" />
+                      Add Your First Stock
+                    </button>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {sortedHoldings.map((holding, index) => {
+                      const chartData = holdingChartData[holding.ticker];
+                      return (
+                        <div 
+                          key={holding.id} 
+                          className="fade-in"
+                          style={{ animationDelay: `${0.1 * (index + 1)}s` }}
+                        >
+                          <SectionErrorBoundary sectionName={`${holding.ticker} card`}>
+                            <HoldingCard
+                              holding={holding}
+                              history={chartData?.history ?? []}
+                              referenceClose={chartData?.referenceClose ?? null}
+                              isDataComplete={chartData?.isComplete ?? false}
+                              expectedStart={chartData?.expectedStart ?? null}
+                              actualStart={chartData?.actualStart ?? null}
+                              onDelete={removeHolding}
+                              onSelect={setSelectedTicker}
+                              onUpdateAllocation={handleUpdateAllocation}
+                              onUpdateInvestment={handleUpdateInvestment}
+                              currentTotalAllocation={currentAllocation}
+                              portfolioTotalValue={portfolio?.total_value ?? 0}
+                              isRefreshing={false}
+                              isHistoryLoading={!chartData}
+                              lastPricesFetched={lastPricesFetched}
+                            />
+                          </SectionErrorBoundary>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Modals */}
+        <AddHoldingModal
+          isOpen={showAddModal}
+          onClose={() => setShowAddModal(false)}
+          onAdd={handleAddHolding}
+          currentAllocation={currentAllocation}
+          portfolioTotalValue={portfolio?.total_value ?? 0}
         />
 
-        {portfolio && (
-          <>
-            <PortfolioSummary 
-              portfolio={portfolio} 
-              onUpdateValue={updatePortfolioValue}
-            />
-
-            {/* Holdings Section */}
-            <div className="fade-in" style={{ animationDelay: '0.3s' }}>
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
-                <div className="flex items-center gap-3">
-                  <Briefcase className="w-5 h-5 text-accent-cyan" />
-                  <h2 className="text-xl font-semibold text-white">Holdings</h2>
-                  <span className="text-white/40 text-sm">
-                    ({portfolio.holdings.length} stocks)
-                  </span>
-                </div>
-                
-                <button 
-                    onClick={() => setShowAddModal(true)}
-                    className="btn-primary flex items-center gap-2"
-                  >
-                    <Plus className="w-5 h-5" />
-                    Add Stock
-                  </button>
-              </div>
-
-              {/* Chart Period & Sort Selectors */}
-              {portfolio.holdings.length > 0 && (
-                <div className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-3">
-                  <div className="flex items-center gap-3">
-                    <span className="text-white/50 text-sm">Chart period:</span>
-                    <ChartPeriodSelector 
-                      selected={chartPeriod} 
-                      onSelect={setChartPeriod} 
-                    />
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <span className="text-white/50 text-sm">Sort by:</span>
-                    <SortSelector
-                      value={sortOption}
-                      onChange={setSortOption}
-                    />
-                  </div>
-                </div>
-              )}
-
-              {portfolio.holdings.length === 0 ? (
-                <div className="glass-card p-12 text-center">
-                  <Briefcase className="w-16 h-16 text-white/20 mx-auto mb-4" />
-                  <h3 className="text-xl font-semibold text-white mb-2">No holdings yet</h3>
-                  <p className="text-white/50 mb-6">
-                    Add your first stock to start tracking your portfolio
-                  </p>
-                  <button 
-                    onClick={() => setShowAddModal(true)}
-                    className="btn-primary inline-flex items-center gap-2"
-                  >
-                    <Plus className="w-5 h-5" />
-                    Add Your First Stock
-                  </button>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {sortedHoldings.map((holding, index) => {
-                    const chartData = holdingChartData[holding.ticker];
-                    return (
-                      <div 
-                        key={holding.id} 
-                        className="fade-in"
-                        style={{ animationDelay: `${0.1 * (index + 1)}s` }}
-                      >
-                        <HoldingCard
-                          holding={holding}
-                          history={chartData?.history ?? []}
-                          referenceClose={chartData?.referenceClose ?? null}
-                          isDataComplete={chartData?.isComplete ?? false}
-                          expectedStart={chartData?.expectedStart ?? null}
-                          actualStart={chartData?.actualStart ?? null}
-                          onDelete={removeHolding}
-                          onSelect={setSelectedTicker}
-                          onUpdateAllocation={handleUpdateAllocation}
-                          onUpdateInvestment={handleUpdateInvestment}
-                          currentTotalAllocation={currentAllocation}
-                          portfolioTotalValue={portfolio?.total_value ?? 0}
-                          isRefreshing={false}
-                          isHistoryLoading={!chartData}
-                        />
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          </>
-        )}
+        <StockDetailModal
+          ticker={selectedTicker}
+          onClose={() => setSelectedTicker(null)}
+          chartPeriod={chartPeriod}
+          onChartPeriodChange={handleChartPeriodChange}
+          lastPricesFetched={lastPricesFetched}
+        />
       </div>
-
-      {/* Modals */}
-      <AddHoldingModal
-        isOpen={showAddModal}
-        onClose={() => setShowAddModal(false)}
-        onAdd={handleAddHolding}
-        currentAllocation={currentAllocation}
-        portfolioTotalValue={portfolio?.total_value ?? 0}
-      />
-
-      <StockDetailModal
-        ticker={selectedTicker}
-        onClose={() => setSelectedTicker(null)}
-      />
-    </div>
+    </ErrorBoundary>
   );
 }
 

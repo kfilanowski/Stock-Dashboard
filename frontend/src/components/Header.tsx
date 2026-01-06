@@ -16,7 +16,9 @@ export function Header({ totalValue, lastUpdated, isDataReady }: HeaderProps) {
         <div>
           <h1 className="text-2xl font-bold gradient-text">Portfolio Dashboard</h1>
           <p className="text-white/50 text-sm">
-            {lastUpdated ? `Last updated: ${lastUpdated.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}` : 'Loading...'}
+            {lastUpdated 
+              ? `Last updated: ${lastUpdated.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}`
+              : 'Loading...'}
           </p>
         </div>
       </div>
