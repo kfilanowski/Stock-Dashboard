@@ -344,6 +344,14 @@ function App() {
           chartPeriod={chartPeriod}
           onChartPeriodChange={handleChartPeriodChange}
           lastPricesFetched={lastPricesFetched}
+          holding={selectedTicker ? portfolio?.holdings.find(h => h.ticker === selectedTicker) : null}
+          chartData={selectedTicker && holdingChartData[selectedTicker] ? {
+            history: holdingChartData[selectedTicker].history,
+            referenceClose: holdingChartData[selectedTicker].referenceClose,
+            isComplete: holdingChartData[selectedTicker].isComplete,
+            expectedStart: holdingChartData[selectedTicker].expectedStart,
+            actualStart: holdingChartData[selectedTicker].actualStart
+          } : null}
         />
       </div>
     </ErrorBoundary>

@@ -53,8 +53,14 @@ function getTradingDay(dateStr: string): string {
 }
 
 // Convert xValue (minutes since start of chart) to time string for X-axis labels
-function minutesToTimeLabel(minutes: number, numDays: number): string {
+// For multi-day views (3d/1w), tradingDays array is used to get actual day names
+function minutesToTimeLabel(
+  minutes: number, 
+  tradingDays?: string[],
+  showDayNameOnly?: boolean
+): string {
   const minutesPerDay = EXTENDED_END_MINUTES - EXTENDED_START_MINUTES; // 960 (4AM to 8PM)
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   
   // Calculate which day and minute within day
   // For values at exact day boundaries (960, 1920, etc), treat as end of previous day
@@ -70,6 +76,14 @@ function minutesToTimeLabel(minutes: number, numDays: number): string {
     minuteWithinDay = minutes % minutesPerDay;
   }
   
+  // For 3-day and 1-week views, show day name only
+  if (showDayNameOnly && tradingDays && tradingDays[dayIndex]) {
+    const dateStr = tradingDays[dayIndex];
+    const [year, month, day] = dateStr.split('-').map(Number);
+    const date = new Date(year, month - 1, day);
+    return dayNames[date.getDay()];
+  }
+  
   // Convert to actual clock time (minuteWithinDay is 0-960, representing 4AM-8PM)
   // 0 = 4AM (240 min from midnight), 960 = 8PM (1200 min from midnight)
   const minutesSinceMidnight = minuteWithinDay + EXTENDED_START_MINUTES;
@@ -82,10 +96,15 @@ function minutesToTimeLabel(minutes: number, numDays: number): string {
   // For clean hour marks, don't show minutes
   const timeStr = mins === 0 ? `${hours12}${ampm}` : `${hours12}:${mins.toString().padStart(2, '0')}${ampm}`;
   
-  if (numDays > 1) {
-    return `D${dayIndex + 1} ${timeStr}`;
-  }
   return timeStr;
+}
+
+interface ChartData {
+  history: HistoryPoint[];
+  referenceClose: number | null;
+  isComplete: boolean;
+  expectedStart: string | null;
+  actualStart: string | null;
 }
 
 interface StockDetailModalProps {
@@ -94,17 +113,41 @@ interface StockDetailModalProps {
   chartPeriod: ChartPeriod;
   onChartPeriodChange: (period: ChartPeriod) => void;
   lastPricesFetched?: Date | null;
+  // Live data from parent (updated when prices refresh)
+  holding?: {
+    current_price?: number;
+    ytd_return?: number;
+    sma_200?: number;
+    price_vs_sma?: number;
+  } | null;
+  chartData?: ChartData | null;
 }
 
-export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodChange, lastPricesFetched }: StockDetailModalProps) {
+export function StockDetailModal({ 
+  ticker, 
+  onClose, 
+  chartPeriod, 
+  onChartPeriodChange, 
+  lastPricesFetched,
+  holding,
+  chartData
+}: StockDetailModalProps) {
   const [stock, setStock] = useState<StockData | null>(null);
   const [loading, setLoading] = useState(false);
-  const [chartHistory, setChartHistory] = useState<HistoryPoint[]>([]);
-  const [referenceClose, setReferenceClose] = useState<number | null>(null);
+  // Use parent's chart data if provided, otherwise manage locally
+  const [localChartHistory, setLocalChartHistory] = useState<HistoryPoint[]>([]);
+  const [localReferenceClose, setLocalReferenceClose] = useState<number | null>(null);
   const [chartLoading, setChartLoading] = useState(false);
-  const [isDataComplete, setIsDataComplete] = useState(true);
-  const [expectedStart, setExpectedStart] = useState<string | null>(null);
-  const [actualStart, setActualStart] = useState<string | null>(null);
+  const [localIsDataComplete, setLocalIsDataComplete] = useState(true);
+  const [localExpectedStart, setLocalExpectedStart] = useState<string | null>(null);
+  const [localActualStart, setLocalActualStart] = useState<string | null>(null);
+  
+  // Use parent's chart data if available, otherwise use local state
+  const chartHistory = chartData?.history ?? localChartHistory;
+  const referenceClose = chartData?.referenceClose ?? localReferenceClose;
+  const isDataComplete = chartData?.isComplete ?? localIsDataComplete;
+  const expectedStart = chartData?.expectedStart ?? localExpectedStart;
+  const actualStart = chartData?.actualStart ?? localActualStart;
   
   // Ping animation state - triggers when prices API returns
   const [pingKey, setPingKey] = useState(0);
@@ -112,7 +155,7 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
   const prevTimestampRef = useRef<number | null>(null);
   const isFirstPricesFetch = useRef(true);
 
-  // Fetch stock data on mount
+  // Fetch stock data on mount and when prices update
   useEffect(() => {
     if (!ticker) {
       setStock(null);
@@ -120,7 +163,8 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
     }
 
     const fetchStock = async () => {
-      setLoading(true);
+      // Only show loading spinner on initial fetch
+      if (!stock) setLoading(true);
       try {
         const data = await api.getStock(ticker);
         setStock(data);
@@ -132,39 +176,41 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
     };
 
     fetchStock();
-  }, [ticker]);
+  }, [ticker, lastPricesFetched]); // Re-fetch when prices update
 
-  // Fetch chart history when period changes
+  // Fetch chart history when period changes (only if not provided by parent)
   useEffect(() => {
     if (!ticker) return;
+    // If parent provides chart data, don't fetch locally
+    if (chartData) return;
 
     // Clear old data immediately when period changes to avoid stale display
-    setChartHistory([]);
-    setReferenceClose(null);
+    setLocalChartHistory([]);
+    setLocalReferenceClose(null);
 
     const fetchHistory = async () => {
       setChartLoading(true);
       try {
         const result = await api.getStockHistory(ticker, chartPeriod);
-        setChartHistory(result.history);
-        setReferenceClose(result.reference_close);
-        setIsDataComplete(result.is_complete);
-        setExpectedStart(result.expected_start);
-        setActualStart(result.actual_start);
+        setLocalChartHistory(result.history);
+        setLocalReferenceClose(result.reference_close);
+        setLocalIsDataComplete(result.is_complete);
+        setLocalExpectedStart(result.expected_start);
+        setLocalActualStart(result.actual_start);
       } catch (err) {
         console.error('Failed to fetch history:', err);
-        setChartHistory([]);
-        setReferenceClose(null);
-        setIsDataComplete(false);
-        setExpectedStart(null);
-        setActualStart(null);
+        setLocalChartHistory([]);
+        setLocalReferenceClose(null);
+        setLocalIsDataComplete(false);
+        setLocalExpectedStart(null);
+        setLocalActualStart(null);
       } finally {
         setChartLoading(false);
       }
     };
 
     fetchHistory();
-  }, [ticker, chartPeriod]);
+  }, [ticker, chartPeriod, chartData]);
 
   // Trigger ping when prices API returns (not just when data changes)
   useEffect(() => {
@@ -188,6 +234,24 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
     
     prevTimestampRef.current = currentTimestamp;
   }, [lastPricesFetched]);
+  
+  // Merge live holding data with fetched stock data
+  const displayStock = useMemo(() => {
+    if (!stock) return null;
+    return {
+      ...stock,
+      // Override with live data from holding if available
+      current_price: holding?.current_price ?? stock.current_price,
+      ytd_return: holding?.ytd_return ?? stock.ytd_return,
+      sma_200: holding?.sma_200 ?? stock.sma_200,
+      price_vs_sma: holding?.price_vs_sma ?? stock.price_vs_sma,
+      // Recalculate change based on live price
+      change: (holding?.current_price ?? stock.current_price) - stock.previous_close,
+      change_pct: stock.previous_close > 0 
+        ? (((holding?.current_price ?? stock.current_price) - stock.previous_close) / stock.previous_close) * 100
+        : 0
+    };
+  }, [stock, holding]);
 
   // Check if this is an intraday period
   const isIntraday = ['1d', '3d', '1w'].includes(chartPeriod);
@@ -227,24 +291,25 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
     }
     
     // Include SMA if visible
-    if (!isIntraday && stock?.sma_200) {
-      min = Math.min(min, stock.sma_200);
-      max = Math.max(max, stock.sma_200);
+    if (!isIntraday && displayStock?.sma_200) {
+      min = Math.min(min, displayStock.sma_200);
+      max = Math.max(max, displayStock.sma_200);
     }
     
     // Add 5% padding
     const padding = (max - min) * 0.05;
     return [min - padding, max + padding] as [number, number];
-  }, [chartHistory, referenceClose, isIntraday, stock?.sma_200]);
+  }, [chartHistory, referenceClose, isIntraday, displayStock?.sma_200]);
 
   // Process chart data with time-based positioning for intraday
-  const { processedHistory, extendedHoursRanges, xDomain, numTradingDays } = useMemo(() => {
+  const { processedHistory, extendedHoursRanges, xDomain, numTradingDays, tradingDays } = useMemo(() => {
     if (!chartHistory.length) {
       return { 
         processedHistory: [], 
         extendedHoursRanges: [], 
         xDomain: [0, 100] as [number, number],
-        numTradingDays: 1
+        numTradingDays: 1,
+        tradingDays: [] as string[]
       };
     }
     
@@ -261,17 +326,18 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
         processedHistory: processed, 
         extendedHoursRanges: [], 
         xDomain: [0, maxIdx] as [number, number],
-        numTradingDays: 0
+        numTradingDays: 0,
+        tradingDays: [] as string[]
       };
     }
     
     // For intraday data, use time-based positioning
-    const tradingDays = [...new Set(chartHistory.map(h => getTradingDay(h.date)))].sort();
-    const numDays = tradingDays.length;
+    const days = [...new Set(chartHistory.map(h => getTradingDay(h.date)))].sort();
+    const numDays = days.length;
     const minutesPerDay = EXTENDED_END_MINUTES - EXTENDED_START_MINUTES; // 960 minutes (4 AM to 8 PM)
     
     const processed = chartHistory.map((h) => {
-      const dayIndex = tradingDays.indexOf(getTradingDay(h.date));
+      const dayIndex = days.indexOf(getTradingDay(h.date));
       const minuteOfDay = dateToMinutes(h.date);
       // Position within the full time range: dayIndex * dayWidth + position within day
       const xValue = (dayIndex * minutesPerDay) + (minuteOfDay - EXTENDED_START_MINUTES);
@@ -305,7 +371,7 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
       ranges.push({ start: rangeStart, end: processed[processed.length - 1].xValue });
     }
     
-    return { processedHistory: processed, extendedHoursRanges: ranges, xDomain: domain, numTradingDays: numDays };
+    return { processedHistory: processed, extendedHoursRanges: ranges, xDomain: domain, numTradingDays: numDays, tradingDays: days };
   }, [chartHistory, hasIntradayData]);
 
   // Generate nice tick values for intraday X-axis
@@ -316,26 +382,88 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
     const ticks: number[] = [];
     
     if (numTradingDays === 1) {
-      // 1 day: Show 4AM, 8AM, 12PM, 4PM, 8PM (5 ticks)
-      [4, 8, 12, 16, 20].forEach(hour => {
+      // 1 day: 4AM, 6AM, 8AM, 10AM, 12PM, 2PM, 4PM, 6PM, 8PM
+      [4, 6, 8, 10, 12, 14, 16, 18, 20].forEach(hour => {
         ticks.push((hour * 60) - EXTENDED_START_MINUTES);
       });
-    } else if (numTradingDays <= 3) {
-      // 3 days: Show 4AM and 12PM per day only (6 ticks max)
-      for (let day = 0; day < numTradingDays; day++) {
-        ticks.push(day * minutesPerDay); // 4AM
-        ticks.push(day * minutesPerDay + (12 * 60 - EXTENDED_START_MINUTES)); // 12PM
-      }
     } else {
-      // 1 week (5 days): Show only 9AM per day (market open-ish)
+      // 3 days or 1 week: One tick per day at 12PM (noon) for day name display
       for (let day = 0; day < numTradingDays; day++) {
-        ticks.push(day * minutesPerDay + (9 * 60 - EXTENDED_START_MINUTES)); // 9AM
+        ticks.push(day * minutesPerDay + (12 * 60 - EXTENDED_START_MINUTES)); // 12PM
       }
     }
     
-    console.log('xAxisTicks:', { numTradingDays, ticks, hasIntradayData });
     return ticks;
   }, [hasIntradayData, numTradingDays]);
+  
+  // Generate tick values for daily (non-intraday) data based on chart period
+  const dailyAxisTicks = useMemo(() => {
+    if (hasIntradayData || !chartHistory.length) return undefined;
+    
+    const dates = chartHistory.map(h => h.date.split(' ')[0]); // Extract just date part
+    const uniqueDates = [...new Set(dates)];
+    
+    // Helper to get first occurrence of each unique month (year-month combo)
+    const getMonthStarts = (): string[] => {
+      const monthStarts: string[] = [];
+      let lastYearMonth = '';
+      for (const date of uniqueDates) {
+        const [year, month] = date.split('-');
+        const yearMonth = `${year}-${month}`;
+        if (yearMonth !== lastYearMonth) {
+          monthStarts.push(date);
+          lastYearMonth = yearMonth;
+        }
+      }
+      return monthStarts;
+    };
+    
+    // Helper to get first of each year from dates
+    const getYearStarts = (): string[] => {
+      const yearStarts: string[] = [];
+      let lastYear = -1;
+      for (const date of uniqueDates) {
+        const year = parseInt(date.split('-')[0]);
+        if (year !== lastYear) {
+          yearStarts.push(date);
+          lastYear = year;
+        }
+      }
+      return yearStarts;
+    };
+    
+    // Helper to get weekly ticks (every ~7 days)
+    const getWeeklyTicks = (): string[] => {
+      const weekly: string[] = [];
+      for (let i = 0; i < uniqueDates.length; i += 5) { // ~5 trading days per week
+        weekly.push(uniqueDates[i]);
+      }
+      return weekly;
+    };
+    
+    switch (chartPeriod) {
+      case '3mo':
+        // One tick per week (day numbers)
+        return getWeeklyTicks();
+      case '6mo':
+        // One label per month (should be ~6 months)
+        return getMonthStarts();
+      case 'ytd':
+        // One label per month
+        return getMonthStarts();
+      case '1y':
+        // One label per month (should be ~12 months)
+        return getMonthStarts();
+      case '2y':
+        // One label per month
+        return getMonthStarts();
+      case '5y':
+        // One label per year
+        return getYearStarts();
+      default:
+        return undefined; // Let Recharts decide
+    }
+  }, [hasIntradayData, chartHistory, chartPeriod]);
 
   // Convert 24-hour time (HH:MM) to 12-hour format
   const formatTime12Hour = (time24: string): string => {
@@ -389,15 +517,69 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
       : `${monthNames[month - 1]} ${day}`;
   };
 
-  // Format X-axis labels
+  // Format X-axis labels based on chart period
   const formatXAxis = (value: number | string) => {
-    if (hasIntradayData && typeof value === 'number') {
-      return minutesToTimeLabel(value, numTradingDays);
+    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    
+    // Helper to extract date parts from various formats
+    const extractDateParts = (val: number | string): { year: number; month: number; day: number } | null => {
+      if (typeof val === 'string') {
+        // Format: "YYYY-MM-DD" or "YYYY-MM-DD HH:MM"
+        const datePart = val.includes(' ') ? val.split(' ')[0] : val;
+        const [year, month, day] = datePart.split('-').map(Number);
+        if (!isNaN(year) && !isNaN(month) && !isNaN(day)) {
+          return { year, month, day };
+        }
+      } else if (typeof val === 'number' && tradingDays.length > 0) {
+        // For intraday data, extract from tradingDays using xValue
+        const minutesPerDay = EXTENDED_END_MINUTES - EXTENDED_START_MINUTES;
+        const dayIndex = Math.floor(val / minutesPerDay);
+        if (tradingDays[dayIndex]) {
+          const [year, month, day] = tradingDays[dayIndex].split('-').map(Number);
+          return { year, month, day };
+        }
+      }
+      return null;
+    };
+    
+    // 1 day: Show time labels
+    if (chartPeriod === '1d' && hasIntradayData && typeof value === 'number') {
+      return minutesToTimeLabel(value, tradingDays, false);
     }
-    // Daily data - value is the date string
-    if (typeof value === 'string') {
-      return formatDate(value, false);
+    
+    // 3 days or 1 week: Show day names (Mon, Tue, Wed)
+    if (['3d', '1w'].includes(chartPeriod) && hasIntradayData && typeof value === 'number') {
+      return minutesToTimeLabel(value, tradingDays, true);
     }
+    
+    // 1 month or 3 months: Show day number only (7, 14, 21, 28)
+    if (['1mo', '3mo'].includes(chartPeriod)) {
+      const parts = extractDateParts(value);
+      if (parts) return `${parts.day}`;
+    }
+    
+    // 6 months, YTD, 1 year: Show month name only (Jan, Feb, Mar)
+    if (['6mo', 'ytd', '1y'].includes(chartPeriod)) {
+      const parts = extractDateParts(value);
+      if (parts) return monthNames[parts.month - 1];
+    }
+    
+    // 2 years: Show month number (1, 2, 3, etc.)
+    if (chartPeriod === '2y') {
+      const parts = extractDateParts(value);
+      if (parts) return `${parts.month}`;
+    }
+    
+    // 5 years: Show 4-digit year
+    if (chartPeriod === '5y') {
+      const parts = extractDateParts(value);
+      if (parts) return `${parts.year}`;
+    }
+    
+    // Default fallback
+    const parts = extractDateParts(value);
+    if (parts) return `${monthNames[parts.month - 1]} ${parts.day}`;
+    
     return '';
   };
 
@@ -433,7 +615,7 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
 
   if (!ticker) return null;
 
-  const isPositive = (stock?.ytd_return ?? 0) >= 0;
+  const isPositive = (displayStock?.ytd_return ?? 0) >= 0;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -452,11 +634,11 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
             </div>
             <div>
               <h2 className="text-2xl font-bold text-white">{ticker}</h2>
-              {stock && (
+              {displayStock && (
                 <p className="text-white/50">
-                  ${stock.current_price.toFixed(2)}
-                  <span className={`ml-2 ${stock.change >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                    {stock.change >= 0 ? '+' : ''}{stock.change.toFixed(2)} ({stock.change_pct.toFixed(2)}%)
+                  ${displayStock.current_price.toFixed(2)}
+                  <span className={`ml-2 ${displayStock.change >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {displayStock.change >= 0 ? '+' : ''}{displayStock.change.toFixed(2)} ({displayStock.change_pct.toFixed(2)}%)
                   </span>
                 </p>
               )}
@@ -474,7 +656,7 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
           <div className="h-80 flex items-center justify-center">
             <div className="w-10 h-10 border-3 border-white/20 border-t-accent-cyan rounded-full animate-spin" />
           </div>
-        ) : stock ? (
+        ) : displayStock ? (
           <>
             {/* Stats Grid */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
@@ -490,7 +672,7 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
                     <TrendingDown className="w-5 h-5 text-red-400" />
                   )}
                   <span className={`text-xl font-bold ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
-                    {isPositive ? '+' : ''}{stock.ytd_return.toFixed(2)}%
+                    {isPositive ? '+' : ''}{displayStock.ytd_return.toFixed(2)}%
                   </span>
                 </div>
               </div>
@@ -523,14 +705,14 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
               <div className="bg-white/5 rounded-xl p-4 border border-white/10">
                 <p className="text-white/50 text-sm mb-1">52W High</p>
                 <p className="text-xl font-bold text-white">
-                  ${stock.high_52w?.toFixed(2) ?? '—'}
+                  ${displayStock.high_52w?.toFixed(2) ?? '—'}
                 </p>
               </div>
 
               <div className="bg-white/5 rounded-xl p-4 border border-white/10">
                 <p className="text-white/50 text-sm mb-1">52W Low</p>
                 <p className="text-xl font-bold text-white">
-                  ${stock.low_52w?.toFixed(2) ?? '—'}
+                  ${displayStock.low_52w?.toFixed(2) ?? '—'}
                 </p>
               </div>
             </div>
@@ -608,8 +790,8 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
                       stroke="rgba(255,255,255,0.3)"
                       tick={{ fill: 'rgba(255,255,255,0.5)', fontSize: 11 }}
                       tickFormatter={formatXAxis}
-                      interval="preserveStartEnd"
-                      tickCount={6}
+                      ticks={dailyAxisTicks}
+                      interval={dailyAxisTicks ? 0 : "preserveStartEnd"}
                     />
                   )}
                   <YAxis 
@@ -642,13 +824,13 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
                   )}
                   
                   {/* SMA Reference Line (only for longer periods) */}
-                  {!isIntraday && stock.sma_200 && (
+                  {!isIntraday && displayStock.sma_200 && (
                     <ReferenceLine 
-                      y={stock.sma_200} 
+                      y={displayStock.sma_200} 
                       stroke="#a855f7" 
                       strokeDasharray="5 5"
                       label={{ 
-                        value: `SMA(200): $${stock.sma_200.toFixed(2)}`, 
+                        value: `SMA(200): $${displayStock.sma_200.toFixed(2)}`, 
                         fill: '#a855f7',
                         fontSize: 11,
                         position: 'right'
@@ -714,7 +896,7 @@ export function StockDetailModal({ ticker, onClose, chartPeriod, onChartPeriodCh
                 <span className="w-3 h-0.5 bg-white/40" style={{ borderStyle: 'dashed' }}></span>
                 Previous Close
               </span>
-              {!isIntraday && stock.sma_200 && (
+              {!isIntraday && displayStock.sma_200 && (
                 <span className="flex items-center gap-1.5">
                   <span className="w-3 h-0.5 bg-purple-500"></span>
                   SMA(200)
