@@ -164,28 +164,4 @@ class StockCalculations:
         gain_loss_pct = ((current_price - investment_price) / investment_price) * 100
         
         return round(gain_loss, 2), round(gain_loss_pct, 2)
-    
-    @staticmethod
-    def calculate_period_gain(
-        history: List[Dict[str, Any]], 
-        reference_close: Optional[float]
-    ) -> Optional[float]:
-        """
-        Calculate gain for a period relative to reference close.
-        
-        Args:
-            history: Price history for the period.
-            reference_close: Closing price before the period started.
-            
-        Returns:
-            Period gain as percentage, or None if cannot be calculated.
-        """
-        if not history or reference_close is None or reference_close <= 0:
-            return None
-        
-        latest_close = history[-1].get('close', 0)
-        if latest_close <= 0:
-            return None
-        
-        return ((latest_close - reference_close) / reference_close) * 100
 

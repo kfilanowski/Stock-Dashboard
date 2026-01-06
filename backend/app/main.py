@@ -18,8 +18,7 @@ from .models import Portfolio
 from .schemas import (
     PortfolioUpdate, PortfolioResponse, PortfolioWithData,
     HoldingCreate, HoldingUpdate, HoldingResponse,
-    StockData, PortfolioHistory, PortfolioHistoryPoint,
-    IncrementalHistoryRequest
+    StockData
 )
 from .services import (
     PortfolioService, get_portfolio_service,
@@ -272,42 +271,7 @@ async def get_stock_history(
     }
 
 
-@app.post("/api/v1/stocks/history")
-@app.post("/api/stocks/history", include_in_schema=False)  # Legacy
-async def get_multiple_stock_histories(
-    tickers: list[str],
-    period: str = "1y",
-    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
-):
-    """
-    Get historical data for multiple stocks at once.
-    
-    Processes sequentially to avoid yfinance data corruption.
-    """
-    results = {}
-    for ticker in tickers:
-        try:
-            result = await stock_fetcher.get_stock_history(ticker, period)
-            results[ticker.upper()] = {
-                "history": result.get("history", []),
-                "reference_close": result.get("reference_close"),
-                "is_complete": result.get("is_complete", True),
-                "expected_start": result.get("expected_start"),
-                "actual_start": result.get("actual_start")
-            }
-        except Exception as e:
-            logger.warning(f"Error fetching history for {ticker}: {e}")
-            results[ticker.upper()] = {
-                "history": [],
-                "reference_close": None,
-                "is_complete": False,
-                "expected_start": None,
-                "actual_start": None
-            }
-    return results
-
-
-# ============ Batch & Incremental Endpoints ============
+# ============ Batch Prices Endpoint ============
 
 @app.get("/api/v1/prices")
 async def get_batch_prices(
@@ -332,71 +296,6 @@ async def get_batch_prices(
         return {}
     
     return await stock_fetcher.get_batch_prices(ticker_list)
-
-
-@app.post("/api/v1/stocks/history/incremental")
-async def get_incremental_history(
-    request: IncrementalHistoryRequest,
-    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
-):
-    """
-    Get only NEW intraday history data since the provided timestamps.
-    
-    This is the key endpoint for efficient chart updates:
-    - Frontend tracks the latest timestamp it has for each ticker
-    - On refresh, sends those timestamps here
-    - Backend fetches only new data points
-    - Returns minimal data for chart updates
-    
-    Example request:
-    ```json
-    {
-        "tickers": ["AAPL", "MSFT"],
-        "interval": "1m",
-        "since_timestamps": {
-            "AAPL": "2024-01-15T10:30:00",
-            "MSFT": "2024-01-15T10:30:00"
-        }
-    }
-    ```
-    
-    Returns:
-        Dict of ticker -> {new_points: [...], latest_timestamp: str, count: int}
-    """
-    return await stock_fetcher.get_incremental_intraday(
-        tickers=request.tickers,
-        interval=request.interval,
-        since_timestamps=request.since_timestamps
-    )
-
-
-# ============ Portfolio History ============
-
-@app.get("/api/v1/portfolio/history", response_model=PortfolioHistory)
-@app.get("/api/portfolio/history", response_model=PortfolioHistory, include_in_schema=False)  # Legacy
-async def get_portfolio_history(
-    db: AsyncSession = Depends(get_db),
-    portfolio_service: PortfolioService = Depends(get_portfolio_service)
-):
-    """Get portfolio value history over time."""
-    history = await portfolio_service.get_history(db)
-    return PortfolioHistory(
-        history=[PortfolioHistoryPoint(**h) for h in history]
-    )
-
-
-@app.post("/api/v1/portfolio/snapshot")
-@app.post("/api/portfolio/snapshot", include_in_schema=False)  # Legacy
-async def create_portfolio_snapshot(
-    db: AsyncSession = Depends(get_db),
-    portfolio_service: PortfolioService = Depends(get_portfolio_service)
-):
-    """Create a snapshot of the current portfolio value."""
-    value = await portfolio_service.create_snapshot(db)
-    
-    if value is not None:
-        return {"message": "Snapshot created", "value": value}
-    return {"message": "No portfolio found"}
 
 
 # ============ Cache Management ============

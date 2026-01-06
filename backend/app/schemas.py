@@ -12,10 +12,6 @@ class PortfolioBase(BaseModel):
     sort_direction: Optional[str] = "desc"
 
 
-class PortfolioCreate(PortfolioBase):
-    pass
-
-
 class PortfolioUpdate(BaseModel):
     name: Optional[str] = None
     total_value: Optional[float] = None
@@ -80,14 +76,6 @@ class PortfolioWithData(PortfolioResponse):
 
 
 # Stock Schemas
-class StockPrice(BaseModel):
-    ticker: str
-    current_price: float
-    previous_close: float
-    change: float
-    change_pct: float
-
-
 class StockData(BaseModel):
     ticker: str
     current_price: float
@@ -102,19 +90,4 @@ class StockData(BaseModel):
     history: list[dict]  # List of {date, open, high, low, close, volume}
 
 
-class PortfolioHistoryPoint(BaseModel):
-    timestamp: datetime
-    total_value: float
-
-
-class PortfolioHistory(BaseModel):
-    history: list[PortfolioHistoryPoint]
-
-
-# Incremental History Request
-class IncrementalHistoryRequest(BaseModel):
-    """Request for incremental intraday history updates."""
-    tickers: list[str]
-    interval: str = "1m"  # '1m', '5m', '15m'
-    since_timestamps: Optional[dict[str, Optional[str]]] = None  # ticker -> ISO timestamp
 

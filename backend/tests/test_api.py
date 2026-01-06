@@ -88,16 +88,3 @@ class TestHoldingsEndpoints:
         
         assert response.status_code == 404
 
-
-@pytest.mark.asyncio
-class TestPortfolioHistory:
-    """Tests for portfolio history endpoints."""
-    
-    async def test_get_empty_history(self, client: AsyncClient):
-        """New portfolio should have empty history."""
-        response = await client.get("/api/v1/portfolio/history")
-        
-        assert response.status_code == 200
-        data = response.json()
-        assert data["history"] == []
-

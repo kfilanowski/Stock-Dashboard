@@ -4,7 +4,7 @@
  * All API calls are centralized here for maintainability.
  * Uses versioned API endpoints (v1) with fallback support.
  */
-import type { Portfolio, StockData, PortfolioHistoryPoint, StockHistoryResponse } from '../types';
+import type { Portfolio, StockData, StockHistoryResponse } from '../types';
 
 // API Configuration
 const API_VERSION = 'v1';
@@ -147,24 +147,8 @@ export async function getStockHistory(ticker: string, period: string = '1y'): Pr
   return handleResponse<StockHistoryResponse>(response);
 }
 
-/**
- * Get historical data for multiple stocks at once.
- * More efficient than calling individual endpoints.
- */
-export async function getMultipleStockHistories(
-  tickers: string[], 
-  period: string = '1y'
-): Promise<Record<string, StockHistoryResponse>> {
-  const response = await fetch(`${API_BASE}/stocks/history?period=${period}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(tickers),
-  });
-  return handleResponse<Record<string, StockHistoryResponse>>(response);
-}
-
 // ============================================================================
-// Batch & Incremental API (Optimized for fast updates)
+// Batch Prices API (Optimized for fast updates)
 // ============================================================================
 
 export interface ChartPoint {
@@ -201,103 +185,4 @@ export async function getBatchPrices(tickers: string[]): Promise<Record<string, 
   const tickerStr = tickers.join(',');
   const response = await fetch(`${API_BASE}/prices?tickers=${encodeURIComponent(tickerStr)}`);
   return handleResponse<Record<string, BatchPriceData>>(response);
-}
-
-export interface IncrementalHistoryPoint {
-  date: string;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-}
-
-export interface IncrementalHistoryResult {
-  new_points: IncrementalHistoryPoint[];
-  latest_timestamp: string | null;
-  count?: number;
-}
-
-export interface IncrementalHistoryRequest {
-  tickers: string[];
-  interval: string;
-  since_timestamps?: Record<string, string | null>;
-}
-
-/**
- * Get only NEW intraday history data since the provided timestamps.
- * 
- * This is the key function for efficient chart updates:
- * - Track the latest timestamp you have for each ticker
- * - Call this with those timestamps
- * - Get back only new data points (typically 1-5 points)
- * - Append to existing chart data
- * 
- * This reduces bandwidth by ~99% compared to fetching full history.
- * 
- * @param request - Tickers, interval, and since_timestamps
- * @returns Dict of ticker -> {new_points, latest_timestamp}
- */
-export async function getIncrementalHistory(
-  request: IncrementalHistoryRequest
-): Promise<Record<string, IncrementalHistoryResult>> {
-  const response = await fetch(`${API_BASE}/stocks/history/incremental`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request),
-  });
-  return handleResponse<Record<string, IncrementalHistoryResult>>(response);
-}
-
-// ============================================================================
-// Portfolio History API
-// ============================================================================
-
-/**
- * Get portfolio value history over time.
- */
-export async function getPortfolioHistory(): Promise<{ history: PortfolioHistoryPoint[] }> {
-  const response = await fetch(`${API_BASE}/portfolio/history`);
-  return handleResponse(response);
-}
-
-/**
- * Create a snapshot of current portfolio value.
- */
-export async function createPortfolioSnapshot(): Promise<void> {
-  const response = await fetch(`${API_BASE}/portfolio/snapshot`, { method: 'POST' });
-  return handleResponse<void>(response);
-}
-
-// ============================================================================
-// Cache Management API
-// ============================================================================
-
-/**
- * Clear the intraday cache for a specific stock.
- * Forces fresh data fetch on next request.
- */
-export async function clearStockCache(ticker: string): Promise<{ message: string; deleted_records: number }> {
-  const response = await fetch(`${API_BASE}/stock/${ticker}/cache`, {
-    method: 'DELETE',
-  });
-  return handleResponse(response);
-}
-
-// ============================================================================
-// Health API
-// ============================================================================
-
-export interface HealthStatus {
-  status: string;
-  service: string;
-  version: string;
-}
-
-/**
- * Check API health status.
- */
-export async function checkHealth(): Promise<HealthStatus> {
-  const response = await fetch(`${API_BASE}/health`);
-  return handleResponse<HealthStatus>(response);
 }

@@ -198,38 +198,3 @@ class TestYTDReturn:
         ytd = calc.calculate_ytd_return(0, [{"date": "2024-01-01", "close": 100}])
         assert ytd == 0.0
 
-
-class TestPeriodGain:
-    """Tests for period gain calculation."""
-    
-    def test_positive_period_gain(self):
-        calc = StockCalculations()
-        history = [
-            {"close": 102},
-            {"close": 105},
-            {"close": 110},
-        ]
-        gain = calc.calculate_period_gain(history, 100)
-        assert gain == pytest.approx(10.0)
-    
-    def test_negative_period_gain(self):
-        calc = StockCalculations()
-        history = [
-            {"close": 98},
-            {"close": 95},
-            {"close": 90},
-        ]
-        gain = calc.calculate_period_gain(history, 100)
-        assert gain == pytest.approx(-10.0)
-    
-    def test_no_reference(self):
-        calc = StockCalculations()
-        history = [{"close": 110}]
-        gain = calc.calculate_period_gain(history, None)
-        assert gain is None
-    
-    def test_empty_history(self):
-        calc = StockCalculations()
-        gain = calc.calculate_period_gain([], 100)
-        assert gain is None
-

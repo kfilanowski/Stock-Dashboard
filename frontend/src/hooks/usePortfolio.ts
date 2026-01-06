@@ -51,7 +51,6 @@ export function usePortfolio(options: UsePortfolioOptions = {}) {
 
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastFetched, setLastFetched] = useState<Date | null>(null);
   const [lastPricesFetched, setLastPricesFetched] = useState<Date | null>(null);
@@ -146,8 +145,6 @@ export function usePortfolio(options: UsePortfolioOptions = {}) {
   const fetchPortfolio = useCallback(async (showLoading = true, useLiteMode = false) => {
     if (showLoading && isInitialLoad.current) {
       setLoading(true);
-    } else if (!useLiteMode) {
-      setRefreshing(true);
     }
     
     try {
@@ -160,7 +157,6 @@ export function usePortfolio(options: UsePortfolioOptions = {}) {
       setError(err instanceof Error ? err.message : 'Failed to fetch portfolio');
     } finally {
       setLoading(false);
-      setRefreshing(false);
     }
   }, []);
 
@@ -561,7 +557,6 @@ export function usePortfolio(options: UsePortfolioOptions = {}) {
   return {
     portfolio,
     loading,
-    refreshing,
     error,
     lastFetched,
     lastPricesFetched,

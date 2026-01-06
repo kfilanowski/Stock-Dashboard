@@ -61,8 +61,3 @@ class Settings(BaseSettings):
 # Singleton instance
 settings = Settings()
 
-
-def get_settings() -> Settings:
-    """Get the settings instance. Useful for dependency injection."""
-    return settings
-

@@ -217,35 +217,6 @@ class CandleAggregator:
             logger.debug(f"Closed candle for {ticker}, started new at {interval_key}")
             return candle.to_dict()
     
-    def update_batch(
-        self,
-        prices: Dict[str, Dict[str, Any]],
-        now: Optional[datetime] = None
-    ) -> Dict[str, Dict[str, Any]]:
-        """
-        Update candles for multiple tickers from batch price response.
-        
-        Args:
-            prices: Dict of ticker -> price data from yahooquery.
-            now: Current time (optional, for testing).
-            
-        Returns:
-            Dict of ticker -> current candle state.
-        """
-        results = {}
-        
-        for ticker, data in prices.items():
-            if isinstance(data, dict) and data.get('current_price', 0) > 0:
-                price = data['current_price']
-                # yahooquery doesn't provide per-tick volume in quotes
-                # We'll estimate from the regularMarketVolume if available
-                volume = 0
-                
-                candle = self.update_price(ticker, price, volume, now)
-                results[ticker] = candle
-        
-        return results
-    
     def _close_candle(self, candle: CandleState) -> None:
         """
         Close a candle and persist it to SQLite.
@@ -270,58 +241,6 @@ class CandleAggregator:
             )
         except Exception as e:
             logger.error(f"Failed to persist candle for {candle.ticker}: {e}")
-    
-    def get_current_candle(self, ticker: str) -> Optional[Dict[str, Any]]:
-        """
-        Get the current in-progress candle for a ticker.
-        
-        Args:
-            ticker: Stock ticker symbol.
-            
-        Returns:
-            Current candle state or None if no candle in progress.
-        """
-        ticker = ticker.upper()
-        
-        with self._lock:
-            candle = self._candles.get(ticker)
-            if candle:
-                return candle.to_dict()
-            return None
-    
-    def get_all_current_candles(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Get all current in-progress candles.
-        
-        Returns:
-            Dict of ticker -> candle state.
-        """
-        with self._lock:
-            return {
-                ticker: candle.to_dict()
-                for ticker, candle in self._candles.items()
-            }
-    
-    def flush_all(self) -> int:
-        """
-        Close and persist all in-progress candles.
-        
-        Useful for shutdown or when switching periods.
-        
-        Returns:
-            Number of candles flushed.
-        """
-        with self._lock:
-            count = 0
-            for candle in self._candles.values():
-                self._close_candle(candle)
-                count += 1
-            self._candles.clear()
-            
-            if count > 0:
-                logger.info(f"Flushed {count} in-progress candles")
-            
-            return count
     
     def clear_ticker(self, ticker: str) -> bool:
         """

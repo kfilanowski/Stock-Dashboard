@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from ..config import settings
 from ..logging_config import get_logger
-from ..models import Portfolio, Holding, PortfolioSnapshot
+from ..models import Portfolio, Holding
 from ..schemas import (
     PortfolioWithData, HoldingWithData, HoldingCreate, HoldingUpdate
 )
@@ -377,57 +377,6 @@ class PortfolioService:
         
         logger.info(f"Deleted holding: {ticker}")
         return True
-    
-    # ============ Portfolio Snapshots ============
-    
-    async def create_snapshot(self, db: AsyncSession) -> Optional[float]:
-        """
-        Create a snapshot of current portfolio value.
-        
-        Args:
-            db: Database session.
-            
-        Returns:
-            Snapshot value, or None if no portfolio.
-        """
-        portfolio_data = await self.get_portfolio(db)
-        
-        result = await db.execute(select(Portfolio).limit(1))
-        portfolio = result.scalar_one_or_none()
-        
-        if portfolio:
-            value = portfolio_data.current_total_value or portfolio.total_value
-            snapshot = PortfolioSnapshot(
-                portfolio_id=portfolio.id,
-                total_value=value
-            )
-            db.add(snapshot)
-            await db.commit()
-            
-            logger.info(f"Created portfolio snapshot: ${value:,.2f}")
-            return value
-        
-        return None
-    
-    async def get_history(self, db: AsyncSession) -> List[Dict[str, Any]]:
-        """
-        Get portfolio value history.
-        
-        Args:
-            db: Database session.
-            
-        Returns:
-            List of historical value points.
-        """
-        result = await db.execute(
-            select(PortfolioSnapshot).order_by(PortfolioSnapshot.timestamp)
-        )
-        snapshots = result.scalars().all()
-        
-        return [
-            {"timestamp": s.timestamp, "total_value": s.total_value}
-            for s in snapshots
-        ]
 
 
 # Singleton instance

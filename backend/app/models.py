@@ -35,15 +35,6 @@ class Holding(Base):
     portfolio = relationship("Portfolio", back_populates="holdings")
 
 
-class PortfolioSnapshot(Base):
-    __tablename__ = "portfolio_snapshots"
-
-    id = Column(Integer, primary_key=True, index=True)
-    portfolio_id = Column(Integer, ForeignKey("portfolios.id"), nullable=False)
-    total_value = Column(Float, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-
-
 class PriceHistory(Base):
     """Stores historical price data (daily) to avoid repeated API calls."""
     __tablename__ = "price_history"

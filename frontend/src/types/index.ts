@@ -54,11 +54,6 @@ export interface HistoryPoint {
   volume: number;
 }
 
-export interface PortfolioHistoryPoint {
-  timestamp: string;
-  total_value: number;
-}
-
 export interface StockHistoryResponse {
   ticker: string;
   history: HistoryPoint[];
