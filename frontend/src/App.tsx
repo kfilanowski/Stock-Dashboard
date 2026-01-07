@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Plus, Briefcase } from 'lucide-react';
+import { Plus, Briefcase, Layers } from 'lucide-react';
 import { 
   Header, 
   PortfolioSummary, 
@@ -7,6 +7,7 @@ import {
   AddHoldingModal, 
   StockDetailModal,
   StockAnalysisModal,
+  StockCompareModal,
   ChartPeriodSelector,
   SortSelector,
   ErrorBoundary,
@@ -20,6 +21,7 @@ import * as api from './services/api';
 
 function App() {
   const [showAddModal, setShowAddModal] = useState(false);
+  const [showCompareModal, setShowCompareModal] = useState(false);
   const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
   const [analyzeTicker, setAnalyzeTicker] = useState<string | null>(null);
   const [holdingChartData, setHoldingChartData] = useState<Record<string, HoldingChartData>>({});
@@ -291,13 +293,24 @@ function App() {
                     </span>
                   </div>
                   
-                  <button 
+                  <div className="flex items-center gap-2">
+                    {portfolio.holdings.length >= 2 && (
+                      <button 
+                        onClick={() => setShowCompareModal(true)}
+                        className="btn-secondary flex items-center gap-2"
+                      >
+                        <Layers className="w-5 h-5" />
+                        Compare
+                      </button>
+                    )}
+                    <button 
                       onClick={() => setShowAddModal(true)}
                       className="btn-primary flex items-center gap-2"
                     >
                       <Plus className="w-5 h-5" />
                       Add Stock
                     </button>
+                  </div>
                 </div>
 
                 {/* Chart Period & Sort Selectors */}
@@ -383,17 +396,9 @@ function App() {
         <StockDetailModal
           ticker={selectedTicker}
           onClose={() => setSelectedTicker(null)}
-          chartPeriod={chartPeriod}
-          onChartPeriodChange={handleChartPeriodChange}
+          initialChartPeriod={chartPeriod}
           lastPricesFetched={lastPricesFetched}
           holding={selectedTicker ? portfolio?.holdings.find(h => h.ticker === selectedTicker) : null}
-          chartData={selectedTicker && holdingChartData[selectedTicker] ? {
-            history: holdingChartData[selectedTicker].history,
-            referenceClose: holdingChartData[selectedTicker].referenceClose,
-            isComplete: holdingChartData[selectedTicker].isComplete,
-            expectedStart: holdingChartData[selectedTicker].expectedStart,
-            actualStart: holdingChartData[selectedTicker].actualStart
-          } : null}
         />
 
         {/* Stock Analysis Modal - uses shared cache with ActionScoreBadge */}
@@ -404,6 +409,15 @@ function App() {
             currentPrice={portfolio?.holdings.find(h => h.ticker === analyzeTicker)?.current_price}
           />
         )}
+
+        {/* Stock Compare Modal - overlay multiple holdings on one chart */}
+        <StockCompareModal
+          isOpen={showCompareModal}
+          onClose={() => setShowCompareModal(false)}
+          holdings={portfolio?.holdings ?? []}
+          holdingChartData={holdingChartData}
+          initialChartPeriod={chartPeriod}
+        />
       </div>
     </ErrorBoundary>
   );

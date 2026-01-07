@@ -349,17 +349,21 @@ export function StockAnalysisModal({
   }, [ticker, currentPrice, high52w, low52w]);
   
   // Options-related actions to filter when stock has no options
-  const optionsActions: ActionType[] = ['openCSP', 'openCC', 'buyCall', 'buyPut'];
+  const optionsActions = useMemo<ActionType[]>(
+    () => ['openCSP', 'openCC', 'buyCall', 'buyPut'], 
+    []
+  );
   
   // Filter scores to only show applicable actions
   const applicableScores = useMemo(() => {
     if (!analysis) return [];
     
     // If stock has options, show all actions; otherwise filter out options actions
-    return analysis.hasOptions 
-      ? analysis.scores 
-      : analysis.scores.filter(s => !optionsActions.includes(s.action));
-  }, [analysis]);
+    if (analysis.hasOptions) {
+      return analysis.scores;
+    }
+    return analysis.scores.filter(s => !optionsActions.includes(s.action));
+  }, [analysis, optionsActions]);
   
   // Prepare radar chart data (only applicable actions)
   const radarData = useMemo(() => {

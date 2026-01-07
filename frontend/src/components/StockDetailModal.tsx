@@ -99,19 +99,11 @@ function minutesToTimeLabel(
   return timeStr;
 }
 
-interface ChartData {
-  history: HistoryPoint[];
-  referenceClose: number | null;
-  isComplete: boolean;
-  expectedStart: string | null;
-  actualStart: string | null;
-}
-
 interface StockDetailModalProps {
   ticker: string | null;
   onClose: () => void;
-  chartPeriod: ChartPeriod;
-  onChartPeriodChange: (period: ChartPeriod) => void;
+  /** Initial chart period to display when the modal opens */
+  initialChartPeriod?: ChartPeriod;
   lastPricesFetched?: Date | null;
   // Live data from parent (updated when prices refresh)
   holding?: {
@@ -120,34 +112,34 @@ interface StockDetailModalProps {
     sma_200?: number;
     price_vs_sma?: number;
   } | null;
-  chartData?: ChartData | null;
 }
 
 export function StockDetailModal({ 
   ticker, 
   onClose, 
-  chartPeriod, 
-  onChartPeriodChange, 
+  initialChartPeriod = '1d',
   lastPricesFetched,
-  holding,
-  chartData
+  holding
 }: StockDetailModalProps) {
   const [stock, setStock] = useState<StockData | null>(null);
   const [loading, setLoading] = useState(false);
-  // Use parent's chart data if provided, otherwise manage locally
-  const [localChartHistory, setLocalChartHistory] = useState<HistoryPoint[]>([]);
-  const [localReferenceClose, setLocalReferenceClose] = useState<number | null>(null);
-  const [chartLoading, setChartLoading] = useState(false);
-  const [localIsDataComplete, setLocalIsDataComplete] = useState(true);
-  const [localExpectedStart, setLocalExpectedStart] = useState<string | null>(null);
-  const [localActualStart, setLocalActualStart] = useState<string | null>(null);
+  // Local chart period state - isolated from parent dashboard
+  const [chartPeriod, setChartPeriod] = useState<ChartPeriod>(initialChartPeriod);
   
-  // Use parent's chart data if available, otherwise use local state
-  const chartHistory = chartData?.history ?? localChartHistory;
-  const referenceClose = chartData?.referenceClose ?? localReferenceClose;
-  const isDataComplete = chartData?.isComplete ?? localIsDataComplete;
-  const expectedStart = chartData?.expectedStart ?? localExpectedStart;
-  const actualStart = chartData?.actualStart ?? localActualStart;
+  // Reset chart period to initial value when modal opens for a new ticker
+  useEffect(() => {
+    if (ticker) {
+      setChartPeriod(initialChartPeriod);
+    }
+  }, [ticker, initialChartPeriod]);
+  
+  // Chart data managed locally (isolated from parent dashboard)
+  const [chartHistory, setChartHistory] = useState<HistoryPoint[]>([]);
+  const [referenceClose, setReferenceClose] = useState<number | null>(null);
+  const [chartLoading, setChartLoading] = useState(false);
+  const [isDataComplete, setIsDataComplete] = useState(true);
+  const [expectedStart, setExpectedStart] = useState<string | null>(null);
+  const [actualStart, setActualStart] = useState<string | null>(null);
   
   // Ping animation state - triggers when prices API returns
   const [pingKey, setPingKey] = useState(0);
@@ -178,39 +170,37 @@ export function StockDetailModal({
     fetchStock();
   }, [ticker, lastPricesFetched]); // Re-fetch when prices update
 
-  // Fetch chart history when period changes (only if not provided by parent)
+  // Fetch chart history when period changes
   useEffect(() => {
     if (!ticker) return;
-    // If parent provides chart data, don't fetch locally
-    if (chartData) return;
 
     // Clear old data immediately when period changes to avoid stale display
-    setLocalChartHistory([]);
-    setLocalReferenceClose(null);
+    setChartHistory([]);
+    setReferenceClose(null);
 
     const fetchHistory = async () => {
       setChartLoading(true);
       try {
         const result = await api.getStockHistory(ticker, chartPeriod);
-        setLocalChartHistory(result.history);
-        setLocalReferenceClose(result.reference_close);
-        setLocalIsDataComplete(result.is_complete);
-        setLocalExpectedStart(result.expected_start);
-        setLocalActualStart(result.actual_start);
+        setChartHistory(result.history);
+        setReferenceClose(result.reference_close);
+        setIsDataComplete(result.is_complete);
+        setExpectedStart(result.expected_start);
+        setActualStart(result.actual_start);
       } catch (err) {
         console.error('Failed to fetch history:', err);
-        setLocalChartHistory([]);
-        setLocalReferenceClose(null);
-        setLocalIsDataComplete(false);
-        setLocalExpectedStart(null);
-        setLocalActualStart(null);
+        setChartHistory([]);
+        setReferenceClose(null);
+        setIsDataComplete(false);
+        setExpectedStart(null);
+        setActualStart(null);
       } finally {
         setChartLoading(false);
       }
     };
 
     fetchHistory();
-  }, [ticker, chartPeriod, chartData]);
+  }, [ticker, chartPeriod]);
 
   // Trigger ping when prices API returns (not just when data changes)
   useEffect(() => {
@@ -719,7 +709,7 @@ export function StockDetailModal({
 
             {/* Period Selector */}
             <div className="mb-4">
-              <ChartPeriodSelector selected={chartPeriod} onSelect={onChartPeriodChange} />
+              <ChartPeriodSelector selected={chartPeriod} onSelect={setChartPeriod} />
             </div>
 
             {/* Reference Close Info */}

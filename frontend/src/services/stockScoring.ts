@@ -1446,7 +1446,8 @@ export function analyzeStock(
   const indicators = calculateAllIndicators(history, currentPrice, high52w, low52w);
   
   // Determine if options are available for this stock
-  const hasOptions = additionalData?.hasOptions ?? false;
+  // Default to TRUE (most stocks have options) - only exclude if explicitly set to false
+  const hasOptions = additionalData?.hasOptions !== false;
   
   // Calculate scores for all actions
   const scores = ALL_ACTIONS.map(action => 
