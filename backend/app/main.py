@@ -18,13 +18,18 @@ from .models import Portfolio
 from .schemas import (
     PortfolioUpdate, PortfolioResponse, PortfolioWithData,
     HoldingCreate, HoldingUpdate, HoldingResponse,
-    StockData
+    StockData,
+    OptionHoldingCreate, OptionHoldingUpdate, OptionHoldingResponse, OptionHoldingWithData
 )
+from .models import OptionHolding
 from .services import (
     PortfolioService, get_portfolio_service,
     StockFetcher, get_stock_fetcher,
-    StockAnalysisService, get_stock_analysis_service
+    StockAnalysisService, get_stock_analysis_service,
+    OptionPricingService, get_option_pricing_service,
+    OptionAnalyticsService, get_option_analytics_service
 )
+from .services.option_analytics import OptionPosition
 
 # Setup logging
 setup_logging()
@@ -369,6 +374,326 @@ async def get_stock_sector_correlation(
     Returns correlation with sector ETF, beta to sector, and sector/industry info.
     """
     return await analysis_service.get_sector_correlation(ticker, days)
+
+
+# ============ Option Holdings Endpoints ============
+
+@app.get("/api/v1/options", response_model=list[OptionHoldingWithData])
+async def get_option_holdings(
+    db: AsyncSession = Depends(get_db),
+    option_pricing: OptionPricingService = Depends(get_option_pricing_service),
+    option_analytics: OptionAnalyticsService = Depends(get_option_analytics_service)
+):
+    """
+    Get all option holdings with live pricing and analytics.
+    
+    Returns option positions with current prices, Greeks, breakeven, and P/L.
+    """
+    from sqlalchemy.orm import selectinload
+    
+    # Get portfolio with option holdings
+    result = await db.execute(
+        select(Portfolio).options(selectinload(Portfolio.option_holdings)).limit(1)
+    )
+    portfolio = result.scalar_one_or_none()
+    
+    if not portfolio or not portfolio.option_holdings:
+        return []
+    
+    # Build position list for batch pricing
+    positions = [
+        {
+            "id": oh.id,
+            "underlying_ticker": oh.underlying_ticker,
+            "expiration_date": oh.expiration_date,
+            "option_type": oh.option_type,
+            "strike_price": oh.strike_price
+        }
+        for oh in portfolio.option_holdings
+    ]
+    
+    # Fetch prices in batch
+    price_data = await option_pricing.get_batch_option_prices(positions)
+    
+    # Build response with analytics
+    result_list = []
+    for oh in portfolio.option_holdings:
+        prices = price_data.get(oh.id, {})
+        
+        # Calculate analytics
+        position = OptionPosition(
+            underlying_ticker=oh.underlying_ticker,
+            option_type=oh.option_type,
+            position_type=oh.position_type,
+            strike_price=oh.strike_price,
+            expiration_date=oh.expiration_date,
+            contracts=oh.contracts,
+            premium_per_contract=oh.premium_per_contract,
+            underlying_price=prices.get("underlying_price"),
+            current_option_price=prices.get("current_price"),
+            implied_volatility=prices.get("implied_volatility")
+        )
+        analytics = option_analytics.calculate_position_analytics(position)
+        
+        result_list.append(OptionHoldingWithData(
+            id=oh.id,
+            portfolio_id=oh.portfolio_id,
+            underlying_ticker=oh.underlying_ticker,
+            option_type=oh.option_type,
+            position_type=oh.position_type,
+            strike_price=oh.strike_price,
+            expiration_date=oh.expiration_date,
+            contracts=oh.contracts,
+            premium_per_contract=oh.premium_per_contract,
+            opened_at=oh.opened_at,
+            notes=oh.notes,
+            # Market data
+            underlying_price=prices.get("underlying_price"),
+            current_price=prices.get("current_price"),
+            bid=prices.get("bid"),
+            ask=prices.get("ask"),
+            implied_volatility=prices.get("implied_volatility"),
+            open_interest=prices.get("open_interest"),
+            volume=prices.get("volume"),
+            # Position values
+            position_value=analytics.get("position_value"),
+            cost_basis=analytics.get("cost_basis"),
+            gain_loss=analytics.get("gain_loss"),
+            gain_loss_pct=analytics.get("gain_loss_pct"),
+            # Greeks
+            greeks=prices.get("greeks"),
+            # Analytics
+            analytics={
+                "breakeven_price": analytics.get("breakeven_price"),
+                "max_profit": analytics.get("max_profit"),
+                "max_loss": analytics.get("max_loss"),
+                "profit_probability": analytics.get("profit_probability"),
+                "days_to_expiration": analytics.get("days_to_expiration"),
+                "is_itm": analytics.get("is_itm"),
+                "is_expired": analytics.get("is_expired"),
+                "intrinsic_value": analytics.get("intrinsic_value"),
+                "time_value": analytics.get("time_value"),
+            }
+        ))
+    
+    return result_list
+
+
+@app.post("/api/v1/options", response_model=OptionHoldingResponse)
+async def add_option_holding(
+    option: OptionHoldingCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Add an option position to the portfolio.
+    
+    Provide underlying ticker, strike, expiration, type (call/put),
+    position (long/short), contracts, and premium paid/received.
+    """
+    from sqlalchemy.orm import selectinload
+    
+    # Get or create portfolio
+    result = await db.execute(
+        select(Portfolio).options(selectinload(Portfolio.option_holdings)).limit(1)
+    )
+    portfolio = result.scalar_one_or_none()
+    
+    if not portfolio:
+        portfolio = Portfolio()
+        db.add(portfolio)
+        await db.flush()
+    
+    # Create the option holding
+    new_option = OptionHolding(
+        portfolio_id=portfolio.id,
+        underlying_ticker=option.underlying_ticker.upper(),
+        option_type=option.option_type,
+        position_type=option.position_type,
+        strike_price=option.strike_price,
+        expiration_date=option.expiration_date,
+        contracts=option.contracts,
+        premium_per_contract=option.premium_per_contract,
+        notes=option.notes
+    )
+    
+    db.add(new_option)
+    await db.commit()
+    await db.refresh(new_option)
+    
+    logger.info(
+        f"Added option: {new_option.underlying_ticker} "
+        f"{new_option.option_type} ${new_option.strike_price} "
+        f"exp {new_option.expiration_date}"
+    )
+    
+    return new_option
+
+
+@app.put("/api/v1/options/{option_id}", response_model=OptionHoldingResponse)
+async def update_option_holding(
+    option_id: int,
+    option_update: OptionHoldingUpdate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update an option holding (contracts, premium, notes)."""
+    result = await db.execute(
+        select(OptionHolding).where(OptionHolding.id == option_id)
+    )
+    option = result.scalar_one_or_none()
+    
+    if not option:
+        raise HTTPException(status_code=404, detail="Option holding not found")
+    
+    if option_update.contracts is not None:
+        option.contracts = option_update.contracts
+    if option_update.premium_per_contract is not None:
+        option.premium_per_contract = option_update.premium_per_contract
+    if option_update.notes is not None:
+        option.notes = option_update.notes
+    
+    await db.commit()
+    await db.refresh(option)
+    
+    logger.info(f"Updated option holding {option_id}")
+    return option
+
+
+@app.delete("/api/v1/options/{option_id}")
+async def delete_option_holding(
+    option_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Remove an option holding from the portfolio."""
+    result = await db.execute(
+        select(OptionHolding).where(OptionHolding.id == option_id)
+    )
+    option = result.scalar_one_or_none()
+    
+    if not option:
+        raise HTTPException(status_code=404, detail="Option holding not found")
+    
+    await db.delete(option)
+    await db.commit()
+    
+    logger.info(f"Deleted option holding {option_id}")
+    return {"message": "Option holding deleted successfully"}
+
+
+@app.get("/api/v1/options/{option_id}", response_model=OptionHoldingWithData)
+async def get_option_holding(
+    option_id: int,
+    db: AsyncSession = Depends(get_db),
+    option_pricing: OptionPricingService = Depends(get_option_pricing_service),
+    option_analytics: OptionAnalyticsService = Depends(get_option_analytics_service)
+):
+    """Get a single option holding with live pricing and analytics."""
+    result = await db.execute(
+        select(OptionHolding).where(OptionHolding.id == option_id)
+    )
+    oh = result.scalar_one_or_none()
+    
+    if not oh:
+        raise HTTPException(status_code=404, detail="Option holding not found")
+    
+    # Fetch live price
+    prices = await option_pricing.get_option_price(
+        oh.underlying_ticker,
+        oh.expiration_date,
+        oh.option_type,
+        oh.strike_price
+    )
+    
+    # Calculate analytics
+    position = OptionPosition(
+        underlying_ticker=oh.underlying_ticker,
+        option_type=oh.option_type,
+        position_type=oh.position_type,
+        strike_price=oh.strike_price,
+        expiration_date=oh.expiration_date,
+        contracts=oh.contracts,
+        premium_per_contract=oh.premium_per_contract,
+        underlying_price=prices.get("underlying_price"),
+        current_option_price=prices.get("current_price"),
+        implied_volatility=prices.get("implied_volatility")
+    )
+    analytics = option_analytics.calculate_position_analytics(position)
+    
+    return OptionHoldingWithData(
+        id=oh.id,
+        portfolio_id=oh.portfolio_id,
+        underlying_ticker=oh.underlying_ticker,
+        option_type=oh.option_type,
+        position_type=oh.position_type,
+        strike_price=oh.strike_price,
+        expiration_date=oh.expiration_date,
+        contracts=oh.contracts,
+        premium_per_contract=oh.premium_per_contract,
+        opened_at=oh.opened_at,
+        notes=oh.notes,
+        # Market data
+        underlying_price=prices.get("underlying_price"),
+        current_price=prices.get("current_price"),
+        bid=prices.get("bid"),
+        ask=prices.get("ask"),
+        implied_volatility=prices.get("implied_volatility"),
+        open_interest=prices.get("open_interest"),
+        volume=prices.get("volume"),
+        # Position values
+        position_value=analytics.get("position_value"),
+        cost_basis=analytics.get("cost_basis"),
+        gain_loss=analytics.get("gain_loss"),
+        gain_loss_pct=analytics.get("gain_loss_pct"),
+        # Greeks
+        greeks=prices.get("greeks"),
+        # Analytics
+        analytics={
+            "breakeven_price": analytics.get("breakeven_price"),
+            "max_profit": analytics.get("max_profit"),
+            "max_loss": analytics.get("max_loss"),
+            "profit_probability": analytics.get("profit_probability"),
+            "days_to_expiration": analytics.get("days_to_expiration"),
+            "is_itm": analytics.get("is_itm"),
+            "is_expired": analytics.get("is_expired"),
+            "intrinsic_value": analytics.get("intrinsic_value"),
+            "time_value": analytics.get("time_value"),
+        }
+    )
+
+
+# ============ Option Chain Discovery Endpoints ============
+
+@app.get("/api/v1/options/chain/{ticker}/expirations")
+async def get_option_expirations(
+    ticker: str,
+    option_pricing: OptionPricingService = Depends(get_option_pricing_service)
+):
+    """
+    Get available expiration dates for a ticker's options.
+    
+    Use this to populate the expiration date picker when adding an option.
+    """
+    expirations = await option_pricing.get_available_expirations(ticker)
+    return {"ticker": ticker.upper(), "expirations": expirations}
+
+
+@app.get("/api/v1/options/chain/{ticker}/strikes")
+async def get_option_strikes(
+    ticker: str,
+    expiration: str,
+    option_type: str = None,
+    option_pricing: OptionPricingService = Depends(get_option_pricing_service)
+):
+    """
+    Get available strike prices for a ticker and expiration.
+    
+    Use this to populate the strike price picker when adding an option.
+    """
+    strikes = await option_pricing.get_strikes_for_expiration(ticker, expiration, option_type)
+    return {
+        "ticker": ticker.upper(),
+        "expiration": expiration,
+        "strikes": strikes
+    }
 
 
 # ============ Health Check ============

@@ -57,10 +57,43 @@ body {
 
 /* Input styles */
 input[type="text"],
-input[type="number"] {
+input[type="number"],
+input[type="date"] {
   @apply bg-white/5 border border-white/10 rounded-lg px-4 py-2 text-white placeholder-white/40;
   @apply focus:outline-none focus:border-accent-cyan/50 focus:ring-1 focus:ring-accent-cyan/30;
   @apply transition-all duration-200;
+}
+
+/* Date input calendar icon color */
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(1);
+  cursor: pointer;
+}
+
+/* Select dropdown styles */
+select {
+  @apply bg-surface-800 border border-white/10 rounded-lg px-4 py-2 text-white;
+  @apply focus:outline-none focus:border-accent-cyan/50 focus:ring-1 focus:ring-accent-cyan/30;
+  @apply transition-all duration-200;
+  @apply cursor-pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%239ca3af' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e");
+  background-position: right 0.5rem center;
+  background-repeat: no-repeat;
+  background-size: 1.5em 1.5em;
+  padding-right: 2.5rem;
+}
+
+/* Style the dropdown options - dark background with white text */
+select option {
+  @apply bg-surface-800 text-white;
+  padding: 0.5rem;
+}
+
+select option:hover,
+select option:focus,
+select option:checked {
+  background: linear-gradient(to right, #22d3ee20, #a855f720);
 }
 
 /* Button styles */

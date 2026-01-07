@@ -162,3 +162,118 @@ export interface StockAnalysis {
   };
 }
 
+// ============================================================================
+// Option Holdings Types
+// ============================================================================
+
+export type OptionType = 'call' | 'put';
+export type PositionType = 'long' | 'short';
+
+/**
+ * Greeks for an option position.
+ */
+export interface OptionGreeks {
+  delta: number | null;   // Rate of change vs underlying price
+  gamma: number | null;   // Rate of change of delta
+  theta: number | null;   // Time decay (per day)
+  vega: number | null;    // Sensitivity to IV changes
+  rho: number | null;     // Sensitivity to interest rate
+}
+
+/**
+ * Calculated analytics for an option position.
+ */
+export interface OptionAnalytics {
+  breakeven_price: number | null;    // Price at which position breaks even
+  max_profit: number | null;         // Maximum possible profit (null if unlimited)
+  max_loss: number | null;           // Maximum possible loss (null if unlimited)
+  profit_probability: number | null; // Estimated probability of profit (0-100)
+  days_to_expiration: number;
+  is_itm: boolean;                   // In the money
+  is_expired: boolean;
+  intrinsic_value: number | null;    // Current intrinsic value per contract
+  time_value: number | null;         // Current time/extrinsic value per contract
+}
+
+/**
+ * Base option holding interface (for creation).
+ */
+export interface OptionHoldingCreate {
+  underlying_ticker: string;
+  option_type: OptionType;
+  position_type: PositionType;
+  strike_price: number;
+  expiration_date: string;  // ISO date string YYYY-MM-DD
+  contracts: number;
+  premium_per_contract?: number | null;
+  notes?: string | null;
+}
+
+/**
+ * Option holding update interface.
+ */
+export interface OptionHoldingUpdate {
+  contracts?: number;
+  premium_per_contract?: number | null;
+  notes?: string | null;
+}
+
+/**
+ * Base option holding from database.
+ */
+export interface OptionHolding {
+  id: number;
+  portfolio_id: number;
+  underlying_ticker: string;
+  option_type: OptionType;
+  position_type: PositionType;
+  strike_price: number;
+  expiration_date: string;
+  contracts: number;
+  premium_per_contract: number | null;
+  opened_at: string;
+  notes: string | null;
+}
+
+/**
+ * Option holding with live market data and analytics.
+ */
+export interface OptionHoldingWithData extends OptionHolding {
+  // Current market data
+  underlying_price: number | null;
+  current_price: number | null;      // Current option price per share
+  bid: number | null;
+  ask: number | null;
+  implied_volatility: number | null; // IV as percentage
+  open_interest: number | null;
+  volume: number | null;
+  
+  // Position values
+  position_value: number | null;     // contracts * 100 * current_price
+  cost_basis: number | null;         // contracts * 100 * premium_per_contract
+  gain_loss: number | null;          // P/L in dollars
+  gain_loss_pct: number | null;      // P/L percentage
+  
+  // Greeks
+  greeks: OptionGreeks | null;
+  
+  // Analytics
+  analytics: OptionAnalytics | null;
+}
+
+/**
+ * Display labels for option types.
+ */
+export const OPTION_TYPE_LABELS: Record<OptionType, string> = {
+  call: 'Call',
+  put: 'Put'
+};
+
+/**
+ * Display labels for position types.
+ */
+export const POSITION_TYPE_LABELS: Record<PositionType, string> = {
+  long: 'Long',
+  short: 'Short'
+};
+

@@ -1,5 +1,5 @@
 import { useMemo, useEffect, useRef, useState } from 'react';
-import { RefreshCw } from 'lucide-react';
+import { RefreshCw, Sun, Moon, Sunrise } from 'lucide-react';
 import { LineChart, Line, ResponsiveContainer, Tooltip, ReferenceLine, YAxis, XAxis, ReferenceArea } from 'recharts';
 import type { HistoryPoint } from '../../types';
 
@@ -11,6 +11,18 @@ const EXTENDED_END_MINUTES = 20 * 60;     // 8:00 PM = 1200 minutes
 // Regular market hours
 const MARKET_OPEN = 9 * 60 + 30;  // 9:30 AM = 570 minutes
 const MARKET_CLOSE = 16 * 60;     // 4:00 PM = 960 minutes
+
+// Session change type
+interface SessionChange {
+  percent: number;
+  value: number;
+}
+
+interface SessionChanges {
+  preMarket: SessionChange | null;
+  regular: SessionChange | null;
+  afterHours: SessionChange | null;
+}
 
 function parseTimeToMinutes(timeStr: string): number {
   const [hours, minutes] = timeStr.split(':').map(Number);
@@ -133,6 +145,70 @@ export function MiniStockChart({
     prevTimestampRef.current = currentTimestamp;
   }, [lastPricesFetched]);
   const isIntraday = useMemo(() => isIntradayData(history), [history]);
+  
+  // Calculate session-specific changes (pre-market, regular, after-hours)
+  const sessionChanges = useMemo((): SessionChanges | null => {
+    if (!isIntraday || !history.length) return null;
+    
+    // Get the most recent trading day's data
+    const latestDay = getTradingDay(history[history.length - 1].date);
+    const todayData = history.filter(h => getTradingDay(h.date) === latestDay);
+    
+    if (!todayData.length) return null;
+    
+    // Find first and last prices for each session
+    let preMarketFirst: number | null = null;
+    let preMarketLast: number | null = null;
+    let regularFirst: number | null = null;
+    let regularLast: number | null = null;
+    let afterHoursFirst: number | null = null;
+    let afterHoursLast: number | null = null;
+    
+    for (const point of todayData) {
+      const minutes = dateToMinutes(point.date);
+      
+      if (minutes < MARKET_OPEN) {
+        // Pre-market (4 AM - 9:30 AM)
+        if (preMarketFirst === null) preMarketFirst = point.close;
+        preMarketLast = point.close;
+      } else if (minutes < MARKET_CLOSE) {
+        // Regular hours (9:30 AM - 4 PM)
+        if (regularFirst === null) regularFirst = point.close;
+        regularLast = point.close;
+      } else {
+        // After hours (4 PM - 8 PM)
+        if (afterHoursFirst === null) afterHoursFirst = point.close;
+        afterHoursLast = point.close;
+      }
+    }
+    
+    // Helper to calculate change
+    const calcChange = (start: number | null, end: number | null): SessionChange | null => {
+      if (start === null || end === null || start === 0) return null;
+      return {
+        percent: ((end - start) / start) * 100,
+        value: end - start
+      };
+    };
+    
+    // Pre-market: from reference close to end of pre-market
+    // If no pre-market data, use null
+    const preMarketBase = referenceClose ?? preMarketFirst;
+    const preMarket = (preMarketBase && preMarketLast) 
+      ? calcChange(preMarketBase, preMarketLast)
+      : null;
+    
+    // Regular: from first regular price to last regular price
+    const regular = calcChange(regularFirst, regularLast);
+    
+    // After-hours: from last regular price to last after-hours price
+    const afterHoursBase = regularLast ?? afterHoursFirst;
+    const afterHours = (afterHoursBase && afterHoursLast)
+      ? calcChange(afterHoursBase, afterHoursLast)
+      : null;
+    
+    return { preMarket, regular, afterHours };
+  }, [history, isIntraday, referenceClose]);
   
   // Calculate period gain
   const periodGain = useMemo(() => {
@@ -369,6 +445,27 @@ export function MiniStockChart({
         ) : null}
       </div>
 
+      {/* Session Changes Display */}
+      {sessionChanges && (sessionChanges.preMarket || sessionChanges.regular || sessionChanges.afterHours) && (
+        <div className="mt-2 grid grid-cols-3 gap-1.5">
+          <SessionBadge 
+            label="Pre" 
+            icon={<Sunrise className="w-2.5 h-2.5" />}
+            change={sessionChanges.preMarket} 
+          />
+          <SessionBadge 
+            label="Mkt" 
+            icon={<Sun className="w-2.5 h-2.5" />}
+            change={sessionChanges.regular} 
+          />
+          <SessionBadge 
+            label="AH" 
+            icon={<Moon className="w-2.5 h-2.5" />}
+            change={sessionChanges.afterHours} 
+          />
+        </div>
+      )}
+
       {/* Legend */}
       {processedHistory.length > 0 && (
         <div className="mt-1 flex items-center gap-3 text-[10px] text-white/40">
@@ -393,5 +490,54 @@ export function MiniStockChart({
         </div>
       )}
     </>
+  );
+}
+
+// Session change badge component
+function SessionBadge({ 
+  label, 
+  icon, 
+  change 
+}: { 
+  label: string; 
+  icon: React.ReactNode; 
+  change: SessionChange | null;
+}) {
+  // Format value as dollar amount
+  const formatValue = (val: number) => {
+    const sign = val >= 0 ? '+' : '';
+    return `${sign}$${val.toFixed(2)}`;
+  };
+  
+  // Empty state when no data for this session
+  if (!change) {
+    return (
+      <div className="flex items-center justify-center gap-1 px-1.5 py-1 rounded text-[10px] bg-white/5 text-white/30 border border-white/5">
+        <span className="opacity-50">{icon}</span>
+        <span>{label}</span>
+        <span>—</span>
+      </div>
+    );
+  }
+  
+  const isPositive = change.percent >= 0;
+  const sign = isPositive ? '+' : '';
+  
+  return (
+    <div 
+      className={`
+        flex items-center justify-center gap-1 px-1.5 py-1 rounded text-[10px] font-medium
+        ${isPositive 
+          ? 'bg-green-500/15 text-green-400 border border-green-500/20' 
+          : 'bg-red-500/15 text-red-400 border border-red-500/20'
+        }
+      `}
+      title={`${label}: ${sign}${change.percent.toFixed(2)}% (${formatValue(change.value)})`}
+    >
+      <span className="opacity-70">{icon}</span>
+      <span className="opacity-60">{label}</span>
+      <span>{sign}{change.percent.toFixed(1)}%</span>
+      <span className="opacity-50 text-[9px]">{formatValue(change.value)}</span>
+    </div>
   );
 }

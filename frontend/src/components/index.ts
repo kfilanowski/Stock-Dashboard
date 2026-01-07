@@ -9,6 +9,8 @@ export { ChartPeriodSelector } from './ChartPeriodSelector';
 export { LoadingValue, LoadingSpinner } from './LoadingValue';
 export { SortSelector } from './SortSelector';
 export { ErrorBoundary, SectionErrorBoundary } from './ErrorBoundary';
+export { OptionHoldingCard } from './OptionHoldingCard';
+export { AddOptionModal } from './AddOptionModal';
 export type { ChartPeriod } from './ChartPeriodSelector';
 export type { SortField, SortDirection, SortOption } from './SortSelector';
 

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, UniqueConstraint, Index
+from sqlalchemy import Column, Integer, String, Float, DateTime, Date, ForeignKey, UniqueConstraint, Index
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from .database import Base
@@ -19,6 +19,7 @@ class Portfolio(Base):
     sort_direction = Column(String, default="desc")  # asc, desc
 
     holdings = relationship("Holding", back_populates="portfolio", cascade="all, delete-orphan")
+    option_holdings = relationship("OptionHolding", back_populates="portfolio", cascade="all, delete-orphan")
 
 
 class Holding(Base):
@@ -71,4 +72,40 @@ class IntradayPriceHistory(Base):
     __table_args__ = (
         UniqueConstraint('ticker', 'timestamp', 'interval', name='uix_ticker_timestamp_interval'),
         Index('ix_intraday_ticker_interval_time', 'ticker', 'interval', 'timestamp'),
+    )
+
+
+class OptionHolding(Base):
+    """
+    Stores option contract positions (calls/puts, long/short).
+    
+    Options are fundamentally different from stock holdings:
+    - They have expiration dates and strike prices
+    - Each contract represents 100 shares of the underlying
+    - Position can be long (bought) or short (sold/written)
+    """
+    __tablename__ = "option_holdings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    portfolio_id = Column(Integer, ForeignKey("portfolios.id"), nullable=False)
+    
+    # Option contract identifiers
+    underlying_ticker = Column(String, nullable=False, index=True)  # e.g., "AAPL"
+    option_type = Column(String, nullable=False)  # "call" or "put"
+    position_type = Column(String, nullable=False)  # "long" or "short"
+    strike_price = Column(Float, nullable=False)  # Strike price
+    expiration_date = Column(Date, nullable=False, index=True)  # Expiration date
+    
+    # Position details
+    contracts = Column(Integer, nullable=False, default=1)  # Number of contracts (each = 100 shares)
+    premium_per_contract = Column(Float, nullable=True)  # Premium paid (long) or received (short) per contract
+    
+    # Metadata
+    opened_at = Column(DateTime, default=datetime.utcnow)
+    notes = Column(String, nullable=True)  # Optional notes about the position
+    
+    portfolio = relationship("Portfolio", back_populates="option_holdings")
+    
+    __table_args__ = (
+        Index('ix_option_underlying_exp', 'underlying_ticker', 'expiration_date'),
     )

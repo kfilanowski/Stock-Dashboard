@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Plus, Briefcase, Layers } from 'lucide-react';
+import { Plus, Briefcase, Layers, TrendingUp, RefreshCw } from 'lucide-react';
 import { 
   Header, 
   PortfolioSummary, 
@@ -12,15 +12,19 @@ import {
   SortSelector,
   ErrorBoundary,
   SectionErrorBoundary,
+  OptionHoldingCard,
+  AddOptionModal,
   type ChartPeriod,
   type SortOption
 } from './components';
 import { usePortfolio, type HoldingChartData } from './hooks/usePortfolio';
 import { getCachedAnalysisScore } from './hooks/useStockAnalysis';
 import * as api from './services/api';
+import type { OptionHoldingWithData, OptionHoldingCreate } from './types';
 
 function App() {
   const [showAddModal, setShowAddModal] = useState(false);
+  const [showAddOptionModal, setShowAddOptionModal] = useState(false);
   const [showCompareModal, setShowCompareModal] = useState(false);
   const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
   const [analyzeTicker, setAnalyzeTicker] = useState<string | null>(null);
@@ -28,6 +32,11 @@ function App() {
   const [chartPeriod, setChartPeriod] = useState<ChartPeriod>('1d');
   const [sortOption, setSortOption] = useState<SortOption>({ field: 'allocation', direction: 'desc' });
   const [settingsInitialized, setSettingsInitialized] = useState(false);
+  
+  // Options state
+  const [optionHoldings, setOptionHoldings] = useState<OptionHoldingWithData[]>([]);
+  const [optionsLoading, setOptionsLoading] = useState(false);
+  const [optionsError, setOptionsError] = useState<string | null>(null);
 
   // Callback for when the portfolio hook fetches new history data
   const handleHistoryUpdate = useCallback((ticker: string, data: HoldingChartData) => {
@@ -233,6 +242,52 @@ function App() {
     });
   };
 
+  // ============================================================================
+  // Options Management
+  // ============================================================================
+
+  // Fetch option holdings
+  const fetchOptionHoldings = useCallback(async () => {
+    setOptionsLoading(true);
+    setOptionsError(null);
+    try {
+      const options = await api.getOptionHoldings();
+      setOptionHoldings(options);
+    } catch (err) {
+      console.error('Failed to fetch option holdings:', err);
+      setOptionsError(err instanceof Error ? err.message : 'Failed to load options');
+    } finally {
+      setOptionsLoading(false);
+    }
+  }, []);
+
+  // Load options on mount and periodically refresh
+  useEffect(() => {
+    fetchOptionHoldings();
+    // Refresh options every 60 seconds
+    const interval = setInterval(fetchOptionHoldings, 60000);
+    return () => clearInterval(interval);
+  }, [fetchOptionHoldings]);
+
+  const handleAddOption = async (option: OptionHoldingCreate) => {
+    await api.addOptionHolding(option);
+    await fetchOptionHoldings();
+  };
+
+  const handleDeleteOption = async (optionId: number) => {
+    await api.deleteOptionHolding(optionId);
+    setOptionHoldings(prev => prev.filter(o => o.id !== optionId));
+  };
+
+  // Calculate total options value
+  const totalOptionsValue = useMemo(() => {
+    return optionHoldings.reduce((sum, opt) => sum + (opt.position_value ?? 0), 0);
+  }, [optionHoldings]);
+
+  const totalOptionsGainLoss = useMemo(() => {
+    return optionHoldings.reduce((sum, opt) => sum + (opt.gain_loss ?? 0), 0);
+  }, [optionHoldings]);
+
   // Check if all holdings have loaded their stock data (have current_price)
   const allDataLoaded = !portfolio?.holdings.length || 
     portfolio.holdings.every(h => h.current_price !== undefined && h.current_price !== null);
@@ -382,6 +437,88 @@ function App() {
                   </div>
                 )}
               </div>
+
+              {/* Options Section */}
+              <div className="fade-in mt-8" style={{ animationDelay: '0.4s' }}>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
+                  <div className="flex items-center gap-3">
+                    <TrendingUp className="w-5 h-5 text-accent-purple" />
+                    <h2 className="text-xl font-semibold text-white">Options</h2>
+                    <span className="text-white/40 text-sm">
+                      ({optionHoldings.length} positions)
+                    </span>
+                    {optionHoldings.length > 0 && (
+                      <>
+                        <span className="text-white/30">•</span>
+                        <span className="text-white/60 text-sm">
+                          ${totalOptionsValue.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                        </span>
+                        <span className={`text-sm font-medium ${totalOptionsGainLoss >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          ({totalOptionsGainLoss >= 0 ? '+' : ''}${totalOptionsGainLoss.toLocaleString('en-US', { minimumFractionDigits: 2 })})
+                        </span>
+                      </>
+                    )}
+                  </div>
+                  
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={fetchOptionHoldings}
+                      disabled={optionsLoading}
+                      className="btn-secondary flex items-center gap-2"
+                      title="Refresh option prices"
+                    >
+                      <RefreshCw className={`w-4 h-4 ${optionsLoading ? 'animate-spin' : ''}`} />
+                    </button>
+                    <button 
+                      onClick={() => setShowAddOptionModal(true)}
+                      className="btn-primary flex items-center gap-2"
+                    >
+                      <Plus className="w-5 h-5" />
+                      Add Option
+                    </button>
+                  </div>
+                </div>
+
+                {optionsError && (
+                  <div className="glass-card p-4 mb-4 border-red-500/30">
+                    <p className="text-red-400 text-sm">{optionsError}</p>
+                  </div>
+                )}
+
+                {optionHoldings.length === 0 ? (
+                  <div className="glass-card p-12 text-center">
+                    <TrendingUp className="w-16 h-16 text-white/20 mx-auto mb-4" />
+                    <h3 className="text-xl font-semibold text-white mb-2">No options yet</h3>
+                    <p className="text-white/50 mb-6">
+                      Track your calls, puts, covered calls, and cash-secured puts
+                    </p>
+                    <button 
+                      onClick={() => setShowAddOptionModal(true)}
+                      className="btn-primary inline-flex items-center gap-2"
+                    >
+                      <Plus className="w-5 h-5" />
+                      Add Your First Option
+                    </button>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {optionHoldings.map((option, index) => (
+                      <div 
+                        key={option.id} 
+                        className="fade-in"
+                        style={{ animationDelay: `${0.1 * (index + 1)}s` }}
+                      >
+                        <SectionErrorBoundary sectionName={`${option.underlying_ticker} option`}>
+                          <OptionHoldingCard
+                            option={option}
+                            onDelete={handleDeleteOption}
+                          />
+                        </SectionErrorBoundary>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </>
           )}
         </div>
@@ -391,6 +528,12 @@ function App() {
           isOpen={showAddModal}
           onClose={() => setShowAddModal(false)}
           onAdd={handleAddHolding}
+        />
+
+        <AddOptionModal
+          isOpen={showAddOptionModal}
+          onClose={() => setShowAddOptionModal(false)}
+          onAdd={handleAddOption}
         />
 
         <StockDetailModal

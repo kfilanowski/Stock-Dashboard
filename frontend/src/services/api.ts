@@ -4,7 +4,15 @@
  * All API calls are centralized here for maintainability.
  * Uses versioned API endpoints (v1) with fallback support.
  */
-import type { Portfolio, StockData, StockHistoryResponse } from '../types';
+import type { 
+  Portfolio, 
+  StockData, 
+  StockHistoryResponse,
+  OptionHolding,
+  OptionHoldingWithData,
+  OptionHoldingCreate,
+  OptionHoldingUpdate
+} from '../types';
 
 // API Configuration
 const API_VERSION = 'v1';
@@ -280,4 +288,99 @@ export async function getStockOptions(ticker: string): Promise<StockOptionsData>
 export async function getSectorCorrelation(ticker: string, days: number = 60): Promise<SectorCorrelation> {
   const response = await fetch(`${API_BASE}/stock/${ticker}/sector-correlation?days=${days}`);
   return handleResponse<SectorCorrelation>(response);
+}
+
+// ============================================================================
+// Option Holdings API
+// ============================================================================
+
+/**
+ * Get all option holdings with live pricing and analytics.
+ */
+export async function getOptionHoldings(): Promise<OptionHoldingWithData[]> {
+  const response = await fetch(`${API_BASE}/options`);
+  return handleResponse<OptionHoldingWithData[]>(response);
+}
+
+/**
+ * Get a single option holding with live pricing and analytics.
+ */
+export async function getOptionHolding(optionId: number): Promise<OptionHoldingWithData> {
+  const response = await fetch(`${API_BASE}/options/${optionId}`);
+  return handleResponse<OptionHoldingWithData>(response);
+}
+
+/**
+ * Add a new option holding to the portfolio.
+ */
+export async function addOptionHolding(data: OptionHoldingCreate): Promise<OptionHolding> {
+  const response = await fetch(`${API_BASE}/options`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  return handleResponse<OptionHolding>(response);
+}
+
+/**
+ * Update an option holding (contracts, premium, notes).
+ */
+export async function updateOptionHolding(optionId: number, data: OptionHoldingUpdate): Promise<OptionHolding> {
+  const response = await fetch(`${API_BASE}/options/${optionId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  return handleResponse<OptionHolding>(response);
+}
+
+/**
+ * Delete an option holding from the portfolio.
+ */
+export async function deleteOptionHolding(optionId: number): Promise<void> {
+  const response = await fetch(`${API_BASE}/options/${optionId}`, {
+    method: 'DELETE',
+  });
+  return handleResponse<void>(response);
+}
+
+// ============================================================================
+// Option Chain Discovery API
+// ============================================================================
+
+export interface OptionExpirationsResponse {
+  ticker: string;
+  expirations: string[];
+}
+
+/**
+ * Get available expiration dates for a ticker's options.
+ * Use this to populate the expiration date picker when adding an option.
+ */
+export async function getOptionExpirations(ticker: string): Promise<OptionExpirationsResponse> {
+  const response = await fetch(`${API_BASE}/options/chain/${ticker}/expirations`);
+  return handleResponse<OptionExpirationsResponse>(response);
+}
+
+export interface OptionStrikesResponse {
+  ticker: string;
+  expiration: string;
+  strikes: number[];
+}
+
+/**
+ * Get available strike prices for a ticker and expiration.
+ * Use this to populate the strike price picker when adding an option.
+ */
+export async function getOptionStrikes(
+  ticker: string, 
+  expiration: string,
+  optionType?: 'call' | 'put'
+): Promise<OptionStrikesResponse> {
+  let url = `${API_BASE}/options/chain/${ticker}/strikes?expiration=${expiration}`;
+  if (optionType) {
+    url += `&option_type=${optionType}`;
+  }
+  const response = await fetch(url);
+  return handleResponse<OptionStrikesResponse>(response);
 }

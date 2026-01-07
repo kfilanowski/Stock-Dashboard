@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo, useRef } from 'react';
-import { X, TrendingUp, TrendingDown, Calendar, BarChart2 } from 'lucide-react';
+import { X, TrendingUp, TrendingDown, Calendar, BarChart2, Sun, Moon, Sunrise } from 'lucide-react';
 import { 
   Line, XAxis, YAxis, Tooltip, ResponsiveContainer, 
   CartesianGrid, ReferenceLine, Area, ComposedChart, ReferenceArea 
@@ -15,6 +15,18 @@ const EXTENDED_END_MINUTES = 20 * 60;     // 8:00 PM = 1200 minutes
 // Market hours in Eastern Time (24-hour format)
 const MARKET_OPEN = 9 * 60 + 30;  // 9:30 AM = 570 minutes
 const MARKET_CLOSE = 16 * 60;     // 4:00 PM = 960 minutes
+
+// Session change types
+interface SessionChange {
+  percent: number;
+  value: number;
+}
+
+interface SessionChanges {
+  preMarket: SessionChange | null;
+  regular: SessionChange | null;
+  afterHours: SessionChange | null;
+}
 
 // Parse time string "HH:MM" to minutes since midnight
 function parseTimeToMinutes(timeStr: string): number {
@@ -246,6 +258,69 @@ export function StockDetailModal({
   // Check if this is an intraday period
   const isIntraday = ['1d', '3d', '1w'].includes(chartPeriod);
   const hasIntradayData = useMemo(() => isIntradayData(chartHistory), [chartHistory]);
+
+  // Calculate session-specific changes (pre-market, regular, after-hours)
+  const sessionChanges = useMemo((): SessionChanges | null => {
+    if (!hasIntradayData || !chartHistory.length) return null;
+    
+    // Get the most recent trading day's data
+    const latestDay = getTradingDay(chartHistory[chartHistory.length - 1].date);
+    const todayData = chartHistory.filter(h => getTradingDay(h.date) === latestDay);
+    
+    if (!todayData.length) return null;
+    
+    // Find first and last prices for each session
+    let preMarketFirst: number | null = null;
+    let preMarketLast: number | null = null;
+    let regularFirst: number | null = null;
+    let regularLast: number | null = null;
+    let afterHoursFirst: number | null = null;
+    let afterHoursLast: number | null = null;
+    
+    for (const point of todayData) {
+      const minutes = dateToMinutes(point.date);
+      
+      if (minutes < MARKET_OPEN) {
+        // Pre-market (4 AM - 9:30 AM)
+        if (preMarketFirst === null) preMarketFirst = point.close;
+        preMarketLast = point.close;
+      } else if (minutes < MARKET_CLOSE) {
+        // Regular hours (9:30 AM - 4 PM)
+        if (regularFirst === null) regularFirst = point.close;
+        regularLast = point.close;
+      } else {
+        // After hours (4 PM - 8 PM)
+        if (afterHoursFirst === null) afterHoursFirst = point.close;
+        afterHoursLast = point.close;
+      }
+    }
+    
+    // Helper to calculate change
+    const calcChange = (start: number | null, end: number | null): SessionChange | null => {
+      if (start === null || end === null || start === 0) return null;
+      return {
+        percent: ((end - start) / start) * 100,
+        value: end - start
+      };
+    };
+    
+    // Pre-market: from reference close to end of pre-market
+    const preMarketBase = referenceClose ?? preMarketFirst;
+    const preMarket = (preMarketBase && preMarketLast) 
+      ? calcChange(preMarketBase, preMarketLast)
+      : null;
+    
+    // Regular: from first regular price to last regular price
+    const regular = calcChange(regularFirst, regularLast);
+    
+    // After-hours: from last regular price to last after-hours price
+    const afterHoursBase = regularLast ?? afterHoursFirst;
+    const afterHours = (afterHoursBase && afterHoursLast)
+      ? calcChange(afterHoursBase, afterHoursLast)
+      : null;
+    
+    return { preMarket, regular, afterHours };
+  }, [chartHistory, hasIntradayData, referenceClose]);
 
   // Calculate period gain
   const periodGain = useMemo(() => {
@@ -880,6 +955,27 @@ export function StockDetailModal({
               </ResponsiveContainer>
             </div>
 
+            {/* Session Changes Display */}
+            {sessionChanges && (sessionChanges.preMarket || sessionChanges.regular || sessionChanges.afterHours) && (
+              <div className="mt-4 grid grid-cols-3 gap-2">
+                <SessionBadge 
+                  label="Pre-Market" 
+                  icon={<Sunrise className="w-3.5 h-3.5" />}
+                  change={sessionChanges.preMarket} 
+                />
+                <SessionBadge 
+                  label="Regular" 
+                  icon={<Sun className="w-3.5 h-3.5" />}
+                  change={sessionChanges.regular} 
+                />
+                <SessionBadge 
+                  label="After Hours" 
+                  icon={<Moon className="w-3.5 h-3.5" />}
+                  change={sessionChanges.afterHours} 
+                />
+              </div>
+            )}
+
             {/* Legend */}
             <div className="mt-3 flex flex-wrap gap-4 text-xs text-white/50">
               <span className="flex items-center gap-1.5">
@@ -916,6 +1012,55 @@ export function StockDetailModal({
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// Session change badge component
+function SessionBadge({ 
+  label, 
+  icon, 
+  change 
+}: { 
+  label: string; 
+  icon: React.ReactNode; 
+  change: SessionChange | null;
+}) {
+  // Format value as dollar amount
+  const formatValue = (val: number) => {
+    const sign = val >= 0 ? '+' : '';
+    return `${sign}$${val.toFixed(2)}`;
+  };
+  
+  // Empty state when no data for this session
+  if (!change) {
+    return (
+      <div className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm bg-white/5 text-white/30 border border-white/5">
+        <span className="opacity-50">{icon}</span>
+        <span>{label}</span>
+        <span>—</span>
+      </div>
+    );
+  }
+  
+  const isPositive = change.percent >= 0;
+  const sign = isPositive ? '+' : '';
+  
+  return (
+    <div 
+      className={`
+        flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-medium
+        ${isPositive 
+          ? 'bg-green-500/15 text-green-400 border border-green-500/20' 
+          : 'bg-red-500/15 text-red-400 border border-red-500/20'
+        }
+      `}
+      title={`${label}: ${sign}${change.percent.toFixed(2)}% (${formatValue(change.value)})`}
+    >
+      <span className="opacity-70">{icon}</span>
+      <span className="opacity-70">{label}</span>
+      <span className="font-semibold">{sign}{change.percent.toFixed(2)}%</span>
+      <span className="opacity-60 text-xs">{formatValue(change.value)}</span>
     </div>
   );
 }

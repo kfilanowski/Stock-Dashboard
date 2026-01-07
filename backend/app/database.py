@@ -73,6 +73,37 @@ async def migrate_db(conn):
     await conn.execute(text("UPDATE portfolios SET chart_period = '1d' WHERE chart_period IS NULL"))
     await conn.execute(text("UPDATE portfolios SET sort_field = 'allocation' WHERE sort_field IS NULL"))
     await conn.execute(text("UPDATE portfolios SET sort_direction = 'desc' WHERE sort_direction IS NULL"))
+    
+    # Create option_holdings table if it doesn't exist
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS option_holdings (
+            id INTEGER PRIMARY KEY,
+            portfolio_id INTEGER NOT NULL REFERENCES portfolios(id),
+            underlying_ticker VARCHAR NOT NULL,
+            option_type VARCHAR NOT NULL,
+            position_type VARCHAR NOT NULL,
+            strike_price FLOAT NOT NULL,
+            expiration_date DATE NOT NULL,
+            contracts INTEGER NOT NULL DEFAULT 1,
+            premium_per_contract FLOAT,
+            opened_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            notes VARCHAR
+        )
+    """))
+    
+    # Create indexes for option_holdings if they don't exist
+    await conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_option_holdings_underlying_ticker 
+        ON option_holdings(underlying_ticker)
+    """))
+    await conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_option_holdings_expiration_date 
+        ON option_holdings(expiration_date)
+    """))
+    await conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_option_underlying_exp 
+        ON option_holdings(underlying_ticker, expiration_date)
+    """))
 
 
 async def init_db():
