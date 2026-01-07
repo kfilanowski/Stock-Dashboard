@@ -27,10 +27,11 @@ class Holding(Base):
     id = Column(Integer, primary_key=True, index=True)
     portfolio_id = Column(Integer, ForeignKey("portfolios.id"), nullable=False)
     ticker = Column(String, nullable=False)
-    allocation_pct = Column(Float, nullable=False)  # Percentage of portfolio (e.g., 5.0 for 5%)
+    shares = Column(Float, nullable=False, default=0)  # Number of shares owned
+    avg_cost = Column(Float, nullable=True)  # Average cost per share
     added_at = Column(DateTime, default=datetime.utcnow)
-    investment_date = Column(DateTime, nullable=True)  # When user started tracking this stock
-    investment_price = Column(Float, nullable=True)  # Stock price at investment_date for gain/loss calc
+    # Legacy column - kept for database compatibility, no longer used
+    allocation_pct = Column(Float, nullable=True, default=0)
 
     portfolio = relationship("Portfolio", back_populates="holdings")
 

@@ -23,10 +23,11 @@ async def get_db():
 
 async def migrate_db(conn):
     """Run simple migrations to add new columns to existing tables."""
-    # Check and add investment_date column to holdings table
+    # Check holdings table columns
     result = await conn.execute(text("PRAGMA table_info(holdings)"))
     columns = [row[1] for row in result.fetchall()]
     
+    # Legacy columns (kept for backwards compatibility during migration)
     if 'investment_date' not in columns:
         await conn.execute(text("ALTER TABLE holdings ADD COLUMN investment_date DATETIME"))
         print("Added investment_date column to holdings table")
@@ -34,6 +35,20 @@ async def migrate_db(conn):
     if 'investment_price' not in columns:
         await conn.execute(text("ALTER TABLE holdings ADD COLUMN investment_price FLOAT"))
         print("Added investment_price column to holdings table")
+    
+    # New position tracking columns
+    if 'shares' not in columns:
+        await conn.execute(text("ALTER TABLE holdings ADD COLUMN shares FLOAT DEFAULT 0"))
+        print("Added shares column to holdings table")
+    
+    if 'avg_cost' not in columns:
+        await conn.execute(text("ALTER TABLE holdings ADD COLUMN avg_cost FLOAT"))
+        print("Added avg_cost column to holdings table")
+    
+    # Migration: Convert old allocation_pct based holdings to share-based
+    # If a holding has allocation_pct but no shares, we can't auto-convert (need price data)
+    # Just ensure shares defaults to 0 for existing holdings
+    await conn.execute(text("UPDATE holdings SET shares = 0 WHERE shares IS NULL"))
     
     # Check and add user preference columns to portfolios table
     result = await conn.execute(text("PRAGMA table_info(portfolios)"))

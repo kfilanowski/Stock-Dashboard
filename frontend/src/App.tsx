@@ -15,8 +15,8 @@ import {
   type SortOption
 } from './components';
 import { usePortfolio, type HoldingChartData } from './hooks/usePortfolio';
+import { getCachedAnalysisScore } from './hooks/useStockAnalysis';
 import * as api from './services/api';
-import { getQuickAnalysis } from './services/stockScoring';
 
 function App() {
   const [showAddModal, setShowAddModal] = useState(false);
@@ -42,7 +42,6 @@ function App() {
     lastFetched,
     lastPricesFetched,
     refresh, 
-    updatePortfolioValue, 
     addHolding, 
     removeHolding,
     updateHolding 
@@ -128,16 +127,10 @@ function App() {
     return ((latestClose - chartData.referenceClose) / chartData.referenceClose) * 100;
   }, [holdingChartData]);
 
-  // Helper to get action score for a holding
+  // Helper to get action score for a holding (uses cached analysis from ActionScoreBadge)
   const getActionScore = useCallback((ticker: string): number | null => {
-    const chartData = holdingChartData[ticker];
-    const holding = portfolio?.holdings.find(h => h.ticker === ticker);
-    if (!chartData?.history?.length || !holding?.current_price) {
-      return null;
-    }
-    const analysis = getQuickAnalysis(chartData.history, holding.current_price, null, null);
-    return analysis?.score ?? null;
-  }, [holdingChartData, portfolio?.holdings]);
+    return getCachedAnalysisScore(ticker);
+  }, []);
 
   // Sort holdings based on current sort option
   const sortedHoldings = useMemo(() => {
@@ -147,6 +140,16 @@ function App() {
     const { field, direction } = sortOption;
     const multiplier = direction === 'asc' ? 1 : -1;
 
+    // Pre-compute values that require expensive calculations to ensure stable sorting
+    // (calling functions during sort comparisons can cause inconsistent results)
+    const periodGainCache = new Map<string, number | null>();
+    const actionScoreCache = new Map<string, number | null>();
+    
+    for (const h of holdings) {
+      periodGainCache.set(h.ticker, getPeriodGain(h.ticker));
+      actionScoreCache.set(h.ticker, getActionScore(h.ticker));
+    }
+
     holdings.sort((a, b) => {
       let comparison = 0;
 
@@ -154,35 +157,49 @@ function App() {
         case 'ticker':
           comparison = a.ticker.localeCompare(b.ticker);
           break;
-        case 'daily_change': {
-          // Use absolute value for daily change sorting
-          const gainA = getPeriodGain(a.ticker);
-          const gainB = getPeriodGain(b.ticker);
-          // Put null values at the end
-          if (gainA === null && gainB === null) comparison = 0;
-          else if (gainA === null) comparison = 1;
-          else if (gainB === null) comparison = -1;
-          else comparison = Math.abs(gainA) - Math.abs(gainB);
+        case 'top_movers': {
+          // Use absolute value - biggest movers regardless of direction
+          const gainA = periodGainCache.get(a.ticker) ?? null;
+          const gainB = periodGainCache.get(b.ticker) ?? null;
+          // Put null values at the end (return directly to bypass multiplier)
+          if (gainA === null && gainB === null) return 0;
+          if (gainA === null) return 1;
+          if (gainB === null) return -1;
+          comparison = Math.abs(gainA) - Math.abs(gainB);
+          break;
+        }
+        case 'period_change': {
+          // Actual value - gainers vs losers
+          const gainA = periodGainCache.get(a.ticker) ?? null;
+          const gainB = periodGainCache.get(b.ticker) ?? null;
+          // Put null values at the end (return directly to bypass multiplier)
+          if (gainA === null && gainB === null) return 0;
+          if (gainA === null) return 1;
+          if (gainB === null) return -1;
+          comparison = gainA - gainB;
           break;
         }
         case 'allocation':
-          comparison = a.allocation_pct - b.allocation_pct;
+          comparison = (a.allocation_pct ?? 0) - (b.allocation_pct ?? 0);
           break;
         case 'equity':
-          comparison = (a.current_value ?? 0) - (b.current_value ?? 0);
+          comparison = (a.market_value ?? 0) - (b.market_value ?? 0);
           break;
-        case 'ytd':
-          comparison = (a.ytd_return ?? 0) - (b.ytd_return ?? 0);
+        case 'gain_pct':
+          comparison = (a.gain_loss_pct ?? 0) - (b.gain_loss_pct ?? 0);
+          break;
+        case 'gain_value':
+          comparison = (a.gain_loss ?? 0) - (b.gain_loss ?? 0);
           break;
         case 'confidence': {
           // Sort by action score (0-100)
-          const scoreA = getActionScore(a.ticker);
-          const scoreB = getActionScore(b.ticker);
-          // Put null values at the end
-          if (scoreA === null && scoreB === null) comparison = 0;
-          else if (scoreA === null) comparison = 1;
-          else if (scoreB === null) comparison = -1;
-          else comparison = scoreA - scoreB;
+          const scoreA = actionScoreCache.get(a.ticker) ?? null;
+          const scoreB = actionScoreCache.get(b.ticker) ?? null;
+          // Put null values at the end (return directly to bypass multiplier)
+          if (scoreA === null && scoreB === null) return 0;
+          if (scoreA === null) return 1;
+          if (scoreB === null) return -1;
+          comparison = scoreA - scoreB;
           break;
         }
         default:
@@ -195,19 +212,24 @@ function App() {
     return holdings;
   }, [portfolio?.holdings, sortOption, getPeriodGain, getActionScore]);
 
-  const handleAddHolding = async (ticker: string, allocation: number) => {
-    await addHolding(ticker, allocation);
+  const handleAddHolding = async (ticker: string, shares: number, avgCost?: number) => {
+    await addHolding(ticker, shares, avgCost);
   };
 
-  const handleUpdateAllocation = async (holdingId: number, allocation: number) => {
-    await updateHolding(holdingId, { allocation_pct: allocation });
-  };
-
-  const handleUpdateInvestment = async (holdingId: number, data: { investment_date?: string; investment_price?: number }) => {
+  const handleUpdatePosition = async (holdingId: number, data: { shares?: number; avg_cost?: number }) => {
     await updateHolding(holdingId, data);
   };
 
-  const currentAllocation = portfolio?.holdings.reduce((sum, h) => sum + h.allocation_pct, 0) ?? 0;
+  const handleRefreshHistory = async (ticker: string) => {
+    // Clear cached history on backend
+    await api.clearStockHistory(ticker);
+    // Clear local chart data to trigger refetch
+    setHoldingChartData(prev => {
+      const newData = { ...prev };
+      delete newData[ticker];
+      return newData;
+    });
+  };
 
   // Check if all holdings have loaded their stock data (have current_price)
   const allDataLoaded = !portfolio?.holdings.length || 
@@ -246,18 +268,16 @@ function App() {
         
         <div className="max-w-7xl mx-auto">
           <Header 
-            totalValue={(portfolio?.total_value ?? 0) + (portfolio?.total_gain_loss ?? 0)}
+            totalValue={portfolio?.total_market_value ?? 0}
             lastUpdated={lastFetched ?? undefined}
             isDataReady={allDataLoaded}
+            holdings={portfolio?.holdings}
           />
 
           {portfolio && (
             <>
               <SectionErrorBoundary sectionName="portfolio summary">
-                <PortfolioSummary 
-                  portfolio={portfolio} 
-                  onUpdateValue={updatePortfolioValue}
-                />
+                <PortfolioSummary portfolio={portfolio} />
               </SectionErrorBoundary>
 
               {/* Holdings Section */}
@@ -336,10 +356,8 @@ function App() {
                               onDelete={removeHolding}
                               onSelect={setSelectedTicker}
                               onAnalyze={setAnalyzeTicker}
-                              onUpdateAllocation={handleUpdateAllocation}
-                              onUpdateInvestment={handleUpdateInvestment}
-                              currentTotalAllocation={currentAllocation}
-                              portfolioTotalValue={portfolio?.total_value ?? 0}
+                              onUpdatePosition={handleUpdatePosition}
+                              onRefreshHistory={handleRefreshHistory}
                               isRefreshing={false}
                               isHistoryLoading={!chartData}
                               lastPricesFetched={lastPricesFetched}
@@ -360,8 +378,6 @@ function App() {
           isOpen={showAddModal}
           onClose={() => setShowAddModal(false)}
           onAdd={handleAddHolding}
-          currentAllocation={currentAllocation}
-          portfolioTotalValue={portfolio?.total_value ?? 0}
         />
 
         <StockDetailModal
@@ -380,13 +396,12 @@ function App() {
           } : null}
         />
 
-        {/* Stock Analysis Modal */}
+        {/* Stock Analysis Modal - uses shared cache with ActionScoreBadge */}
         {analyzeTicker && (
           <StockAnalysisModal
             ticker={analyzeTicker}
             onClose={() => setAnalyzeTicker(null)}
             currentPrice={portfolio?.holdings.find(h => h.ticker === analyzeTicker)?.current_price}
-            history={holdingChartData[analyzeTicker]?.history}
           />
         )}
       </div>

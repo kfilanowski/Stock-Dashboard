@@ -3,10 +3,12 @@ import { useState, useRef, useEffect } from 'react';
 
 export type SortField = 
   | 'ticker' 
-  | 'daily_change' 
+  | 'top_movers' 
+  | 'period_change'
   | 'allocation' 
   | 'equity' 
-  | 'ytd'
+  | 'gain_pct'
+  | 'gain_value'
   | 'confidence';
 
 export type SortDirection = 'asc' | 'desc';
@@ -18,10 +20,12 @@ export interface SortOption {
 
 const SORT_OPTIONS: { field: SortField; label: string; defaultDirection: SortDirection }[] = [
   { field: 'ticker', label: 'Ticker (A-Z)', defaultDirection: 'asc' },
-  { field: 'daily_change', label: 'Daily Change', defaultDirection: 'desc' },
+  { field: 'top_movers', label: 'Top Movers', defaultDirection: 'desc' },
+  { field: 'period_change', label: 'Period Change', defaultDirection: 'desc' },
   { field: 'allocation', label: 'Allocation %', defaultDirection: 'desc' },
-  { field: 'equity', label: 'Equity Value', defaultDirection: 'desc' },
-  { field: 'ytd', label: 'YTD Returns', defaultDirection: 'desc' },
+  { field: 'equity', label: 'Market Value', defaultDirection: 'desc' },
+  { field: 'gain_pct', label: 'Return %', defaultDirection: 'desc' },
+  { field: 'gain_value', label: 'Return $', defaultDirection: 'desc' },
   { field: 'confidence', label: 'Action Score', defaultDirection: 'desc' },
 ];
 

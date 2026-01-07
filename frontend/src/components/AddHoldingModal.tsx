@@ -1,87 +1,46 @@
 import { useState, useEffect } from 'react';
-import { X, Plus, AlertCircle, Percent, DollarSign } from 'lucide-react';
+import { X, Plus, AlertCircle, Layers, DollarSign } from 'lucide-react';
 
 interface AddHoldingModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onAdd: (ticker: string, allocation: number) => Promise<void>;
-  currentAllocation: number;
-  portfolioTotalValue: number;
+  onAdd: (ticker: string, shares: number, avgCost?: number) => Promise<void>;
 }
 
-export function AddHoldingModal({ isOpen, onClose, onAdd, currentAllocation, portfolioTotalValue }: AddHoldingModalProps) {
+export function AddHoldingModal({ isOpen, onClose, onAdd }: AddHoldingModalProps) {
   const [ticker, setTicker] = useState('');
-  const [allocation, setAllocation] = useState('');
-  const [amount, setAmount] = useState('');
-  const [activeInput, setActiveInput] = useState<'percent' | 'amount' | null>(null);
+  const [shares, setShares] = useState('');
+  const [avgCost, setAvgCost] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-
-  const remainingAllocation = 100 - currentAllocation;
-  const remainingAmount = portfolioTotalValue * (remainingAllocation / 100);
-
-  // Sync allocation and amount based on which one was edited
-  useEffect(() => {
-    if (activeInput === 'percent' && allocation !== '') {
-      const pct = parseFloat(allocation);
-      if (!isNaN(pct) && portfolioTotalValue > 0) {
-        const calculatedAmount = (pct / 100) * portfolioTotalValue;
-        setAmount(calculatedAmount.toFixed(2));
-      }
-    } else if (activeInput === 'amount' && amount !== '') {
-      const amt = parseFloat(amount);
-      if (!isNaN(amt) && portfolioTotalValue > 0) {
-        const calculatedPct = (amt / portfolioTotalValue) * 100;
-        setAllocation(calculatedPct.toFixed(2));
-      }
-    }
-  }, [allocation, amount, activeInput, portfolioTotalValue]);
-
-  const handleAllocationChange = (value: string) => {
-    setActiveInput('percent');
-    setAllocation(value);
-    if (value === '') {
-      setAmount('');
-    }
-  };
-
-  const handleAmountChange = (value: string) => {
-    setActiveInput('amount');
-    setAmount(value);
-    if (value === '') {
-      setAllocation('');
-    }
-  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    
-    const allocationNum = parseFloat(allocation) || 0;
     
     if (!ticker.trim()) {
       setError('Please enter a ticker symbol');
       return;
     }
     
-    // Allow 0% allocation
-    if (allocationNum < 0) {
-      setError('Allocation cannot be negative');
+    const sharesNum = parseFloat(shares) || 0;
+    if (sharesNum < 0) {
+      setError('Shares cannot be negative');
       return;
     }
     
-    if (allocationNum > remainingAllocation) {
-      setError(`Allocation cannot exceed ${remainingAllocation.toFixed(1)}%`);
+    const avgCostNum = avgCost ? parseFloat(avgCost) : undefined;
+    if (avgCostNum !== undefined && avgCostNum <= 0) {
+      setError('Average cost must be greater than 0');
       return;
     }
 
     setLoading(true);
     try {
-      await onAdd(ticker.toUpperCase(), allocationNum);
+      await onAdd(ticker.toUpperCase(), sharesNum, avgCostNum);
       setTicker('');
-      setAllocation('');
-      setAmount('');
-      setActiveInput(null);
+      setShares('');
+      setAvgCost('');
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add holding');
@@ -94,9 +53,8 @@ export function AddHoldingModal({ isOpen, onClose, onAdd, currentAllocation, por
   useEffect(() => {
     if (!isOpen) {
       setTicker('');
-      setAllocation('');
-      setAmount('');
-      setActiveInput(null);
+      setShares('');
+      setAvgCost('');
       setError('');
     }
   }, [isOpen]);
@@ -131,7 +89,7 @@ export function AddHoldingModal({ isOpen, onClose, onAdd, currentAllocation, por
                 type="text"
                 value={ticker}
                 onChange={(e) => setTicker(e.target.value.toUpperCase())}
-                placeholder="e.g., AAPL, ONDS"
+                placeholder="e.g., AAPL, MSFT"
                 className="w-full"
                 disabled={loading}
                 autoFocus
@@ -140,56 +98,44 @@ export function AddHoldingModal({ isOpen, onClose, onAdd, currentAllocation, por
 
             <div>
               <label className="block text-white/70 text-sm mb-2">
-                Allocation
-                <span className="text-white/40 ml-2">
-                  (optional)
-                </span>
+                Number of Shares
+                <span className="text-white/40 ml-2">(optional)</span>
               </label>
-              <div className="space-y-3">
-                {/* Percentage Input */}
-                <div>
-                  <div className="flex items-center gap-2">
-                    <Percent className="w-4 h-4 text-white/40 flex-shrink-0" />
-                    <input
-                      type="number"
-                      value={allocation}
-                      onChange={(e) => handleAllocationChange(e.target.value)}
-                      placeholder="0"
-                      min="0"
-                      max={remainingAllocation}
-                      step="0.1"
-                      className="flex-1"
-                      disabled={loading}
-                    />
-                    <span className="text-white/30 text-xs whitespace-nowrap">
-                      max {remainingAllocation.toFixed(1)}%
-                    </span>
-                  </div>
-                </div>
-                
-                {/* Amount Input */}
-                <div>
-                  <div className="flex items-center gap-2">
-                    <DollarSign className="w-4 h-4 text-white/40 flex-shrink-0" />
-                    <input
-                      type="number"
-                      value={amount}
-                      onChange={(e) => handleAmountChange(e.target.value)}
-                      placeholder="0.00"
-                      min="0"
-                      max={remainingAmount}
-                      step="0.01"
-                      className="flex-1"
-                      disabled={loading}
-                    />
-                    <span className="text-white/30 text-xs whitespace-nowrap">
-                      max ${remainingAmount.toLocaleString('en-US', { maximumFractionDigits: 0 })}
-                    </span>
-                  </div>
-                </div>
+              <div className="flex items-center gap-2">
+                <Layers className="w-4 h-4 text-white/40 flex-shrink-0" />
+                <input
+                  type="number"
+                  value={shares}
+                  onChange={(e) => setShares(e.target.value)}
+                  placeholder="0"
+                  min="0"
+                  step="0.0001"
+                  className="flex-1"
+                  disabled={loading}
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-white/70 text-sm mb-2">
+                Average Cost per Share
+                <span className="text-white/40 ml-2">(optional)</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <DollarSign className="w-4 h-4 text-white/40 flex-shrink-0" />
+                <input
+                  type="number"
+                  value={avgCost}
+                  onChange={(e) => setAvgCost(e.target.value)}
+                  placeholder="0.00"
+                  min="0.01"
+                  step="0.01"
+                  className="flex-1"
+                  disabled={loading}
+                />
               </div>
               <p className="text-white/30 text-xs mt-2">
-                Enter either — the other is calculated automatically
+                Used to calculate your gain/loss on this position
               </p>
             </div>
 
@@ -230,4 +176,3 @@ export function AddHoldingModal({ isOpen, onClose, onAdd, currentAllocation, por
     </div>
   );
 }
-

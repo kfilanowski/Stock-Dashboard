@@ -177,35 +177,60 @@ export function usePortfolio(options: UsePortfolioOptions = {}) {
       setPortfolio((prev: Portfolio | null) => {
         if (!prev) return prev;
         
-        const updatedHoldings = prev.holdings.map((h: Holding) => {
+        // First pass: calculate market values for allocation percentages
+        let totalMarketValue = 0;
+        let totalCostBasis = 0;
+        
+        const holdingsWithPrices = prev.holdings.map((h: Holding) => {
           const price = priceData[h.ticker];
-          if (!price || price.current_price === 0) return h;
+          const currentPrice = price?.current_price ?? h.current_price ?? 0;
+          const marketValue = h.shares * currentPrice;
+          const costBasis = h.shares && h.avg_cost ? h.shares * h.avg_cost : null;
           
-          // We need ytd_return from the quote endpoint for value calculation
-          // For now, keep existing ytd_return if we have it
-          const ytdReturn = h.ytd_return ?? 0;
-          const allocatedValue = prev.total_value * (h.allocation_pct / 100);
-          const currentValue = allocatedValue * (1 + ytdReturn / 100);
+          totalMarketValue += marketValue;
+          if (costBasis !== null) totalCostBasis += costBasis;
           
           return {
             ...h,
-            current_price: price.current_price,
-            current_value: Math.round(currentValue * 100) / 100,
+            current_price: currentPrice,
+            market_value: Math.round(marketValue * 100) / 100,
+            cost_basis: costBasis ? Math.round(costBasis * 100) / 100 : null,
           };
         });
         
-        const newTotalValue = updatedHoldings.reduce((sum: number, h: Holding) => sum + (h.current_value ?? 0), 0);
-        const totalAllocated = updatedHoldings.reduce((sum: number, h: Holding) => sum + h.allocation_pct, 0);
-        const baseInvested = prev.total_value * (totalAllocated / 100);
-        const totalGainLoss = baseInvested > 0 ? newTotalValue - baseInvested : 0;
-        const totalGainLossPct = baseInvested > 0 ? (totalGainLoss / baseInvested) * 100 : 0;
+        // Second pass: calculate allocations and gain/loss
+        const updatedHoldings = holdingsWithPrices.map((h) => {
+          const allocationPct = totalMarketValue > 0 ? (h.market_value! / totalMarketValue) * 100 : 0;
+          let gainLoss = null;
+          let gainLossPct = null;
+          
+          if (h.market_value !== null && h.cost_basis !== null) {
+            gainLoss = h.market_value - h.cost_basis;
+            if (h.avg_cost && h.avg_cost > 0) {
+              gainLossPct = ((h.current_price! - h.avg_cost) / h.avg_cost) * 100;
+            }
+          }
+          
+          return {
+            ...h,
+            allocation_pct: Math.round(allocationPct * 100) / 100,
+            gain_loss: gainLoss !== null ? Math.round(gainLoss * 100) / 100 : null,
+            gain_loss_pct: gainLossPct !== null ? Math.round(gainLossPct * 100) / 100 : null,
+          };
+        });
+        
+        const totalGainLoss = totalCostBasis > 0 ? totalMarketValue - totalCostBasis : null;
+        const totalGainLossPct = totalCostBasis > 0 && totalGainLoss !== null 
+          ? (totalGainLoss / totalCostBasis) * 100 
+          : null;
         
         return {
           ...prev,
           holdings: updatedHoldings,
-          current_total_value: Math.round(newTotalValue * 100) / 100,
-          total_gain_loss: Math.round(totalGainLoss * 100) / 100,
-          total_gain_loss_pct: Math.round(totalGainLossPct * 100) / 100,
+          total_market_value: Math.round(totalMarketValue * 100) / 100,
+          total_cost_basis: totalCostBasis > 0 ? Math.round(totalCostBasis * 100) / 100 : null,
+          total_gain_loss: totalGainLoss !== null ? Math.round(totalGainLoss * 100) / 100 : null,
+          total_gain_loss_pct: totalGainLossPct !== null ? Math.round(totalGainLossPct * 100) / 100 : null,
         };
       });
       
@@ -282,38 +307,70 @@ export function usePortfolio(options: UsePortfolioOptions = {}) {
       
       if (!isMounted.current) return;
       
-      // Update holding with quote data
+      // Update holding with quote data and recalculate portfolio totals
       setPortfolio((prev: Portfolio | null) => {
         if (!prev) return prev;
         
-        const allocatedValue = prev.total_value * (holding.allocation_pct / 100);
-        const currentValue = allocatedValue * (1 + quote.ytd_return / 100);
+        // First, update the holding with new price data
+        const updatedHoldings = prev.holdings.map((h: Holding) => {
+          if (h.ticker !== holding.ticker) return h;
+          
+          const marketValue = h.shares * quote.current_price;
+          const costBasis = h.shares && h.avg_cost ? h.shares * h.avg_cost : null;
+          
+          return {
+            ...h,
+            current_price: quote.current_price,
+            market_value: Math.round(marketValue * 100) / 100,
+            cost_basis: costBasis ? Math.round(costBasis * 100) / 100 : null,
+            ytd_return: quote.ytd_return,
+            sma_200: quote.sma_200 ?? undefined,
+            price_vs_sma: quote.price_vs_sma ?? undefined,
+          };
+        });
         
-        const updatedHoldings = prev.holdings.map((h: Holding) => 
-          h.ticker === holding.ticker 
-            ? {
-                ...h,
-                current_price: quote.current_price,
-                current_value: Math.round(currentValue * 100) / 100,
-                ytd_return: quote.ytd_return,
-                sma_200: quote.sma_200 ?? undefined,
-                price_vs_sma: quote.price_vs_sma ?? undefined,
-              }
-            : h
-        );
+        // Calculate portfolio totals
+        let totalMarketValue = 0;
+        let totalCostBasis = 0;
         
-        const newTotalValue = updatedHoldings.reduce((sum: number, h: Holding) => sum + (h.current_value ?? 0), 0);
-        const totalAllocated = updatedHoldings.reduce((sum: number, h: Holding) => sum + h.allocation_pct, 0);
-        const baseInvested = prev.total_value * (totalAllocated / 100);
-        const totalGainLoss = baseInvested > 0 ? newTotalValue - baseInvested : 0;
-        const totalGainLossPct = baseInvested > 0 ? (totalGainLoss / baseInvested) * 100 : 0;
+        updatedHoldings.forEach((h) => {
+          totalMarketValue += h.market_value ?? 0;
+          totalCostBasis += h.cost_basis ?? 0;
+        });
+        
+        // Calculate allocations and gain/loss
+        const finalHoldings = updatedHoldings.map((h) => {
+          const allocationPct = totalMarketValue > 0 ? ((h.market_value ?? 0) / totalMarketValue) * 100 : 0;
+          let gainLoss = null;
+          let gainLossPct = null;
+          
+          if (h.market_value !== null && h.cost_basis !== null) {
+            gainLoss = (h.market_value ?? 0) - (h.cost_basis ?? 0);
+            if (h.avg_cost && h.avg_cost > 0 && h.current_price) {
+              gainLossPct = ((h.current_price - h.avg_cost) / h.avg_cost) * 100;
+            }
+          }
+          
+          return {
+            ...h,
+            allocation_pct: Math.round(allocationPct * 100) / 100,
+            gain_loss: gainLoss !== null ? Math.round(gainLoss * 100) / 100 : null,
+            gain_loss_pct: gainLossPct !== null ? Math.round(gainLossPct * 100) / 100 : null,
+          };
+        });
+        
+        const totalGainLoss = totalCostBasis > 0 ? totalMarketValue - totalCostBasis : null;
+        const totalGainLossPct = totalCostBasis > 0 && totalGainLoss !== null 
+          ? (totalGainLoss / totalCostBasis) * 100 
+          : null;
         
         return {
           ...prev,
-          holdings: updatedHoldings,
-          current_total_value: Math.round(newTotalValue * 100) / 100,
-          total_gain_loss: Math.round(totalGainLoss * 100) / 100,
-          total_gain_loss_pct: Math.round(totalGainLossPct * 100) / 100,
+          holdings: finalHoldings,
+          total_market_value: Math.round(totalMarketValue * 100) / 100,
+          total_cost_basis: totalCostBasis > 0 ? Math.round(totalCostBasis * 100) / 100 : null,
+          total_gain_loss: totalGainLoss !== null ? Math.round(totalGainLoss * 100) / 100 : null,
+          total_gain_loss_pct: totalGainLossPct !== null ? Math.round(totalGainLossPct * 100) / 100 : null,
         };
       });
       
@@ -447,8 +504,8 @@ export function usePortfolio(options: UsePortfolioOptions = {}) {
     }
   };
 
-  const addHolding = async (ticker: string, allocation_pct: number, investment_date?: string, investment_price?: number) => {
-    await api.addHolding({ ticker, allocation_pct, investment_date, investment_price });
+  const addHolding = async (ticker: string, shares: number = 0, avgCost?: number) => {
+    await api.addHolding({ ticker, shares, avg_cost: avgCost });
     
     const upperTicker = ticker.toUpperCase();
     
@@ -464,10 +521,9 @@ export function usePortfolio(options: UsePortfolioOptions = {}) {
       id: Date.now(),
       portfolio_id: 0,
       ticker: upperTicker,
-      allocation_pct,
+      shares,
+      avg_cost: avgCost,
       added_at: new Date().toISOString(),
-      investment_date,
-      investment_price,
     };
     
     setPortfolio((prev: Portfolio | null) => {
@@ -516,40 +572,69 @@ export function usePortfolio(options: UsePortfolioOptions = {}) {
     }
   };
 
-  const updateHolding = async (holdingId: number, data: { allocation_pct?: number; investment_date?: string; investment_price?: number }) => {
+  const updateHolding = async (holdingId: number, data: { shares?: number; avg_cost?: number }) => {
     await api.updateHolding(holdingId, data);
     setPortfolio((prev: Portfolio | null) => {
       if (!prev) return prev;
       
-      // Update the holding with new data and recalculate current_value if allocation changed
-      const updatedHoldings = prev.holdings.map((h: Holding) => {
-        if (h.id !== holdingId) return h;
+      // First pass: update the holding and calculate market values
+      let totalMarketValue = 0;
+      let totalCostBasis = 0;
+      
+      const holdingsWithUpdates = prev.holdings.map((h: Holding) => {
+        const isUpdatedHolding = h.id === holdingId;
+        const shares = isUpdatedHolding && data.shares !== undefined ? data.shares : h.shares;
+        const avgCost = isUpdatedHolding && data.avg_cost !== undefined ? data.avg_cost : h.avg_cost;
+        const currentPrice = h.current_price ?? 0;
         
-        const updatedHolding = { ...h, ...data };
+        const marketValue = shares * currentPrice;
+        const costBasis = shares && avgCost ? shares * avgCost : null;
         
-        // Recalculate current_value if allocation changed and we have ytd_return data
-        if (data.allocation_pct !== undefined && h.ytd_return !== undefined) {
-          const allocatedValue = prev.total_value * (data.allocation_pct / 100);
-          const currentValue = allocatedValue * (1 + h.ytd_return / 100);
-          updatedHolding.current_value = Math.round(currentValue * 100) / 100;
-        }
+        totalMarketValue += marketValue;
+        if (costBasis !== null) totalCostBasis += costBasis;
         
-        return updatedHolding;
+        return {
+          ...h,
+          shares,
+          avg_cost: avgCost,
+          market_value: Math.round(marketValue * 100) / 100,
+          cost_basis: costBasis ? Math.round(costBasis * 100) / 100 : null,
+        };
       });
       
-      // Recalculate portfolio totals
-      const newTotalValue = updatedHoldings.reduce((sum: number, h: Holding) => sum + (h.current_value ?? 0), 0);
-      const totalAllocated = updatedHoldings.reduce((sum: number, h: Holding) => sum + h.allocation_pct, 0);
-      const baseInvested = prev.total_value * (totalAllocated / 100);
-      const totalGainLoss = baseInvested > 0 ? newTotalValue - baseInvested : 0;
-      const totalGainLossPct = baseInvested > 0 ? (totalGainLoss / baseInvested) * 100 : 0;
+      // Second pass: calculate allocations and gain/loss
+      const updatedHoldings = holdingsWithUpdates.map((h) => {
+        const allocationPct = totalMarketValue > 0 ? ((h.market_value ?? 0) / totalMarketValue) * 100 : 0;
+        let gainLoss = null;
+        let gainLossPct = null;
+        
+        if (h.market_value !== null && h.cost_basis !== null) {
+          gainLoss = (h.market_value ?? 0) - (h.cost_basis ?? 0);
+          if (h.avg_cost && h.avg_cost > 0 && h.current_price) {
+            gainLossPct = ((h.current_price - h.avg_cost) / h.avg_cost) * 100;
+          }
+        }
+        
+        return {
+          ...h,
+          allocation_pct: Math.round(allocationPct * 100) / 100,
+          gain_loss: gainLoss !== null ? Math.round(gainLoss * 100) / 100 : null,
+          gain_loss_pct: gainLossPct !== null ? Math.round(gainLossPct * 100) / 100 : null,
+        };
+      });
+      
+      const totalGainLoss = totalCostBasis > 0 ? totalMarketValue - totalCostBasis : null;
+      const totalGainLossPct = totalCostBasis > 0 && totalGainLoss !== null 
+        ? (totalGainLoss / totalCostBasis) * 100 
+        : null;
       
       return {
         ...prev,
         holdings: updatedHoldings,
-        current_total_value: Math.round(newTotalValue * 100) / 100,
-        total_gain_loss: Math.round(totalGainLoss * 100) / 100,
-        total_gain_loss_pct: Math.round(totalGainLossPct * 100) / 100,
+        total_market_value: Math.round(totalMarketValue * 100) / 100,
+        total_cost_basis: totalCostBasis > 0 ? Math.round(totalCostBasis * 100) / 100 : null,
+        total_gain_loss: totalGainLoss !== null ? Math.round(totalGainLoss * 100) / 100 : null,
+        total_gain_loss_pct: totalGainLossPct !== null ? Math.round(totalGainLossPct * 100) / 100 : null,
       };
     });
   };

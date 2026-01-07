@@ -1154,6 +1154,10 @@ class StockFetcher:
     def clear_ticker_cache(self, ticker: str) -> int:
         """Clear intraday cache for a ticker."""
         return self._price_history.clear_intraday_cache(ticker)
+    
+    def clear_ticker_history(self, ticker: str) -> tuple[int, int]:
+        """Clear ALL price history for a ticker (daily + intraday). Forces full refresh."""
+        return self._price_history.clear_ticker_history(ticker)
 
 
 # Singleton instance

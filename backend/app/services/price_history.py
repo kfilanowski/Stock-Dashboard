@@ -322,6 +322,42 @@ class PriceHistoryService:
             
             return daily_deleted, intraday_deleted
     
+    def clear_ticker_history(self, ticker: str) -> tuple[int, int]:
+        """
+        Clear ALL price history for a specific ticker (both daily and intraday).
+        This forces a full refresh on the next request.
+        
+        Args:
+            ticker: Stock ticker symbol.
+            
+        Returns:
+            Tuple of (daily_deleted, intraday_deleted) counts.
+        """
+        ticker = ticker.upper()
+        
+        with Session(self._engine) as session:
+            # Delete all daily data for this ticker
+            daily_result = session.execute(
+                delete(PriceHistory).where(PriceHistory.ticker == ticker)
+            )
+            
+            # Delete all intraday data for this ticker
+            intraday_result = session.execute(
+                delete(IntradayPriceHistory).where(IntradayPriceHistory.ticker == ticker)
+            )
+            
+            session.commit()
+            
+            daily_deleted = daily_result.rowcount
+            intraday_deleted = intraday_result.rowcount
+            
+            logger.info(
+                f"Cleared {daily_deleted} daily and {intraday_deleted} intraday "
+                f"records for {ticker}"
+            )
+            
+            return daily_deleted, intraday_deleted
+    
     # ============ Utility Methods ============
     
     def filter_intraday_by_period(

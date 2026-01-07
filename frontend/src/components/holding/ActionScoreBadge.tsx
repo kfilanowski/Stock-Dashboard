@@ -1,17 +1,17 @@
 /**
  * Action Score Badge
  * 
- * Compact badge component showing the best recommended action
- * for display on holding cards.
+ * Compact badge component showing the best recommended action.
+ * Uses background analysis with caching - shows loading spinner
+ * while analysis is being calculated, then displays the score.
  */
 
-import { useMemo } from 'react';
-import { Zap } from 'lucide-react';
-import type { HistoryPoint, ActionType } from '../../types';
-import { getQuickAnalysis } from '../../services/stockScoring';
+import { Calculator, Zap, AlertCircle, Clock } from 'lucide-react';
+import type { ActionType } from '../../types';
+import { useStockAnalysis } from '../../hooks/useStockAnalysis';
 
 interface ActionScoreBadgeProps {
-  history: HistoryPoint[];
+  ticker: string;
   currentPrice?: number;
   high52w?: number | null;
   low52w?: number | null;
@@ -22,8 +22,8 @@ interface ActionScoreBadgeProps {
 const SHORT_LABELS: Record<ActionType, string> = {
   buyShares: 'Buy',
   sellShares: 'Sell',
-  buyCSP: 'CSP',
-  buyCC: 'CC',
+  openCSP: 'CSP',
+  openCC: 'CC',
   buyCall: 'Call',
   buyPut: 'Put'
 };
@@ -46,23 +46,73 @@ function getScoreStyles(score: number): { bg: string; text: string; border: stri
 }
 
 export function ActionScoreBadge({
-  history,
+  ticker,
   currentPrice,
   high52w,
   low52w,
   onClick
 }: ActionScoreBadgeProps) {
-  const analysis = useMemo(() => {
-    if (!history?.length || !currentPrice) return null;
-    return getQuickAnalysis(history, currentPrice, high52w ?? null, low52w ?? null);
-  }, [history, currentPrice, high52w, low52w]);
+  const { analysis, isLoading, isStale, error } = useStockAnalysis(
+    ticker,
+    currentPrice,
+    high52w,
+    low52w
+  );
   
+  // Loading state - show calculator icon with spinning animation
+  if (isLoading && !analysis) {
+    return (
+      <div
+        className="
+          inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium
+          border bg-white/5 text-white/40 border-white/10
+        "
+        title="Calculating analysis..."
+      >
+        <Calculator className="w-3 h-3 animate-pulse" />
+        <span className="opacity-60">...</span>
+      </div>
+    );
+  }
+  
+  // Error state - show error icon
+  if (error && !analysis) {
+    return (
+      <button
+        onClick={onClick}
+        className="
+          inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium
+          border bg-red-500/10 text-red-400/60 border-red-500/20
+          hover:bg-red-500/15 transition-colors
+        "
+        title={`Analysis failed: ${error}. Click to retry.`}
+      >
+        <AlertCircle className="w-3 h-3" />
+        <span>—</span>
+      </button>
+    );
+  }
+  
+  // No analysis available
   if (!analysis) {
     return null;
   }
   
-  const styles = getScoreStyles(analysis.score);
-  const shortLabel = SHORT_LABELS[analysis.action];
+  const bestAction = analysis.bestAction;
+  const styles = getScoreStyles(bestAction.totalScore);
+  const shortLabel = SHORT_LABELS[bestAction.action];
+  
+  // Build title with stale indicator
+  let title = `${bestAction.label}: ${bestAction.totalScore}/100 (${bestAction.confidence} confidence)`;
+  if (isStale) {
+    title += ' • Refreshing...';
+  }
+  if (analysis.dataQuality.missingMetrics.length > 0) {
+    title += ` • Missing: ${analysis.dataQuality.missingMetrics.slice(0, 3).join(', ')}`;
+    if (analysis.dataQuality.missingMetrics.length > 3) {
+      title += ` +${analysis.dataQuality.missingMetrics.length - 3} more`;
+    }
+  }
   
   return (
     <button
@@ -71,13 +121,20 @@ export function ActionScoreBadge({
         inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium
         border transition-all hover:scale-105 active:scale-95
         ${styles.bg} ${styles.text} ${styles.border}
+        ${isStale ? 'opacity-70' : ''}
       `}
-      title={`${analysis.label}: ${analysis.score}/100 (${analysis.confidence} confidence)`}
+      title={title}
     >
-      <Zap className="w-3 h-3" />
+      {/* Show clock if stale & refreshing, otherwise zap */}
+      {isLoading && isStale ? (
+        <Clock className="w-3 h-3 animate-pulse" />
+      ) : (
+        <Zap className="w-3 h-3" />
+      )}
       <span>{shortLabel}</span>
-      <span className="opacity-70">{analysis.score}</span>
+      <span className={isStale ? 'opacity-50' : 'opacity-70'}>
+        {bestAction.totalScore}
+      </span>
     </button>
   );
 }
-

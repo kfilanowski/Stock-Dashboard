@@ -307,11 +307,12 @@ async def clear_stock_cache(
     ticker: str,
     stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
 ):
-    """Clear the intraday cache for a specific stock."""
-    deleted_count = stock_fetcher.clear_ticker_cache(ticker)
+    """Clear ALL price history for a specific stock (forces full refresh)."""
+    daily_deleted, intraday_deleted = stock_fetcher.clear_ticker_history(ticker)
     return {
-        "message": f"Cleared intraday cache for {ticker.upper()}",
-        "deleted_records": deleted_count
+        "message": f"Cleared all price history for {ticker.upper()}",
+        "daily_deleted": daily_deleted,
+        "intraday_deleted": intraday_deleted
     }
 
 

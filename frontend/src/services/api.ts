@@ -61,9 +61,8 @@ export async function updatePortfolio(data: UpdatePortfolioData): Promise<Portfo
 
 export interface AddHoldingData {
   ticker: string;
-  allocation_pct: number;
-  investment_date?: string | null;
-  investment_price?: number | null;
+  shares?: number;
+  avg_cost?: number | null;
 }
 
 /**
@@ -89,9 +88,8 @@ export async function deleteHolding(holdingId: number): Promise<void> {
 }
 
 export interface UpdateHoldingData {
-  allocation_pct?: number;
-  investment_date?: string | null;
-  investment_price?: number | null;
+  shares?: number;
+  avg_cost?: number | null;
 }
 
 /**
@@ -145,6 +143,16 @@ export async function getStockQuote(ticker: string): Promise<StockQuote> {
 export async function getStockHistory(ticker: string, period: string = '1y'): Promise<StockHistoryResponse> {
   const response = await fetch(`${API_BASE}/stock/${ticker}/history?period=${period}`);
   return handleResponse<StockHistoryResponse>(response);
+}
+
+/**
+ * Clear all cached price history for a stock (forces full refresh).
+ */
+export async function clearStockHistory(ticker: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/stock/${ticker}/cache`, {
+    method: 'DELETE',
+  });
+  return handleResponse<void>(response);
 }
 
 // ============================================================================

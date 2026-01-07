@@ -28,8 +28,8 @@ import {
  * Optimized weights based on trading strategy requirements:
  * - buyShares: Long-term hold - focus on trend + fundamentals
  * - sellShares: Exit position - focus on reversal signals
- * - buyCSP: Sell cash-secured puts - mean reversion + high IV
- * - buyCC: Sell covered calls - premium collection on held positions
+ * - openCSP: Sell cash-secured puts - mean reversion + high IV
+ * - openCC: Sell covered calls - premium collection on held positions
  * - buyCall: Long options - momentum + explosion (time decay hurts)
  * - buyPut: Long puts - bearish momentum + protection
  * 
@@ -43,13 +43,13 @@ type WeightMatrix = Record<MetricType, Record<ActionType, number>>;
  * 
  * Key Design Principles:
  * 1. MULTICOLLINEARITY REDUCTION: Momentum weight reduced since MACD/RSI capture velocity
- * 2. STRATEGY SEPARATION: Long Gamma (buyCall/buyPut) vs Short Vega (buyCSP/buyCC)
+ * 2. STRATEGY SEPARATION: Long Gamma (buyCall/buyPut) vs Short Vega (openCSP/openCC)
  *    have distinct factor exposures
  * 3. REGIME AWARENESS: ADX and BollingerSqueeze now included for regime detection
  * 
  * Greeks alignment:
  * - buyCall/buyPut: Long Gamma, Long Vega → favor ADX trending + squeeze (cheap vol)
- * - buyCSP/buyCC: Short Gamma, Short Vega → favor ADX sideways + expansion (rich vol)
+ * - openCSP/openCC: Short Gamma, Short Vega → favor ADX sideways + expansion (rich vol)
  */
 const DEFAULT_WEIGHTS: WeightMatrix = {
   // ============================================================================
@@ -60,8 +60,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   rsi: {
     buyShares: 0.8,   // Moderate - avoid extremes
     sellShares: 1.0,  // Important - sell overbought
-    buyCSP: 1.8,      // HIGH - sell puts in oversold (high IV + bounce expected)
-    buyCC: 1.5,       // Important - sell calls in overbought
+    openCSP: 1.8,      // HIGH - sell puts in oversold (high IV + bounce expected)
+    openCC: 1.5,       // Important - sell calls in overbought
     buyCall: 0.3,     // LOW - RSI interpretation now ADX-aware
     buyPut: 0.3       // LOW - RSI interpretation now ADX-aware
   },
@@ -70,8 +70,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   macd: {
     buyShares: 1.2,   // Important for entry timing
     sellShares: 1.2,
-    buyCSP: 0.6,      // Lower - not chasing trend for premium selling
-    buyCC: 0.6,
+    openCSP: 0.6,      // Lower - not chasing trend for premium selling
+    openCC: 0.6,
     buyCall: 1.8,     // HIGH - crossovers = immediate directional move
     buyPut: 1.8
   },
@@ -84,8 +84,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   bollingerBands: {
     buyShares: 0.8,
     sellShares: 0.8,
-    buyCSP: 1.5,      // Important - sell puts at lower band
-    buyCC: 1.5,       // Important - sell calls at upper band
+    openCSP: 1.5,      // Important - sell puts at lower band
+    openCC: 1.5,       // Important - sell calls at upper band
     buyCall: 0.4,     // Low - breakouts pierce bands
     buyPut: 0.4
   },
@@ -95,8 +95,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   bollingerSqueeze: {
     buyShares: 0.3,   // Minor consideration
     sellShares: 0.3,
-    buyCSP: 1.2,      // Moderate - prefer high vol for premium
-    buyCC: 1.2,
+    openCSP: 1.2,      // Moderate - prefer high vol for premium
+    openCC: 1.2,
     buyCall: 2.0,     // CRITICAL - squeeze = cheap options before explosion
     buyPut: 2.0
   },
@@ -109,8 +109,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   adx: {
     buyShares: 0.8,   // Moderate - prefer trending
     sellShares: 0.8,
-    buyCSP: 1.5,      // Important - prefer sideways (low ADX)
-    buyCC: 1.5,
+    openCSP: 1.5,      // Important - prefer sideways (low ADX)
+    openCC: 1.5,
     buyCall: 2.2,     // CRITICAL - need trend for directional bets
     buyPut: 2.2
   },
@@ -123,8 +123,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   vwap: {
     buyShares: 0.8,
     sellShares: 0.8,
-    buyCSP: 1.0,
-    buyCC: 1.0,
+    openCSP: 1.0,
+    openCC: 1.0,
     buyCall: 0.6,
     buyPut: 0.6
   },
@@ -134,8 +134,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   momentum: {
     buyShares: 0.6,   // Reduced - MACD captures this
     sellShares: 0.6,
-    buyCSP: 0.3,      // Low - mean reversion strategy
-    buyCC: 0.3,
+    openCSP: 0.3,      // Low - mean reversion strategy
+    openCC: 0.3,
     buyCall: 1.0,     // Moderate - already captured by ADX
     buyPut: 1.0
   },
@@ -144,8 +144,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   volume: {
     buyShares: 1.0,
     sellShares: 1.0,
-    buyCSP: 0.6,      // Lower - volume direction matters less for premium
-    buyCC: 0.6,
+    openCSP: 0.6,      // Lower - volume direction matters less for premium
+    openCC: 0.6,
     buyCall: 1.8,     // HIGH - need volume conviction
     buyPut: 1.8
   },
@@ -154,8 +154,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   rvol: {
     buyShares: 0.8,
     sellShares: 0.8,
-    buyCSP: 0.5,
-    buyCC: 0.5,
+    openCSP: 0.5,
+    openCC: 0.5,
     buyCall: 1.5,     // Important - confirms participation
     buyPut: 1.5
   },
@@ -168,8 +168,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   pricePosition: {
     buyShares: 1.0,   // Buy low in range
     sellShares: 1.0,
-    buyCSP: 1.5,      // Important - sell puts near lows
-    buyCC: 1.5,       // Important - sell calls near highs
+    openCSP: 1.5,      // Important - sell puts near lows
+    openCC: 1.5,       // Important - sell calls near highs
     buyCall: 0.4,     // Low - breakouts happen at highs
     buyPut: 0.4
   },
@@ -178,8 +178,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   smaAlignment: {
     buyShares: 1.8,   // HIGH - trend alignment critical
     sellShares: 1.5,
-    buyCSP: 0.8,      // Moderate
-    buyCC: 0.8,
+    openCSP: 0.8,      // Moderate
+    openCC: 0.8,
     buyCall: 1.0,
     buyPut: 1.0
   },
@@ -188,8 +188,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   crossPattern: {
     buyShares: 1.5,   // Important for long-term
     sellShares: 1.5,
-    buyCSP: 0.6,
-    buyCC: 0.6,
+    openCSP: 0.6,
+    openCC: 0.6,
     buyCall: 0.8,
     buyPut: 0.8
   },
@@ -202,8 +202,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   roic: {
     buyShares: 1.5,   // Important for holding
     sellShares: 0.5,
-    buyCSP: 1.2,      // Want quality for assignment risk
-    buyCC: 0.6,
+    openCSP: 1.2,      // Want quality for assignment risk
+    openCC: 0.6,
     buyCall: 0.2,     // Short-term doesn't care
     buyPut: 0.2
   },
@@ -212,8 +212,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   callPutRatio: {
     buyShares: 0.6,
     sellShares: 0.6,
-    buyCSP: 1.0,
-    buyCC: 1.0,
+    openCSP: 1.0,
+    openCC: 1.0,
     buyCall: 1.2,
     buyPut: 1.2
   },
@@ -224,8 +224,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   ivPercentile: {
     buyShares: 0.2,   // Minor consideration
     sellShares: 0.2,
-    buyCSP: 2.0,      // CRITICAL - sell puts in high IV
-    buyCC: 2.0,       // CRITICAL - sell calls in high IV
+    openCSP: 2.0,      // CRITICAL - sell puts in high IV
+    openCC: 2.0,       // CRITICAL - sell calls in high IV
     buyCall: 1.8,     // HIGH - buy calls in low IV
     buyPut: 1.8
   },
@@ -234,8 +234,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
   sectorBeta: {
     buyShares: 1.0,
     sellShares: 0.8,
-    buyCSP: 0.6,
-    buyCC: 0.6,
+    openCSP: 0.6,
+    openCC: 0.6,
     buyCall: 0.5,
     buyPut: 0.5
   }
@@ -245,8 +245,8 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
 const actionLabels: Record<ActionType, string> = {
   buyShares: 'Buy Shares',
   sellShares: 'Sell Shares',
-  buyCSP: 'Sell CSP',
-  buyCC: 'Sell CC',
+  openCSP: 'Open CSP',
+  openCC: 'Open CC',
   buyCall: 'Buy Call',
   buyPut: 'Buy Put'
 };
@@ -402,7 +402,7 @@ function interpretRSI(
   }
   
   // Adjust signal direction based on action
-  const bearishActions: ActionType[] = ['sellShares', 'buyCC', 'buyPut'];
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
   if (bearishActions.includes(action)) {
     signal = -signal;
   }
@@ -443,7 +443,7 @@ function interpretMACD(
   }
   
   // Invert for bearish actions
-  const bearishActions: ActionType[] = ['sellShares', 'buyCC', 'buyPut'];
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
   if (bearishActions.includes(action)) {
     signal = -signal;
   }
@@ -495,7 +495,7 @@ function interpretBollingerBands(
   }
   
   // Invert for bearish actions
-  const bearishActions: ActionType[] = ['sellShares', 'buyCC', 'buyPut'];
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
   if (bearishActions.includes(action)) {
     signal = -signal;
   }
@@ -547,7 +547,7 @@ function interpretVWAP(
   }
   
   // Invert for bearish actions
-  const bearishActions: ActionType[] = ['sellShares', 'buyCC', 'buyPut'];
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
   if (bearishActions.includes(action)) {
     signal = -signal;
   }
@@ -587,7 +587,7 @@ function interpretMomentum(
   }
   
   // Invert for bearish actions
-  const bearishActions: ActionType[] = ['sellShares', 'buyCC', 'buyPut'];
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
   if (bearishActions.includes(action)) {
     signal = -signal;
   }
@@ -667,7 +667,7 @@ function interpretVolume(
   
   // Invert signal for bearish actions
   // If signal is -1 (bearish w/ high vol), sellShares wants +1
-  const bearishActions: ActionType[] = ['sellShares', 'buyCC', 'buyPut'];
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
   if (bearishActions.includes(action)) {
     signal = -signal;
   }
@@ -713,7 +713,7 @@ function interpretPricePosition(
   }
   
   // Invert for bearish actions
-  const bearishActions: ActionType[] = ['sellShares', 'buyCC', 'buyPut'];
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
   if (bearishActions.includes(action)) {
     signal = -signal;
   }
@@ -772,7 +772,7 @@ function interpretSMAAlignment(
   }
   
   // Invert for bearish actions
-  const bearishActions: ActionType[] = ['sellShares', 'buyCC', 'buyPut'];
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
   if (bearishActions.includes(action)) {
     signal = -signal;
   }
@@ -857,7 +857,7 @@ function interpretCrossPattern(
   }
   
   // Invert for bearish actions
-  const bearishActions: ActionType[] = ['sellShares', 'buyCC', 'buyPut'];
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
   if (bearishActions.includes(action)) {
     signal = -signal;
   }
@@ -874,7 +874,7 @@ function interpretCrossPattern(
  * 
  * ADX is used differently per action:
  * - Momentum trades (buyCall, buyPut): High ADX is good (trend continuation)
- * - Mean reversion (buyCSP, buyCC): Low ADX is good (range-bound)
+ * - Mean reversion (openCSP, openCC): Low ADX is good (range-bound)
  * - Long-term (buyShares): Moderate importance
  */
 function interpretADX(
@@ -909,7 +909,7 @@ function interpretADX(
     }
   }
   // For mean reversion trades (short options), range-bound is favorable
-  else if (action === 'buyCSP' || action === 'buyCC') {
+  else if (action === 'openCSP' || action === 'openCC') {
     if (!isTrending) {
       // Range-bound - ideal for selling options
       signal = 0.7;
@@ -978,8 +978,8 @@ function interpretBollingerSqueeze(
       reasoning = `Normal volatility (${bandwidthPercentile}%ile)`;
     }
   }
-  // For short options (buyCSP, buyCC): Expansion is bullish (sell expensive premiums)
-  else if (action === 'buyCSP' || action === 'buyCC') {
+  // For short options (openCSP, openCC): Expansion is bullish (sell expensive premiums)
+  else if (action === 'openCSP' || action === 'openCC') {
     if (isExpansion) {
       signal = 0.6;
       reasoning = `High volatility (${bandwidthPercentile}%ile) - rich premiums`;
@@ -1141,7 +1141,7 @@ function interpretCallPutRatio(
   }
   
   // Invert for bearish actions
-  const bearishActions: ActionType[] = ['sellShares', 'buyCC', 'buyPut'];
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
   if (bearishActions.includes(action)) {
     signal = -signal;
   }
@@ -1173,7 +1173,7 @@ function interpretIVPercentile(
   let reasoning = '';
   
   // For SELLING options (CSP, CC): High IV is favorable
-  if (action === 'buyCSP' || action === 'buyCC') {
+  if (action === 'openCSP' || action === 'openCC') {
     if (ivPct >= 80) {
       signal = 1.0;
       reasoning = `Very high IV (${ivPct}%ile) - rich premiums`;
@@ -1280,7 +1280,7 @@ function interpretSectorBeta(
 // ============================================================================
 
 const ALL_ACTIONS: ActionType[] = [
-  'buyShares', 'sellShares', 'buyCSP', 'buyCC', 'buyCall', 'buyPut'
+  'buyShares', 'sellShares', 'openCSP', 'openCC', 'buyCall', 'buyPut'
 ];
 
 const ALL_METRICS: MetricType[] = [
@@ -1379,14 +1379,45 @@ function calculateActionScore(
   const normalizedScore = Math.round(((rawScore / (availableMetrics || 1)) + 1) * 50);
   const totalScore = Math.max(0, Math.min(100, normalizedScore));
   
-  // Determine confidence based on data availability
+  // Determine confidence based on signal agreement and strength
+  // This is now per-action, not just based on data availability
   let confidence: 'high' | 'medium' | 'low';
-  if (availableMetrics >= 6) {
-    confidence = 'high';
-  } else if (availableMetrics >= 4) {
-    confidence = 'medium';
-  } else {
+  
+  if (availableMetrics < 4) {
+    // Not enough data for any confidence
     confidence = 'low';
+  } else {
+    // Calculate signal agreement: how many signals point in the same direction as the total?
+    const overallDirection = rawScore > 0 ? 1 : rawScore < 0 ? -1 : 0;
+    let agreeingSignals = 0;
+    let strongSignals = 0; // Signals with |contribution| > 0.3
+    
+    for (const sig of signals) {
+      const sigDirection = sig.contribution > 0 ? 1 : sig.contribution < 0 ? -1 : 0;
+      if (sigDirection === overallDirection && overallDirection !== 0) {
+        agreeingSignals++;
+      }
+      if (Math.abs(sig.contribution) > 0.3) {
+        strongSignals++;
+      }
+    }
+    
+    const agreementRatio = availableMetrics > 0 ? agreeingSignals / availableMetrics : 0;
+    const strongRatio = availableMetrics > 0 ? strongSignals / availableMetrics : 0;
+    
+    // High confidence: >70% signals agree AND >40% are strong signals AND score is decisive (>60 or <40)
+    // Medium confidence: >50% signals agree OR score is somewhat decisive
+    // Low confidence: signals are mixed or weak
+    const isDecisiveScore = totalScore >= 65 || totalScore <= 35;
+    const isSomewhatDecisive = totalScore >= 55 || totalScore <= 45;
+    
+    if (agreementRatio >= 0.7 && strongRatio >= 0.4 && isDecisiveScore) {
+      confidence = 'high';
+    } else if ((agreementRatio >= 0.5 && isSomewhatDecisive) || (strongRatio >= 0.5)) {
+      confidence = 'medium';
+    } else {
+      confidence = 'low';
+    }
   }
   
   return {
@@ -1414,13 +1445,24 @@ export function analyzeStock(
   // Calculate all technical indicators
   const indicators = calculateAllIndicators(history, currentPrice, high52w, low52w);
   
+  // Determine if options are available for this stock
+  const hasOptions = additionalData?.hasOptions ?? false;
+  
   // Calculate scores for all actions
   const scores = ALL_ACTIONS.map(action => 
     calculateActionScore(action, indicators, currentPrice, weights, additionalData)
   );
   
-  // Find best action (highest score)
-  const bestAction = scores.reduce((best, current) => 
+  // Options-related actions
+  const optionsActions: ActionType[] = ['openCSP', 'openCC', 'buyCall', 'buyPut'];
+  
+  // Filter to eligible actions (exclude options if not available)
+  const eligibleScores = hasOptions 
+    ? scores 
+    : scores.filter(s => !optionsActions.includes(s.action));
+  
+  // Find best action among eligible actions
+  const bestAction = eligibleScores.reduce((best, current) => 
     current.totalScore > best.totalScore ? current : best
   );
   
@@ -1450,6 +1492,7 @@ export function analyzeStock(
     analyzedAt: new Date(),
     scores,
     bestAction,
+    hasOptions,
     dataQuality: {
       availableMetrics: ALL_METRICS.length - missingMetrics.length,
       totalMetrics: ALL_METRICS.length,

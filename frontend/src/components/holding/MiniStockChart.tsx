@@ -145,11 +145,11 @@ export function MiniStockChart({
   const lineColor = isAboveReference ? '#22c55e' : '#ef4444';
 
   // Calculate Y-axis domain
-  const yAxisDomain = useMemo(() => {
-    if (!history.length) return ['auto', 'auto'] as const;
+  const yAxisDomain = useMemo((): [number, number] | [string, string] => {
+    if (!history.length) return ['auto', 'auto'];
     
     const closes = history.map(h => h.close).filter(c => c > 0);
-    if (!closes.length) return ['auto', 'auto'] as const;
+    if (!closes.length) return ['auto', 'auto'];
     
     let min = Math.min(...closes);
     let max = Math.max(...closes);
@@ -330,7 +330,7 @@ export function MiniStockChart({
                   const { cx, cy, index } = props;
                   const isLastPoint = index === processedHistory.length - 1;
                   
-                  if (!isLastPoint) return null;
+                  if (!isLastPoint) return <g key={`empty-${index}`} />;
                   
                   // Render the last point with ping effect using CSS animation
                   return (

@@ -1,7 +1,7 @@
-import { useMemo } from 'react';
-import { Trash2, BarChart3, RefreshCw, TrendingUp, TrendingDown, Activity } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Trash2, BarChart3, RefreshCw, TrendingUp, TrendingDown, Activity, RotateCcw } from 'lucide-react';
 import type { Holding, HistoryPoint } from '../types';
-import { AllocationEditor, InvestmentInfoEditor, MiniStockChart, ActionScoreBadge } from './holding';
+import { PositionEditor, MiniStockChart, ActionScoreBadge } from './holding';
 
 interface HoldingCardProps {
   holding: Holding;
@@ -13,10 +13,8 @@ interface HoldingCardProps {
   onDelete: (id: number) => void;
   onSelect: (ticker: string) => void;
   onAnalyze: (ticker: string) => void;
-  onUpdateAllocation: (id: number, allocation: number) => Promise<void>;
-  onUpdateInvestment: (id: number, data: { investment_date?: string; investment_price?: number }) => Promise<void>;
-  currentTotalAllocation: number;
-  portfolioTotalValue: number;
+  onUpdatePosition: (id: number, data: { shares?: number; avg_cost?: number }) => Promise<void>;
+  onRefreshHistory: (ticker: string) => Promise<void>;
   isRefreshing?: boolean;
   isHistoryLoading?: boolean;
   lastPricesFetched?: Date | null;
@@ -34,16 +32,24 @@ export function HoldingCard({
   onDelete, 
   onSelect,
   onAnalyze,
-  onUpdateAllocation,
-  onUpdateInvestment,
-  currentTotalAllocation,
-  portfolioTotalValue,
+  onUpdatePosition,
+  onRefreshHistory,
   isRefreshing = false,
   isHistoryLoading = false,
   lastPricesFetched,
   high52w,
   low52w
 }: HoldingCardProps) {
+  const [isRefreshingHistory, setIsRefreshingHistory] = useState(false);
+
+  const handleRefreshHistory = async () => {
+    setIsRefreshingHistory(true);
+    try {
+      await onRefreshHistory(holding.ticker);
+    } finally {
+      setIsRefreshingHistory(false);
+    }
+  };
   // Calculate period gain for display under price
   const periodGain = useMemo(() => {
     if (!history.length || referenceClose === null || referenceClose === 0) return null;
@@ -63,10 +69,10 @@ export function HoldingCard({
           <div className="flex items-center gap-2">
             <h3 className="font-bold text-white text-xl">{holding.ticker}</h3>
             {isRefreshing && <RefreshCw className="w-3 h-3 text-accent-cyan/60 animate-spin" />}
-            {/* Action Score Badge */}
-            {history.length > 0 && holding.current_price && (
+            {/* Action Score Badge - runs analysis in background */}
+            {holding.current_price && (
               <ActionScoreBadge
-                history={history}
+                ticker={holding.ticker}
                 currentPrice={holding.current_price}
                 high52w={high52w}
                 low52w={low52w}
@@ -98,6 +104,14 @@ export function HoldingCard({
           {/* Action buttons */}
           <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
             <button
+              onClick={handleRefreshHistory}
+              disabled={isRefreshingHistory}
+              className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 transition-colors disabled:opacity-50"
+              title="Refresh chart history"
+            >
+              <RotateCcw className={`w-4 h-4 text-white/70 ${isRefreshingHistory ? 'animate-spin' : ''}`} />
+            </button>
+            <button
               onClick={() => onAnalyze(holding.ticker)}
               className="p-1.5 rounded-lg bg-accent-cyan/10 hover:bg-accent-cyan/20 transition-colors"
               title="Analyze actions"
@@ -120,17 +134,15 @@ export function HoldingCard({
             </button>
           </div>
           
-          {/* Allocation, Value, and YTD stacked */}
+          {/* Market Value, Allocation, and YTD stacked */}
           <div className="text-right">
-            <AllocationEditor
-              holdingId={holding.id}
-              currentAllocation={holding.allocation_pct}
-              portfolioTotalValue={portfolioTotalValue}
-              currentTotalAllocation={currentTotalAllocation}
-              onSave={onUpdateAllocation}
-            />
+            {/* Allocation percentage */}
+            {holding.allocation_pct !== null && holding.allocation_pct !== undefined && (
+              <p className="text-white/50 text-sm">{holding.allocation_pct.toFixed(1)}% allocation</p>
+            )}
+            {/* Market value */}
             <p className="text-white font-medium text-sm">
-              ${holding.current_value?.toLocaleString('en-US', { minimumFractionDigits: 2 }) ?? '—'}
+              ${holding.market_value?.toLocaleString('en-US', { minimumFractionDigits: 2 }) ?? '—'}
             </p>
             <div className="flex items-center gap-1 justify-end mt-0.5">
               <span className="text-white/40 text-xs">YTD</span>
@@ -147,14 +159,15 @@ export function HoldingCard({
         </div>
       </div>
 
-      {/* Investment info */}
-      <InvestmentInfoEditor
+      {/* Position info (shares & avg cost) */}
+      <PositionEditor
         holdingId={holding.id}
-        investmentDate={holding.investment_date}
-        investmentPrice={holding.investment_price}
+        shares={holding.shares}
+        avgCost={holding.avg_cost}
         currentPrice={holding.current_price}
+        gainLoss={holding.gain_loss}
         gainLossPct={holding.gain_loss_pct}
-        onSave={onUpdateInvestment}
+        onSave={onUpdatePosition}
       />
 
       {/* Mini chart */}

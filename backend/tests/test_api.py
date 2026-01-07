@@ -83,7 +83,7 @@ class TestHoldingsEndpoints:
         """Updating a non-existent holding should return 404."""
         response = await client.put(
             "/api/v1/holdings/9999",
-            json={"allocation_pct": 10.0}
+            json={"shares": 10.0}
         )
         
         assert response.status_code == 404

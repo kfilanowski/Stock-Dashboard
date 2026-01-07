@@ -3,10 +3,13 @@
  * 
  * Displays trading action scores with a radar chart visualization
  * and detailed metric breakdown.
+ * 
+ * Uses the shared analysis cache from useStockAnalysis to ensure
+ * consistency between the badge and the detailed modal view.
  */
 
-import { useEffect, useState, useMemo } from 'react';
-import { X, TrendingUp, TrendingDown, Minus, ChevronDown, ChevronUp, AlertCircle } from 'lucide-react';
+import { useState, useMemo, useCallback } from 'react';
+import { X, TrendingUp, TrendingDown, Minus, ChevronDown, ChevronUp, AlertCircle, RefreshCw, HelpCircle } from 'lucide-react';
 import {
   RadarChart,
   PolarGrid,
@@ -16,18 +19,187 @@ import {
   ResponsiveContainer,
   Tooltip
 } from 'recharts';
-import type { HistoryPoint, StockAnalysis, ActionScore, ActionType } from '../types';
-import { analyzeStock, type AdditionalAnalysisData } from '../services/stockScoring';
-import * as api from '../services/api';
+import type { ActionScore, ActionType } from '../types';
+import { useStockAnalysis, refreshAnalysis } from '../hooks/useStockAnalysis';
 
 interface StockAnalysisModalProps {
   ticker: string | null;
   onClose: () => void;
-  // Optional: pass existing data to avoid re-fetching
   currentPrice?: number;
   high52w?: number | null;
   low52w?: number | null;
-  history?: HistoryPoint[];
+}
+
+// Indicator descriptions for user reference
+const indicatorDescriptions: Record<string, { name: string; description: string; interpretation: string }> = {
+  rsi: {
+    name: 'RSI (Relative Strength Index)',
+    description: 'Momentum oscillator measuring speed and magnitude of price changes on a 0-100 scale.',
+    interpretation: 'Below 30 = oversold (potential bounce). Above 70 = overbought (potential pullback). In strong trends, these levels can persist.'
+  },
+  macd: {
+    name: 'MACD',
+    description: 'Moving Average Convergence Divergence - shows relationship between two moving averages of price.',
+    interpretation: 'Bullish when MACD crosses above signal line. Histogram shows momentum strength. Divergences can signal reversals.'
+  },
+  bollingerBands: {
+    name: 'Bollinger Bands (%B)',
+    description: 'Shows where price sits relative to volatility bands around a 20-day moving average.',
+    interpretation: '%B of 0% = at lower band (oversold). 100% = at upper band (overbought). 50% = at middle band.'
+  },
+  bollingerSqueeze: {
+    name: 'Volatility Squeeze',
+    description: 'Measures band width contraction. Tight bands often precede explosive moves.',
+    interpretation: 'Squeeze = low volatility, cheap options premiums. Expansion = high volatility, rich premiums for selling.'
+  },
+  vwap: {
+    name: 'VWAP',
+    description: 'Volume Weighted Average Price - the average price weighted by trading volume.',
+    interpretation: 'Acts as support when above, resistance when below. Institutional traders often use VWAP as a benchmark.'
+  },
+  momentum: {
+    name: 'Momentum',
+    description: 'Rate of price change over short and medium timeframes.',
+    interpretation: 'Positive momentum = bullish trend. Negative = bearish. Slowing momentum can signal trend exhaustion.'
+  },
+  volume: {
+    name: 'Volume',
+    description: 'Trading activity level compared to recent average.',
+    interpretation: 'High volume confirms price moves. Low volume suggests weak conviction. Watch volume on breakouts.'
+  },
+  rvol: {
+    name: 'Relative Volume (RVOL)',
+    description: 'Today\'s volume as a multiple of average daily volume.',
+    interpretation: 'RVOL > 1.5x = unusual activity. > 3x = potential catalyst. Low RVOL = lack of interest.'
+  },
+  pricePosition: {
+    name: '52-Week Range Position',
+    description: 'Where current price sits within the 52-week high/low range.',
+    interpretation: 'Near lows = potential value (or falling knife). Near highs = strength (or resistance). Context matters.'
+  },
+  smaAlignment: {
+    name: 'SMA Alignment',
+    description: 'Price position relative to 20, 50, and 200-day Simple Moving Averages.',
+    interpretation: 'Price above all SMAs with SMA20 > SMA50 > SMA200 = strong bullish alignment. Inverse = bearish.'
+  },
+  adx: {
+    name: 'ADX (Trend Strength)',
+    description: 'Average Directional Index measures trend strength regardless of direction.',
+    interpretation: 'ADX > 25 = trending market. ADX < 20 = range-bound. Strong trends (>40) favor momentum plays.'
+  },
+  crossPattern: {
+    name: 'Cross Patterns',
+    description: 'Golden Cross (SMA50 crosses above SMA200) and Death Cross (opposite).',
+    interpretation: 'Golden Cross = long-term bullish signal. Death Cross = bearish. Best with volume confirmation.'
+  },
+  roic: {
+    name: 'ROIC',
+    description: 'Return on Invested Capital - measures how efficiently a company uses capital.',
+    interpretation: 'ROIC > 15% = quality business. > 20% = exceptional. Important for long-term holds.'
+  },
+  callPutRatio: {
+    name: 'Call/Put Ratio',
+    description: 'Ratio of call to put options activity in the market.',
+    interpretation: 'High ratio (>1.5) = bullish sentiment. Low ratio (<0.7) = bearish. Can be contrarian indicator at extremes.'
+  },
+  ivPercentile: {
+    name: 'IV Percentile',
+    description: 'Where current implied volatility ranks vs. its historical range.',
+    interpretation: 'High IV = expensive options (sell premium). Low IV = cheap options (buy calls/puts).'
+  },
+  sectorBeta: {
+    name: 'Sector Beta',
+    description: 'Stock\'s correlation and volatility relative to its sector.',
+    interpretation: 'Beta > 1 = more volatile than sector. Beta < 1 = defensive. Helps gauge relative risk.'
+  }
+};
+
+// Indicator Guide Component
+function IndicatorGuide({ isOpen, onToggle }: { isOpen: boolean; onToggle: () => void }) {
+  return (
+    <div className="glass-card p-3 mb-4">
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center justify-between text-left hover:bg-white/5 rounded-lg p-1 -m-1 transition-colors"
+      >
+        <div className="flex items-center gap-2">
+          <HelpCircle className="w-4 h-4 text-accent-cyan" />
+          <span className="text-sm font-medium text-white/80">Indicator Guide</span>
+        </div>
+        {isOpen ? (
+          <ChevronUp className="w-4 h-4 text-white/50" />
+        ) : (
+          <ChevronDown className="w-4 h-4 text-white/50" />
+        )}
+      </button>
+      
+      {isOpen && (
+        <div className="mt-3 space-y-3 max-h-[300px] overflow-y-auto pr-2">
+          {Object.entries(indicatorDescriptions).map(([key, info]) => (
+            <div key={key} className="border-l-2 border-accent-cyan/30 pl-3 py-1">
+              <h4 className="text-sm font-medium text-white/90">{info.name}</h4>
+              <p className="text-xs text-white/50 mt-0.5">{info.description}</p>
+              <p className="text-xs text-accent-cyan/70 mt-1 italic">{info.interpretation}</p>
+            </div>
+          ))}
+          
+          {/* Action types explanation */}
+          <div className="border-t border-white/10 pt-3 mt-4">
+            <h4 className="text-sm font-medium text-white/90 mb-2">Trading Actions</h4>
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <div className="bg-white/5 rounded p-2">
+                <span className="text-green-400 font-medium">Buy Shares</span>
+                <p className="text-white/50 mt-0.5">Long stock position for growth/value</p>
+              </div>
+              <div className="bg-white/5 rounded p-2">
+                <span className="text-red-400 font-medium">Sell Shares</span>
+                <p className="text-white/50 mt-0.5">Exit or reduce stock position</p>
+              </div>
+              <div className="bg-white/5 rounded p-2">
+                <span className="text-blue-400 font-medium">Open CSP</span>
+                <p className="text-white/50 mt-0.5">Sell cash-secured put to collect premium</p>
+              </div>
+              <div className="bg-white/5 rounded p-2">
+                <span className="text-purple-400 font-medium">Open CC</span>
+                <p className="text-white/50 mt-0.5">Sell covered call on held shares</p>
+              </div>
+              <div className="bg-white/5 rounded p-2">
+                <span className="text-lime-400 font-medium">Buy Call</span>
+                <p className="text-white/50 mt-0.5">Long call for bullish leverage</p>
+              </div>
+              <div className="bg-white/5 rounded p-2">
+                <span className="text-orange-400 font-medium">Buy Put</span>
+                <p className="text-white/50 mt-0.5">Long put for bearish bet or hedge</p>
+              </div>
+            </div>
+          </div>
+          
+          {/* Signal interpretation */}
+          <div className="border-t border-white/10 pt-3">
+            <h4 className="text-sm font-medium text-white/90 mb-2">Reading Signals</h4>
+            <div className="text-xs text-white/60 space-y-1">
+              <div className="flex items-center gap-2">
+                <TrendingUp className="w-3 h-3 text-green-400" />
+                <span>Positive signal for this action (+contribution)</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <TrendingDown className="w-3 h-3 text-red-400" />
+                <span>Negative signal for this action (-contribution)</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <Minus className="w-3 h-3 text-yellow-400" />
+                <span>Neutral/weak signal (near zero)</span>
+              </div>
+              <p className="mt-2 text-white/40">
+                Each indicator contributes to the total score. Higher scores indicate stronger alignment 
+                with that action based on current market conditions.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // Background color for score badges
@@ -144,162 +316,59 @@ function ActionScoreCard({
   );
 }
 
-// Note: high52w, low52w, history props are accepted but not used
-// We always fetch full history for consistent analysis (need 200+ days for SMA200)
 export function StockAnalysisModal({
   ticker,
   onClose,
-  currentPrice: propCurrentPrice
+  currentPrice,
+  high52w,
+  low52w
 }: StockAnalysisModalProps) {
-  const [analysis, setAnalysis] = useState<StockAnalysis | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // Use the shared analysis cache - same data as ActionScoreBadge
+  const { analysis, isLoading, isStale, error, lastUpdated } = useStockAnalysis(
+    ticker,
+    currentPrice,
+    high52w,
+    low52w
+  );
+  
   const [expandedAction, setExpandedAction] = useState<ActionType | null>(null);
+  const [showIndicatorGuide, setShowIndicatorGuide] = useState(false);
   
-  // Track if we've done the initial load
-  const hasInitialData = analysis !== null;
-  
-  // Fetch data and analyze - only run when ticker changes (modal opens)
-  // Don't re-run when props update from parent polling
-  useEffect(() => {
-    if (!ticker) return;
-    
-    // Capture ticker in a const to satisfy TypeScript in the async closure
-    const currentTicker = ticker;
-    
-    async function fetchAndAnalyze() {
-      // Show full loading spinner only on initial load
-      // For refreshes, show subtle indicator and keep old data visible
-      if (!hasInitialData) {
-        setLoading(true);
-      } else {
-        setIsRefreshing(true);
-      }
-      setError(null);
-      
-      try {
-        // Fetch FULL history (1 year) and stock data in parallel
-        // The /stock/{ticker} endpoint only returns 30 days for mini charts
-        // We need the /stock/{ticker}/history endpoint for full analysis
-        // This ensures:
-        // 1. SMA200 and Golden Cross can be calculated (need 200+ days)
-        // 2. RSI/MACD are properly smoothed with consistent data
-        // 3. Fair comparison across all stocks
-        const [historyResponse, stockData] = await Promise.all([
-          api.getStockHistory(currentTicker, '1y'),  // Full year of history
-          api.getStock(currentTicker)                 // Current price and 52w data
-        ]);
-        
-        const history = historyResponse.history;
-        let currentPrice = stockData.current_price || propCurrentPrice;
-        const high52w = stockData.high_52w;
-        const low52w = stockData.low_52w;
-        
-        // If still missing price, try to get it from quote
-        if (!currentPrice) {
-          const quote = await api.getStockQuote(currentTicker);
-          currentPrice = quote.current_price;
-        }
-        
-        if (!history || history.length < 14) {
-          // Only show error if we don't have existing data
-          if (!hasInitialData) {
-            setError('Insufficient price history for analysis (need at least 14 days)');
-          }
-          return;
-        }
-        
-        if (!currentPrice) {
-          if (!hasInitialData) {
-            setError('Unable to get current price');
-          }
-          return;
-        }
-        
-        // Fetch additional analysis data (fundamentals, options, sector) in parallel
-        // These are optional - analysis works without them
-        let additionalData: AdditionalAnalysisData = {};
-        
-        try {
-          const [fundamentals, options, sectorData] = await Promise.allSettled([
-            api.getStockFundamentals(currentTicker),
-            api.getStockOptions(currentTicker),
-            api.getSectorCorrelation(currentTicker)
-          ]);
-          
-          // Merge fundamentals data
-          if (fundamentals.status === 'fulfilled') {
-            additionalData.roic = fundamentals.value.roic;
-            additionalData.roe = fundamentals.value.roe;
-            additionalData.sector = fundamentals.value.sector;
-            additionalData.industry = fundamentals.value.industry;
-            additionalData.beta = fundamentals.value.beta;
-          }
-          
-          // Merge options data
-          if (options.status === 'fulfilled') {
-            additionalData.callPutRatioOI = options.value.call_put_ratio_oi;
-            additionalData.callPutRatioVolume = options.value.call_put_ratio_volume;
-            additionalData.optionsSentiment = options.value.options_sentiment;
-            additionalData.avgImpliedVolatility = options.value.avg_implied_volatility;
-            additionalData.ivPercentile = options.value.iv_percentile;
-            additionalData.hasOptions = options.value.has_options;
-          }
-          
-          // Merge sector correlation data
-          if (sectorData.status === 'fulfilled') {
-            additionalData.sectorCorrelation = sectorData.value.correlation;
-            additionalData.betaToSector = sectorData.value.beta_to_sector;
-          }
-        } catch {
-          // Additional data is optional, continue without it
-          console.warn('Could not fetch additional analysis data');
-        }
-        
-        // Perform analysis with all available data
-        const result = analyzeStock(
-          currentTicker,
-          history,
-          currentPrice,
-          high52w ?? null,
-          low52w ?? null,
-          undefined, // Use default weights
-          additionalData
-        );
-        
-        setAnalysis(result);
-        
-        // Auto-expand best action only on initial load
-        if (!hasInitialData) {
-          setExpandedAction(result.bestAction.action);
-        }
-      } catch (err) {
-        // Only show error if we don't have existing data to display
-        if (!hasInitialData) {
-          setError(err instanceof Error ? err.message : 'Analysis failed');
-        }
-      } finally {
-        setLoading(false);
-        setIsRefreshing(false);
-      }
+  // Auto-expand best action when analysis loads
+  useMemo(() => {
+    if (analysis && !expandedAction) {
+      setExpandedAction(analysis.bestAction.action);
     }
-    
-    fetchAndAnalyze();
-    // Only re-run when ticker changes, not when props update from polling
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ticker]);
+  }, [analysis, expandedAction]);
   
-  // Prepare radar chart data
-  const radarData = useMemo(() => {
+  // Force refresh handler
+  const handleRefresh = useCallback(() => {
+    if (ticker && currentPrice) {
+      refreshAnalysis(ticker, currentPrice, high52w ?? null, low52w ?? null);
+    }
+  }, [ticker, currentPrice, high52w, low52w]);
+  
+  // Options-related actions to filter when stock has no options
+  const optionsActions: ActionType[] = ['openCSP', 'openCC', 'buyCall', 'buyPut'];
+  
+  // Filter scores to only show applicable actions
+  const applicableScores = useMemo(() => {
     if (!analysis) return [];
     
-    return analysis.scores.map(score => ({
+    // If stock has options, show all actions; otherwise filter out options actions
+    return analysis.hasOptions 
+      ? analysis.scores 
+      : analysis.scores.filter(s => !optionsActions.includes(s.action));
+  }, [analysis]);
+  
+  // Prepare radar chart data (only applicable actions)
+  const radarData = useMemo(() => {
+    return applicableScores.map(score => ({
       action: score.label,
       score: score.totalScore,
       fullMark: 100
     }));
-  }, [analysis]);
+  }, [applicableScores]);
   
   if (!ticker) return null;
   
@@ -320,7 +389,7 @@ export function StockAnalysisModal({
               <h2 className="text-xl font-bold text-white">
                 {ticker} Analysis
               </h2>
-              {isRefreshing && (
+              {isLoading && analysis && (
                 <div className="flex items-center gap-1.5 text-xs text-accent-cyan/70">
                   <div className="animate-spin rounded-full h-3 w-3 border border-accent-cyan/50 border-t-accent-cyan" />
                   <span>Updating...</span>
@@ -331,35 +400,67 @@ export function StockAnalysisModal({
               Trading action recommendations based on technical indicators
             </p>
           </div>
-          <button
-            onClick={onClose}
-            className="p-2 rounded-lg hover:bg-white/10 transition-colors"
-          >
-            <X className="w-5 h-5 text-white/70" />
-          </button>
+          <div className="flex items-center gap-2">
+            {/* Refresh button */}
+            <button
+              onClick={handleRefresh}
+              disabled={isLoading}
+              className={`
+                p-2 rounded-lg transition-colors
+                ${isLoading 
+                  ? 'bg-white/5 text-white/30 cursor-not-allowed' 
+                  : 'hover:bg-white/10 text-white/70 hover:text-white'
+                }
+              `}
+              title="Refresh analysis"
+            >
+              <RefreshCw className={`w-5 h-5 ${isLoading ? 'animate-spin' : ''}`} />
+            </button>
+            <button
+              onClick={onClose}
+              className="p-2 rounded-lg hover:bg-white/10 transition-colors"
+            >
+              <X className="w-5 h-5 text-white/70" />
+            </button>
+          </div>
         </div>
         
         {/* Content */}
         <div className="flex-1 overflow-y-auto p-4">
-          {/* Show full loading spinner only on initial load (no existing data) */}
-          {loading && !analysis && (
+          {/* Show full loading spinner only when no data */}
+          {isLoading && !analysis && (
             <div className="flex items-center justify-center py-12">
               <div className="animate-spin rounded-full h-8 w-8 border-2 border-accent-cyan border-t-transparent" />
-              <span className="ml-3 text-white/70">Analyzing...</span>
+              <span className="ml-3 text-white/70">Analyzing {ticker}...</span>
             </div>
           )}
           
           {/* Only show error if we have no data to display */}
           {error && !analysis && (
-            <div className="flex items-center gap-3 p-4 rounded-lg bg-red-500/10 border border-red-500/30">
-              <AlertCircle className="w-5 h-5 text-red-400" />
-              <span className="text-red-400">{error}</span>
+            <div className="flex flex-col items-center gap-4 py-12">
+              <div className="flex items-center gap-3 p-4 rounded-lg bg-red-500/10 border border-red-500/30">
+                <AlertCircle className="w-5 h-5 text-red-400" />
+                <span className="text-red-400">{error}</span>
+              </div>
+              <button
+                onClick={handleRefresh}
+                className="px-4 py-2 rounded-lg bg-accent-cyan/20 text-accent-cyan hover:bg-accent-cyan/30 transition-colors"
+              >
+                Try Again
+              </button>
             </div>
           )}
           
           {/* Show analysis content - keep visible even during background refresh */}
           {analysis && (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <>
+              {/* Collapsible Indicator Guide */}
+              <IndicatorGuide 
+                isOpen={showIndicatorGuide} 
+                onToggle={() => setShowIndicatorGuide(!showIndicatorGuide)} 
+              />
+              
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               {/* Radar Chart */}
               <div className="glass-card p-4">
                 <h3 className="text-sm font-medium text-white/70 mb-4">Action Scores</h3>
@@ -434,8 +535,15 @@ export function StockAnalysisModal({
               
               {/* Action Scores List */}
               <div className="space-y-3">
-                <h3 className="text-sm font-medium text-white/70">Action Breakdown</h3>
-                {analysis.scores
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-medium text-white/70">Action Breakdown</h3>
+                  {!analysis.hasOptions && (
+                    <span className="text-xs text-yellow-400/70 bg-yellow-500/10 px-2 py-0.5 rounded">
+                      No options available
+                    </span>
+                  )}
+                </div>
+                {applicableScores
                   .sort((a, b) => b.totalScore - a.totalScore)
                   .map(score => (
                     <ActionScoreCard
@@ -451,6 +559,7 @@ export function StockAnalysisModal({
                 }
               </div>
             </div>
+            </>
           )}
         </div>
         
@@ -459,7 +568,14 @@ export function StockAnalysisModal({
           <div className="p-4 border-t border-white/10 bg-white/5">
             <div className="flex items-center justify-between">
               <div className="text-sm text-white/50">
-                Analysis performed at {analysis.analyzedAt.toLocaleTimeString()}
+                {lastUpdated ? (
+                  <>
+                    Analysis from {lastUpdated.toLocaleTimeString()}
+                    {isStale && <span className="text-yellow-400/70 ml-2">(refreshing...)</span>}
+                  </>
+                ) : (
+                  'Analysis performed just now'
+                )}
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-sm text-white/70">Best Action:</span>
@@ -474,4 +590,3 @@ export function StockAnalysisModal({
     </div>
   );
 }
-

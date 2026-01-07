@@ -2,17 +2,18 @@ export interface Holding {
   id: number;
   portfolio_id: number;
   ticker: string;
-  allocation_pct: number;
+  shares: number;  // Number of shares owned
+  avg_cost?: number | null;  // Average cost per share
   added_at: string;
-  investment_date?: string | null;
-  investment_price?: number | null;
   current_price?: number;
-  current_value?: number;
+  market_value?: number | null;  // shares × current_price
+  cost_basis?: number | null;  // shares × avg_cost
+  allocation_pct?: number | null;  // Calculated: market_value / total_market_value × 100
   ytd_return?: number;
   sma_200?: number;
   price_vs_sma?: number;
-  gain_loss?: number | null;  // Gain/loss since investment_date in dollars
-  gain_loss_pct?: number | null;  // Gain/loss since investment_date in %
+  gain_loss?: number | null;  // market_value - cost_basis
+  gain_loss_pct?: number | null;  // (current_price - avg_cost) / avg_cost × 100
 }
 
 export interface Portfolio {
@@ -22,9 +23,10 @@ export interface Portfolio {
   created_at: string;
   updated_at: string;
   holdings: Holding[];
-  current_total_value?: number;
-  total_gain_loss?: number;
-  total_gain_loss_pct?: number;
+  total_market_value?: number;  // Sum of all holdings' market values
+  total_cost_basis?: number | null;  // Sum of all cost basis
+  total_gain_loss?: number | null;
+  total_gain_loss_pct?: number | null;
   // User preferences (persisted in database)
   chart_period?: string;
   sort_field?: string;
@@ -69,12 +71,17 @@ export interface StockHistoryResponse {
 
 /**
  * Trading actions that can be scored/recommended.
+ * 
+ * Options terminology:
+ * - openCSP: Open a Cash-Secured Put position (sell a put to collect premium)
+ * - openCC: Open a Covered Call position (sell a call to collect premium)
+ * - buyCall/buyPut: Buy options (pay premium, long gamma/vega)
  */
 export type ActionType = 
   | 'buyShares'
   | 'sellShares'
-  | 'buyCSP'      // Cash Secured Put
-  | 'buyCC'       // Covered Call
+  | 'openCSP'     // Open Cash-Secured Put (sell put to collect premium)
+  | 'openCC'      // Open Covered Call (sell call to collect premium)
   | 'buyCall'
   | 'buyPut';
 
@@ -84,8 +91,8 @@ export type ActionType =
 export const ACTION_LABELS: Record<ActionType, string> = {
   buyShares: 'Buy Shares',
   sellShares: 'Sell Shares',
-  buyCSP: 'Sell CSP',
-  buyCC: 'Sell CC',
+  openCSP: 'Open CSP',
+  openCC: 'Open CC',
   buyCall: 'Buy Call',
   buyPut: 'Buy Put'
 };
@@ -145,6 +152,7 @@ export interface StockAnalysis {
   analyzedAt: Date;
   scores: ActionScore[];
   bestAction: ActionScore;
+  hasOptions: boolean;          // Whether options are available for this stock
   dataQuality: {
     availableMetrics: number;
     totalMetrics: number;

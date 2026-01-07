@@ -92,12 +92,13 @@ class PortfolioService:
                 id=h.id,
                 portfolio_id=h.portfolio_id,
                 ticker=h.ticker,
-                allocation_pct=h.allocation_pct,
+                shares=h.shares,
+                avg_cost=h.avg_cost,
                 added_at=h.added_at,
-                investment_date=h.investment_date,
-                investment_price=h.investment_price,
                 current_price=None,
-                current_value=None,
+                market_value=None,
+                cost_basis=h.shares * h.avg_cost if h.shares and h.avg_cost else None,
+                allocation_pct=None,
                 ytd_return=None,
                 sma_200=None,
                 price_vs_sma=None,
@@ -117,7 +118,8 @@ class PortfolioService:
             created_at=portfolio.created_at,
             updated_at=portfolio.updated_at,
             holdings=holdings_with_data,
-            current_total_value=None,
+            total_market_value=None,
+            total_cost_basis=None,
             total_gain_loss=None,
             total_gain_loss_pct=None
         )
@@ -125,32 +127,38 @@ class PortfolioService:
     async def _build_full_response(self, portfolio: Portfolio) -> PortfolioWithData:
         """Build response with live stock data."""
         holdings_with_data = []
-        current_total_value = 0.0
-        total_portfolio_gain_loss = 0.0
+        total_market_value = 0.0
+        total_cost_basis = 0.0
         
         if portfolio.holdings:
             # Fetch live data for all holdings
             tickers = [h.ticker for h in portfolio.holdings]
             stock_data = await self._stock_fetcher.get_multiple_stocks(tickers)
             
+            # First pass: calculate market values for allocation percentages
+            market_values = {}
+            for holding in portfolio.holdings:
+                data = stock_data.get(holding.ticker.upper(), {})
+                current_price = data.get('current_price', 0)
+                market_value = holding.shares * current_price if holding.shares and current_price else 0
+                market_values[holding.id] = market_value
+                total_market_value += market_value
+                
+                if holding.shares and holding.avg_cost:
+                    total_cost_basis += holding.shares * holding.avg_cost
+            
+            # Second pass: build holding data with allocation percentages
             for holding in portfolio.holdings:
                 holding_data = self._calculate_holding_data(
                     holding, 
                     stock_data.get(holding.ticker.upper(), {}),
-                    portfolio.total_value
+                    total_market_value
                 )
                 holdings_with_data.append(holding_data)
-                current_total_value += holding_data.current_value or 0
-                
-                if holding_data.gain_loss is not None:
-                    total_portfolio_gain_loss += holding_data.gain_loss
-        else:
-            current_total_value = portfolio.total_value
         
         # Calculate total gain/loss
-        total_gain_loss, total_gain_loss_pct = self._calculate_portfolio_totals(
-            portfolio, holdings_with_data, total_portfolio_gain_loss
-        )
+        total_gain_loss = total_market_value - total_cost_basis if total_cost_basis > 0 else None
+        total_gain_loss_pct = (total_gain_loss / total_cost_basis * 100) if total_cost_basis > 0 and total_gain_loss is not None else None
         
         return PortfolioWithData(
             id=portfolio.id,
@@ -162,71 +170,54 @@ class PortfolioService:
             created_at=portfolio.created_at,
             updated_at=portfolio.updated_at,
             holdings=holdings_with_data,
-            current_total_value=round(current_total_value, 2),
-            total_gain_loss=round(total_gain_loss, 2) if total_gain_loss else None,
-            total_gain_loss_pct=round(total_gain_loss_pct, 2) if total_gain_loss_pct else None
+            total_market_value=round(total_market_value, 2),
+            total_cost_basis=round(total_cost_basis, 2) if total_cost_basis > 0 else None,
+            total_gain_loss=round(total_gain_loss, 2) if total_gain_loss is not None else None,
+            total_gain_loss_pct=round(total_gain_loss_pct, 2) if total_gain_loss_pct is not None else None
         )
     
     def _calculate_holding_data(
         self, 
         holding: Holding, 
         stock_data: Dict[str, Any],
-        portfolio_total_value: float
+        total_market_value: float
     ) -> HoldingWithData:
         """Calculate derived values for a single holding."""
-        allocated_value = portfolio_total_value * (holding.allocation_pct / 100)
         current_price = stock_data.get('current_price', 0)
         ytd_return = stock_data.get('ytd_return', 0)
         
-        # Calculate current value based on YTD movement
-        current_value = allocated_value * (1 + ytd_return / 100)
+        # Calculate market value and cost basis
+        market_value = holding.shares * current_price if holding.shares and current_price else None
+        cost_basis = holding.shares * holding.avg_cost if holding.shares and holding.avg_cost else None
         
-        # Calculate gain/loss since investment
-        gain_loss, gain_loss_pct = self._calc.calculate_gain_loss(
-            holding.investment_price,
-            current_price,
-            allocated_value
-        )
+        # Calculate allocation percentage
+        allocation_pct = (market_value / total_market_value * 100) if market_value and total_market_value > 0 else None
+        
+        # Calculate gain/loss
+        gain_loss = None
+        gain_loss_pct = None
+        if market_value is not None and cost_basis is not None:
+            gain_loss = round(market_value - cost_basis, 2)
+            if holding.avg_cost and holding.avg_cost > 0:
+                gain_loss_pct = round((current_price - holding.avg_cost) / holding.avg_cost * 100, 2)
         
         return HoldingWithData(
             id=holding.id,
             portfolio_id=holding.portfolio_id,
             ticker=holding.ticker,
-            allocation_pct=holding.allocation_pct,
+            shares=holding.shares,
+            avg_cost=holding.avg_cost,
             added_at=holding.added_at,
-            investment_date=holding.investment_date,
-            investment_price=holding.investment_price,
             current_price=current_price,
-            current_value=round(current_value, 2),
+            market_value=round(market_value, 2) if market_value is not None else None,
+            cost_basis=round(cost_basis, 2) if cost_basis is not None else None,
+            allocation_pct=round(allocation_pct, 2) if allocation_pct is not None else None,
             ytd_return=ytd_return,
             sma_200=stock_data.get('sma_200'),
             price_vs_sma=stock_data.get('price_vs_sma'),
             gain_loss=gain_loss,
             gain_loss_pct=gain_loss_pct
         )
-    
-    def _calculate_portfolio_totals(
-        self,
-        portfolio: Portfolio,
-        holdings: List[HoldingWithData],
-        total_gain_loss: float
-    ) -> tuple[Optional[float], Optional[float]]:
-        """Calculate total portfolio gain/loss."""
-        if not portfolio.holdings:
-            return None, None
-        
-        total_allocated = sum(h.allocation_pct for h in portfolio.holdings)
-        base_invested = portfolio.total_value * (total_allocated / 100)
-        
-        # Only show if all holdings have investment prices
-        all_have_investment_price = all(
-            h.investment_price for h in portfolio.holdings
-        )
-        
-        if all_have_investment_price and base_invested > 0:
-            return total_gain_loss, (total_gain_loss / base_invested * 100)
-        
-        return None, None
     
     # ============ Holding Operations ============
     
@@ -246,7 +237,7 @@ class PortfolioService:
             Created holding.
             
         Raises:
-            ValueError: If ticker already exists or allocation exceeds 100%.
+            ValueError: If ticker already exists.
         """
         portfolio = await self._get_or_create_portfolio(db)
         
@@ -260,19 +251,6 @@ class PortfolioService:
         if existing.scalar_one_or_none():
             raise ValueError(f"Holding for {holding_data.ticker} already exists")
         
-        # Check allocation limit
-        result = await db.execute(
-            select(Holding).where(Holding.portfolio_id == portfolio.id)
-        )
-        current_holdings = result.scalars().all()
-        total_allocated = sum(h.allocation_pct for h in current_holdings)
-        
-        if total_allocated + holding_data.allocation_pct > 100:
-            raise ValueError(
-                f"Total allocation would exceed 100%. "
-                f"Currently allocated: {total_allocated}%"
-            )
-        
         # Validate ticker
         is_valid, _ = await self._stock_fetcher.validate_ticker(holding_data.ticker)
         if not is_valid:
@@ -282,15 +260,15 @@ class PortfolioService:
         new_holding = Holding(
             portfolio_id=portfolio.id,
             ticker=holding_data.ticker.upper(),
-            allocation_pct=holding_data.allocation_pct,
-            investment_date=holding_data.investment_date,
-            investment_price=holding_data.investment_price
+            shares=holding_data.shares,
+            avg_cost=holding_data.avg_cost,
+            allocation_pct=0  # Legacy column - kept for DB compatibility
         )
         db.add(new_holding)
         await db.commit()
         await db.refresh(new_holding)
         
-        logger.info(f"Added holding: {new_holding.ticker} at {new_holding.allocation_pct}%")
+        logger.info(f"Added holding: {new_holding.ticker} with {new_holding.shares} shares")
         return new_holding
     
     async def update_holding(
@@ -300,7 +278,7 @@ class PortfolioService:
         update_data: HoldingUpdate
     ) -> Holding:
         """
-        Update a holding's allocation or investment info.
+        Update a holding's shares or average cost.
         
         Args:
             db: Database session.
@@ -311,7 +289,7 @@ class PortfolioService:
             Updated holding.
             
         Raises:
-            ValueError: If holding not found or allocation exceeds 100%.
+            ValueError: If holding not found.
         """
         result = await db.execute(
             select(Holding).where(Holding.id == holding_id)
@@ -321,35 +299,16 @@ class PortfolioService:
         if not holding:
             raise ValueError("Holding not found")
         
-        # Check allocation if being updated
-        if update_data.allocation_pct is not None:
-            result = await db.execute(
-                select(Holding).where(
-                    Holding.portfolio_id == holding.portfolio_id,
-                    Holding.id != holding_id
-                )
-            )
-            other_holdings = result.scalars().all()
-            total_allocated = sum(h.allocation_pct for h in other_holdings)
-            
-            if total_allocated + update_data.allocation_pct > 100:
-                raise ValueError(
-                    f"Total allocation would exceed 100%. "
-                    f"Other holdings: {total_allocated}%"
-                )
-            
-            holding.allocation_pct = update_data.allocation_pct
+        if update_data.shares is not None:
+            holding.shares = update_data.shares
         
-        if update_data.investment_date is not None:
-            holding.investment_date = update_data.investment_date
-        
-        if update_data.investment_price is not None:
-            holding.investment_price = update_data.investment_price
+        if update_data.avg_cost is not None:
+            holding.avg_cost = update_data.avg_cost
         
         await db.commit()
         await db.refresh(holding)
         
-        logger.info(f"Updated holding {holding_id}: {holding.ticker}")
+        logger.info(f"Updated holding {holding_id}: {holding.ticker} - {holding.shares} shares @ ${holding.avg_cost}")
         return holding
     
     async def delete_holding(self, db: AsyncSession, holding_id: int) -> bool:

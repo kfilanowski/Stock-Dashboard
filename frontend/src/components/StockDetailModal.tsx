@@ -275,11 +275,11 @@ export function StockDetailModal({
   const gradientId = `colorClose-${isAboveReference ? 'green' : 'red'}`;
 
   // Calculate Y-axis domain to include reference close
-  const yAxisDomain = useMemo(() => {
-    if (!chartHistory.length) return ['auto', 'auto'] as const;
+  const yAxisDomain = useMemo((): [number, number] | [string, string] => {
+    if (!chartHistory.length) return ['auto', 'auto'];
     
     const closes = chartHistory.map(h => h.close).filter(c => c > 0);
-    if (!closes.length) return ['auto', 'auto'] as const;
+    if (!closes.length) return ['auto', 'auto'];
     
     let min = Math.min(...closes);
     let max = Math.max(...closes);
@@ -855,7 +855,7 @@ export function StockDetailModal({
                       const isLastPoint = index === processedHistory.length - 1;
                       const showAllDots = processedHistory.length <= 5;
                       
-                      if (!isLastPoint && !showAllDots) return null;
+                      if (!isLastPoint && !showAllDots) return <g key={`empty-${index}`} />;
                       
                       // Render dot (with ping effect for last point using CSS animation)
                       return (

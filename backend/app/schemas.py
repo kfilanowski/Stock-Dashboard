@@ -22,27 +22,24 @@ class PortfolioUpdate(BaseModel):
 
 class HoldingBase(BaseModel):
     ticker: str
-    allocation_pct: float = Field(..., ge=0, le=100)
+    shares: float = Field(default=0, ge=0)  # Number of shares
 
 
 class HoldingCreate(HoldingBase):
-    allocation_pct: float = Field(default=0, ge=0, le=100)  # Optional, defaults to 0%
-    investment_date: Optional[datetime] = None  # Optional: when user started tracking
-    investment_price: Optional[float] = None  # Optional: price at investment date
+    shares: float = Field(default=0, ge=0)  # Number of shares
+    avg_cost: Optional[float] = Field(None, ge=0)  # Average cost per share
 
 
 class HoldingUpdate(BaseModel):
-    allocation_pct: Optional[float] = Field(None, ge=0, le=100)
-    investment_date: Optional[datetime] = None
-    investment_price: Optional[float] = None
+    shares: Optional[float] = Field(None, ge=0)
+    avg_cost: Optional[float] = Field(None, ge=0)
 
 
 class HoldingResponse(HoldingBase):
     id: int
     portfolio_id: int
     added_at: datetime
-    investment_date: Optional[datetime] = None
-    investment_price: Optional[float] = None
+    avg_cost: Optional[float] = None
 
     class Config:
         from_attributes = True
@@ -50,12 +47,14 @@ class HoldingResponse(HoldingBase):
 
 class HoldingWithData(HoldingResponse):
     current_price: Optional[float] = None
-    current_value: Optional[float] = None
+    market_value: Optional[float] = None  # shares * current_price
+    cost_basis: Optional[float] = None  # shares * avg_cost
+    allocation_pct: Optional[float] = None  # market_value / total_portfolio_value * 100
     ytd_return: Optional[float] = None
     sma_200: Optional[float] = None
     price_vs_sma: Optional[float] = None  # Percentage above/below SMA
-    gain_loss: Optional[float] = None  # Gain/loss since investment_date in dollars
-    gain_loss_pct: Optional[float] = None  # Gain/loss since investment_date in %
+    gain_loss: Optional[float] = None  # market_value - cost_basis
+    gain_loss_pct: Optional[float] = None  # (current_price - avg_cost) / avg_cost * 100
 
 
 class PortfolioResponse(PortfolioBase):
@@ -70,9 +69,10 @@ class PortfolioResponse(PortfolioBase):
 
 class PortfolioWithData(PortfolioResponse):
     holdings: list[HoldingWithData] = []
-    current_total_value: Optional[float] = None
-    total_gain_loss: Optional[float] = None
-    total_gain_loss_pct: Optional[float] = None
+    total_market_value: Optional[float] = None  # Sum of all holdings' market values
+    total_cost_basis: Optional[float] = None  # Sum of all holdings' cost basis
+    total_gain_loss: Optional[float] = None  # total_market_value - total_cost_basis
+    total_gain_loss_pct: Optional[float] = None  # Percentage gain/loss
 
 
 # Stock Schemas
