@@ -28,6 +28,42 @@ class OptionPricingService:
     def __init__(self, max_workers: Optional[int] = None):
         self._executor = ThreadPoolExecutor(max_workers=max_workers or 4)
     
+    @staticmethod
+    def _get_current_price(quote_data: Dict[str, Any]) -> Optional[float]:
+        """
+        Get the most current stock price, including after-hours/pre-market.
+        
+        Priority:
+        1. Post-market price (if in after-hours and available)
+        2. Pre-market price (if in pre-market and available)
+        3. Regular market price (fallback)
+        
+        Args:
+            quote_data: Price data dict from yahooquery
+            
+        Returns:
+            Most current price available
+        """
+        if not quote_data or isinstance(quote_data, str):
+            return None
+        
+        market_state = quote_data.get('marketState', '').upper()
+        
+        # After hours - use post-market price if available
+        if market_state in ('POST', 'POSTPOST', 'CLOSED'):
+            post_price = quote_data.get('postMarketPrice')
+            if post_price and post_price > 0:
+                return post_price
+        
+        # Pre-market - use pre-market price if available
+        if market_state in ('PRE', 'PREPRE'):
+            pre_price = quote_data.get('preMarketPrice')
+            if pre_price and pre_price > 0:
+                return pre_price
+        
+        # Regular market hours or fallback
+        return quote_data.get('regularMarketPrice')
+    
     def _build_occ_symbol(
         self,
         ticker: str,
@@ -75,11 +111,11 @@ class OptionPricingService:
         try:
             t = YQTicker(ticker)
             
-            # Get the underlying stock price
+            # Get the underlying stock price (including after-hours if available)
             quote_data = t.price.get(ticker, {})
             if isinstance(quote_data, str):
                 quote_data = {}
-            underlying_price = quote_data.get('regularMarketPrice')
+            underlying_price = self._get_current_price(quote_data)
             
             # Get option chain
             option_chain = t.option_chain
@@ -286,11 +322,11 @@ class OptionPricingService:
             try:
                 t = YQTicker(ticker)
                 
-                # Get underlying price
+                # Get underlying price (including after-hours if available)
                 quote_data = t.price.get(ticker, {})
                 if isinstance(quote_data, str):
                     quote_data = {}
-                underlying_price = quote_data.get('regularMarketPrice')
+                underlying_price = self._get_current_price(quote_data)
                 
                 # Get option chain
                 option_chain = t.option_chain

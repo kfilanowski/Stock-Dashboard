@@ -1,5 +1,5 @@
-import { useEffect, useState, useMemo, useRef } from 'react';
-import { X, TrendingUp, TrendingDown, Calendar, BarChart2, Sun, Moon, Sunrise } from 'lucide-react';
+import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
+import { X, TrendingUp, TrendingDown, Calendar, BarChart2, Sun, Moon, Sunrise, Clock, ArrowUpRight, ArrowDownRight } from 'lucide-react';
 import { 
   Line, XAxis, YAxis, Tooltip, ResponsiveContainer, 
   CartesianGrid, ReferenceLine, Area, ComposedChart, ReferenceArea 
@@ -158,6 +158,13 @@ export function StockDetailModal({
   const [showPing, setShowPing] = useState(false);
   const prevTimestampRef = useRef<number | null>(null);
   const isFirstPricesFetch = useRef(true);
+  
+  // Chart range selection state
+  const [selectionStart, setSelectionStart] = useState<number | null>(null);
+  const [selectionEnd, setSelectionEnd] = useState<number | null>(null);
+  const [isSelecting, setIsSelecting] = useState(false);
+  const [tooltipPosition, setTooltipPosition] = useState<{ x: number; y: number } | null>(null);
+  const chartContainerRef = useRef<HTMLDivElement>(null);
 
   // Fetch stock data on mount and when prices update
   useEffect(() => {
@@ -213,6 +220,14 @@ export function StockDetailModal({
 
     fetchHistory();
   }, [ticker, chartPeriod]);
+  
+  // Clear selection when chart period changes
+  useEffect(() => {
+    setSelectionStart(null);
+    setSelectionEnd(null);
+    setIsSelecting(false);
+    setTooltipPosition(null);
+  }, [chartPeriod]);
 
   // Trigger ping when prices API returns (not just when data changes)
   useEffect(() => {
@@ -438,6 +453,121 @@ export function StockDetailModal({
     
     return { processedHistory: processed, extendedHoursRanges: ranges, xDomain: domain, numTradingDays: numDays, tradingDays: days };
   }, [chartHistory, hasIntradayData]);
+  
+  // Chart selection mouse handlers
+  const handleChartMouseDown = useCallback((e: any) => {
+    if (!e || !e.activePayload || !e.activePayload[0]) return;
+    const dataPoint = e.activePayload[0].payload;
+    const xValue = hasIntradayData ? dataPoint.xValue : processedHistory.findIndex((p: any) => p.date === dataPoint.date);
+    
+    setSelectionStart(xValue);
+    setSelectionEnd(xValue);
+    setIsSelecting(true);
+    setTooltipPosition(null);
+  }, [hasIntradayData, processedHistory]);
+  
+  const handleChartMouseMove = useCallback((e: any) => {
+    if (!isSelecting || !e || !e.activePayload || !e.activePayload[0]) return;
+    const dataPoint = e.activePayload[0].payload;
+    const xValue = hasIntradayData ? dataPoint.xValue : processedHistory.findIndex((p: any) => p.date === dataPoint.date);
+    
+    setSelectionEnd(xValue);
+  }, [isSelecting, hasIntradayData, processedHistory]);
+  
+  const handleChartMouseUp = useCallback((e: any) => {
+    if (!isSelecting) return;
+    setIsSelecting(false);
+    
+    // Only show tooltip if there's a meaningful selection (start != end)
+    if (selectionStart !== null && selectionEnd !== null && selectionStart !== selectionEnd) {
+      // Get mouse position relative to chart container for tooltip positioning
+      if (chartContainerRef.current && e?.chartX !== undefined && e?.chartY !== undefined) {
+        const rect = chartContainerRef.current.getBoundingClientRect();
+        setTooltipPosition({
+          x: Math.min(e.chartX + 20, rect.width - 220), // Keep tooltip within bounds
+          y: Math.max(e.chartY - 100, 10)
+        });
+      }
+    } else {
+      // Single click - clear selection
+      setSelectionStart(null);
+      setSelectionEnd(null);
+      setTooltipPosition(null);
+    }
+  }, [isSelecting, selectionStart, selectionEnd]);
+  
+  const handleChartMouseLeave = useCallback(() => {
+    if (isSelecting) {
+      setIsSelecting(false);
+      // Keep the selection if meaningful, otherwise clear
+      if (selectionStart === selectionEnd) {
+        setSelectionStart(null);
+        setSelectionEnd(null);
+      }
+    }
+  }, [isSelecting, selectionStart, selectionEnd]);
+  
+  const clearSelection = useCallback(() => {
+    setSelectionStart(null);
+    setSelectionEnd(null);
+    setTooltipPosition(null);
+  }, []);
+  
+  // Calculate selection statistics
+  interface SelectionStats {
+    startDate: string;
+    endDate: string;
+    startPrice: number;
+    endPrice: number;
+    priceChange: number;
+    percentChange: number;
+    rangeHigh: number;
+    rangeLow: number;
+    totalVolume: number;
+    numPoints: number;
+  }
+  
+  const selectionStats = useMemo((): SelectionStats | null => {
+    if (selectionStart === null || selectionEnd === null || selectionStart === selectionEnd) {
+      return null;
+    }
+    
+    const minX = Math.min(selectionStart, selectionEnd);
+    const maxX = Math.max(selectionStart, selectionEnd);
+    
+    // Filter points within the selection range
+    const selectedPoints = processedHistory.filter((p: any) => {
+      const xVal = hasIntradayData ? p.xValue : processedHistory.indexOf(p);
+      return xVal >= minX && xVal <= maxX;
+    });
+    
+    if (selectedPoints.length < 2) return null;
+    
+    const startPoint = selectedPoints[0];
+    const endPoint = selectedPoints[selectedPoints.length - 1];
+    
+    const startPrice = startPoint.close;
+    const endPrice = endPoint.close;
+    const priceChange = endPrice - startPrice;
+    const percentChange = startPrice > 0 ? ((endPrice - startPrice) / startPrice) * 100 : 0;
+    
+    const rangeHigh = Math.max(...selectedPoints.map((p: any) => p.high));
+    const rangeLow = Math.min(...selectedPoints.map((p: any) => p.low));
+    const totalVolume = selectedPoints.reduce((sum: number, p: any) => sum + (p.volume || 0), 0);
+    
+    return {
+      startDate: startPoint.date,
+      endDate: endPoint.date,
+      startPrice,
+      endPrice,
+      priceChange,
+      percentChange,
+      rangeHigh,
+      rangeLow,
+      totalVolume,
+      numPoints: selectedPoints.length
+    };
+  }, [selectionStart, selectionEnd, processedHistory, hasIntradayData]);
 
   // Generate nice tick values for intraday X-axis
   const xAxisTicks = useMemo(() => {
@@ -798,7 +928,7 @@ export function StockDetailModal({
             )}
 
             {/* Chart */}
-            <div className="h-80 bg-white/5 rounded-xl p-4 border border-white/10 relative">
+            <div ref={chartContainerRef} className="h-80 bg-white/5 rounded-xl p-4 border border-white/10 relative select-none">
               {chartLoading && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/30 rounded-xl z-10">
                   <div className="w-8 h-8 border-2 border-white/20 border-t-accent-cyan rounded-full animate-spin" />
@@ -825,7 +955,14 @@ export function StockDetailModal({
                 </div>
               )}
               <ResponsiveContainer width="100%" height="100%">
-                <ComposedChart data={processedHistory}>
+                <ComposedChart 
+                  data={processedHistory}
+                  onMouseDown={handleChartMouseDown}
+                  onMouseMove={handleChartMouseMove}
+                  onMouseUp={handleChartMouseUp}
+                  onMouseLeave={handleChartMouseLeave}
+                  style={{ cursor: isSelecting ? 'crosshair' : 'crosshair' }}
+                >
                   <defs>
                     <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
                       <stop offset="5%" stopColor={lineColor} stopOpacity={0.3}/>
@@ -834,6 +971,10 @@ export function StockDetailModal({
                     <linearGradient id="extendedHoursGradient" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="#06b6d4" stopOpacity={0.2}/>
                       <stop offset="100%" stopColor="#10b981" stopOpacity={0.05}/>
+                    </linearGradient>
+                    <linearGradient id="selectionGradient" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#6366f1" stopOpacity={0.4}/>
+                      <stop offset="100%" stopColor="#6366f1" stopOpacity={0.1}/>
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
@@ -877,6 +1018,17 @@ export function StockDetailModal({
                       strokeOpacity={0}
                     />
                   ))}
+                  
+                  {/* User selection range */}
+                  {selectionStart !== null && selectionEnd !== null && selectionStart !== selectionEnd && (
+                    <ReferenceArea
+                      x1={Math.min(selectionStart, selectionEnd)}
+                      x2={Math.max(selectionStart, selectionEnd)}
+                      fill="url(#selectionGradient)"
+                      stroke="rgba(99, 102, 241, 0.6)"
+                      strokeWidth={1}
+                    />
+                  )}
                   
                   {/* Reference Line - Previous Close */}
                   {referenceClose !== null && (
@@ -953,6 +1105,16 @@ export function StockDetailModal({
                   />
                 </ComposedChart>
               </ResponsiveContainer>
+              
+              {/* Selection Statistics Tooltip */}
+              {selectionStats && tooltipPosition && !isSelecting && (
+                <SelectionTooltip
+                  stats={selectionStats}
+                  position={tooltipPosition}
+                  onClose={clearSelection}
+                  formatDate={formatDate}
+                />
+              )}
             </div>
 
             {/* Session Changes Display */}
@@ -1061,6 +1223,128 @@ function SessionBadge({
       <span className="opacity-70">{label}</span>
       <span className="font-semibold">{sign}{change.percent.toFixed(2)}%</span>
       <span className="opacity-60 text-xs">{formatValue(change.value)}</span>
+    </div>
+  );
+}
+
+// Selection tooltip component - displays statistics for the selected range
+interface SelectionStats {
+  startDate: string;
+  endDate: string;
+  startPrice: number;
+  endPrice: number;
+  priceChange: number;
+  percentChange: number;
+  rangeHigh: number;
+  rangeLow: number;
+  totalVolume: number;
+  numPoints: number;
+}
+
+function SelectionTooltip({
+  stats,
+  position,
+  onClose,
+  formatDate
+}: {
+  stats: SelectionStats;
+  position: { x: number; y: number };
+  onClose: () => void;
+  formatDate: (dateStr: string, includeTime: boolean) => string;
+}) {
+  const isPositive = stats.percentChange >= 0;
+  const sign = isPositive ? '+' : '';
+  
+  // Format volume with K/M suffix
+  const formatVolume = (vol: number): string => {
+    if (vol >= 1_000_000) return `${(vol / 1_000_000).toFixed(1)}M`;
+    if (vol >= 1_000) return `${(vol / 1_000).toFixed(1)}K`;
+    return vol.toString();
+  };
+  
+  return (
+    <div
+      className="absolute z-20 bg-[rgba(10,10,20,0.95)] border border-indigo-500/30 rounded-lg shadow-xl backdrop-blur-sm fade-in"
+      style={{
+        left: position.x,
+        top: position.y,
+        minWidth: '200px'
+      }}
+    >
+      {/* Header with close button */}
+      <div className="flex items-center justify-between px-3 py-2 border-b border-white/10">
+        <span className="text-xs text-indigo-400 font-medium">Selection Range</span>
+        <button
+          onClick={onClose}
+          className="p-0.5 rounded hover:bg-white/10 transition-colors"
+        >
+          <X className="w-3.5 h-3.5 text-white/50 hover:text-white/80" />
+        </button>
+      </div>
+      
+      {/* Main price change */}
+      <div className="px-3 py-2 border-b border-white/5">
+        <div className="flex items-center gap-2">
+          {isPositive ? (
+            <ArrowUpRight className="w-5 h-5 text-green-400" />
+          ) : (
+            <ArrowDownRight className="w-5 h-5 text-red-400" />
+          )}
+          <span className={`text-xl font-bold ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
+            {sign}{stats.percentChange.toFixed(2)}%
+          </span>
+        </div>
+        <p className={`text-sm mt-0.5 ${isPositive ? 'text-green-400/70' : 'text-red-400/70'}`}>
+          {sign}${stats.priceChange.toFixed(2)}
+        </p>
+      </div>
+      
+      {/* Details grid */}
+      <div className="px-3 py-2 space-y-1.5 text-xs">
+        {/* Time range */}
+        <div className="flex items-center gap-2 text-white/60">
+          <Clock className="w-3 h-3" />
+          <span className="truncate">{formatDate(stats.startDate, true)}</span>
+        </div>
+        <div className="flex items-center gap-2 text-white/60 pl-5">
+          <span className="text-white/30">→</span>
+          <span className="truncate">{formatDate(stats.endDate, true)}</span>
+        </div>
+        
+        {/* Price range */}
+        <div className="flex justify-between mt-2 pt-2 border-t border-white/5">
+          <span className="text-white/40">Start</span>
+          <span className="text-white/80 font-medium">${stats.startPrice.toFixed(2)}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-white/40">End</span>
+          <span className="text-white/80 font-medium">${stats.endPrice.toFixed(2)}</span>
+        </div>
+        
+        {/* High/Low */}
+        <div className="flex justify-between mt-2 pt-2 border-t border-white/5">
+          <span className="text-white/40">Range High</span>
+          <span className="text-green-400/80">${stats.rangeHigh.toFixed(2)}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-white/40">Range Low</span>
+          <span className="text-red-400/80">${stats.rangeLow.toFixed(2)}</span>
+        </div>
+        
+        {/* Volume */}
+        {stats.totalVolume > 0 && (
+          <div className="flex justify-between mt-2 pt-2 border-t border-white/5">
+            <span className="text-white/40">Volume</span>
+            <span className="text-white/80">{formatVolume(stats.totalVolume)}</span>
+          </div>
+        )}
+        
+        {/* Data points count */}
+        <div className="flex justify-between">
+          <span className="text-white/40">Data Points</span>
+          <span className="text-white/60">{stats.numPoints}</span>
+        </div>
+      </div>
     </div>
   );
 }

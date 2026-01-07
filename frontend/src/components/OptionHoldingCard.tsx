@@ -1,5 +1,6 @@
-import { useMemo } from 'react';
-import { Trash2, TrendingUp, TrendingDown, Clock, Target, AlertTriangle } from 'lucide-react';
+import { useMemo, useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
+import { Trash2, TrendingUp, TrendingDown, Clock, Target, AlertTriangle, HelpCircle, X } from 'lucide-react';
 import type { OptionHoldingWithData } from '../types';
 
 interface OptionHoldingCardProps {
@@ -49,6 +50,7 @@ export function OptionHoldingCard({ option, onDelete }: OptionHoldingCardProps) 
   const isCall = option.option_type === 'call';
   const isLong = option.position_type === 'long';
   const isPositive = (option.gain_loss ?? 0) >= 0;
+  const [showEducation, setShowEducation] = useState(false);
   
   const expStatus = useMemo(() => 
     getExpirationStatus(option.analytics?.days_to_expiration), 
@@ -168,35 +170,23 @@ export function OptionHoldingCard({ option, onDelete }: OptionHoldingCardProps) 
         </div>
       </div>
 
-      {/* Return Summary - Make this prominent */}
-      <div className="flex items-center justify-between py-2 px-3 rounded-lg bg-white/5 mb-3 border border-white/5">
-        <div className="flex gap-4">
-          <div title="Current market value of your position">
-            <span className="text-white/40 text-xs block">Current Value</span>
-            <span className="text-white font-medium">{formatCurrency(option.position_value)}</span>
-          </div>
-        </div>
-        <div className="text-right" title={isLong ? "Current Value - What You Paid" : "What You Received - Current Liability"}>
-          <span className="text-white/40 text-xs block">Your Return</span>
-          <div className="flex items-center gap-2">
-            <span className={`font-bold ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
-              {formatCurrency(option.gain_loss)}
-            </span>
-            <span className={`text-sm ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
-              ({formatPercent(option.gain_loss_pct)})
-            </span>
-          </div>
-        </div>
-      </div>
-
       {/* Greeks row */}
       {option.greeks && (
         <div className="flex justify-between py-2 px-3 rounded-lg bg-white/5 mb-3">
-          <div className="flex gap-4">
-            <GreekBadge label="Δ" value={option.greeks.delta} multiplier={100} suffix="%" />
-            <GreekBadge label="Γ" value={option.greeks.gamma} multiplier={1} decimals={4} />
-            <GreekBadge label="Θ" value={option.greeks.theta} multiplier={100} prefix="$" isNegativeGood={isLong} />
-            <GreekBadge label="V" value={option.greeks.vega} multiplier={1} prefix="$" />
+          <div className="flex items-center gap-3">
+            <div className="flex gap-4">
+              <GreekBadge label="Δ" value={option.greeks.delta} multiplier={100} suffix="%" />
+              <GreekBadge label="Γ" value={option.greeks.gamma} multiplier={1} decimals={4} />
+              <GreekBadge label="Θ" value={option.greeks.theta} multiplier={100} prefix="$" isNegativeGood={isLong} />
+              <GreekBadge label="V" value={option.greeks.vega} multiplier={1} prefix="$" />
+            </div>
+            <button
+              onClick={() => setShowEducation(true)}
+              className="p-1 rounded-full hover:bg-white/10 transition-colors"
+              title="Learn about Greeks & IV"
+            >
+              <HelpCircle className="w-4 h-4 text-white/40 hover:text-accent-cyan" />
+            </button>
           </div>
           {option.implied_volatility && (
             <div className="text-right">
@@ -205,6 +195,12 @@ export function OptionHoldingCard({ option, onDelete }: OptionHoldingCardProps) 
             </div>
           )}
         </div>
+      )}
+
+      {/* Educational Modal - rendered via portal to escape card container */}
+      {showEducation && createPortal(
+        <OptionsEducationModal onClose={() => setShowEducation(false)} isLong={isLong} />,
+        document.body
       )}
 
       {/* Analytics row */}
@@ -307,6 +303,223 @@ function GreekBadge({
       <span className={`text-xs ml-1 font-medium ${colorClass}`}>
         {prefix}{displayValue >= 0 ? '' : ''}{displayValue.toFixed(decimals)}{suffix}
       </span>
+    </div>
+  );
+}
+
+/**
+ * Educational modal explaining Greeks and option metrics
+ */
+function OptionsEducationModal({ onClose, isLong }: { onClose: () => void; isLong: boolean }) {
+  // Lock body scroll when modal is open
+  useEffect(() => {
+    const originalOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    
+    return () => {
+      document.body.style.overflow = originalOverflow;
+    };
+  }, []);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      {/* Backdrop */}
+      <div 
+        className="absolute inset-0 bg-black/70 backdrop-blur-sm"
+        onClick={onClose}
+      />
+      
+      {/* Modal Container */}
+      <div 
+        className="relative z-10 w-full max-w-2xl max-h-[85vh] flex flex-col rounded-2xl border border-white/10 fade-in"
+        style={{
+          background: 'linear-gradient(135deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.02) 100%)',
+          backdropFilter: 'blur(12px)',
+        }}
+      >
+        {/* Fixed Header */}
+        <div className="flex items-center justify-between p-6 pb-4 border-b border-white/10 flex-shrink-0">
+          <h2 className="text-xl font-bold gradient-text">Understanding Options Metrics</h2>
+          <button
+            onClick={onClose}
+            className="p-2 rounded-lg hover:bg-white/10 transition-colors"
+          >
+            <X className="w-5 h-5 text-white/70" />
+          </button>
+        </div>
+        
+        {/* Scrollable Content */}
+        <div className="flex-1 overflow-y-auto overscroll-contain p-6 pt-4">
+
+        {/* The Greeks */}
+        <div className="mb-6">
+          <h3 className="text-lg font-semibold text-accent-cyan mb-3">The Greeks</h3>
+          <div className="space-y-4">
+            <EducationItem
+              symbol="Δ"
+              name="Delta"
+              description="How much the option price moves per $1 move in the stock."
+              example="Delta of 50% means if stock rises $1, option rises ~$0.50"
+              goodValues="Calls: 0-100%, Puts: -100%-0%. Higher absolute value = more responsive to stock moves."
+              tip={isLong 
+                ? "For long calls, you want delta to increase. For long puts, you want it to decrease (become more negative)."
+                : "For short positions, lower absolute delta means less risk from stock movement."
+              }
+            />
+            <EducationItem
+              symbol="Γ"
+              name="Gamma"
+              description="How fast delta changes as the stock moves. Measures acceleration."
+              example="High gamma means delta can change quickly with small stock moves."
+              goodValues="Highest when at-the-money and near expiration. Range: 0 to ~0.05 typically."
+              tip={isLong
+                ? "High gamma is good for long options - your delta improves as the stock moves in your favor."
+                : "High gamma is risky for short options - your position can move against you quickly."
+              }
+            />
+            <EducationItem
+              symbol="Θ"
+              name="Theta"
+              description="How much value the option loses per day due to time decay."
+              example="Theta of -$5 means the option loses $5 in value each day, all else equal."
+              goodValues="Always negative for long options. Accelerates as expiration approaches."
+              tip={isLong
+                ? "Theta works against you. The option loses value every day you hold it."
+                : "Theta works FOR you. You profit as the option decays toward zero."
+              }
+              isNegativeGood={!isLong}
+            />
+            <EducationItem
+              symbol="V"
+              name="Vega"
+              description="How much the option price changes per 1% change in implied volatility."
+              example="Vega of $0.15 means if IV rises 1%, option gains $0.15 per share."
+              goodValues="Higher for longer-dated options. Typically $0.01-$0.50."
+              tip={isLong
+                ? "High vega means you benefit when volatility increases (like before earnings)."
+                : "High vega is risky for shorts - a volatility spike can hurt your position."
+              }
+            />
+          </div>
+        </div>
+
+        {/* Implied Volatility */}
+        <div className="mb-6">
+          <h3 className="text-lg font-semibold text-accent-purple mb-3">Implied Volatility (IV)</h3>
+          <div className="bg-white/5 rounded-lg p-4">
+            <p className="text-white/80 mb-2">
+              <strong>What it is:</strong> The market's expectation of how much the stock will move. Higher IV = more expensive options.
+            </p>
+            <p className="text-white/80 mb-3">
+              <strong>How to interpret:</strong>
+            </p>
+            <ul className="space-y-2 text-sm text-white/70">
+              <li className="flex items-start gap-2">
+                <span className="text-green-400">•</span>
+                <span><strong className="text-green-400">Low IV (under 20%):</strong> Market expects calm trading. Options are cheap. Good time to buy options.</span>
+              </li>
+              <li className="flex items-start gap-2">
+                <span className="text-yellow-400">•</span>
+                <span><strong className="text-yellow-400">Medium IV (20-40%):</strong> Normal volatility range for most stocks.</span>
+              </li>
+              <li className="flex items-start gap-2">
+                <span className="text-red-400">•</span>
+                <span><strong className="text-red-400">High IV (over 50%):</strong> Market expects big moves (earnings, news). Options are expensive. Good time to sell options.</span>
+              </li>
+            </ul>
+            <p className="text-white/60 text-xs mt-3 italic">
+              Tip: IV tends to drop after events like earnings ("IV crush"), hurting long option holders even if the stock moves the right way.
+            </p>
+          </div>
+        </div>
+
+        {/* Other Terms */}
+        <div>
+          <h3 className="text-lg font-semibold text-white mb-3">Other Terms</h3>
+          <div className="space-y-3 text-sm">
+            <div className="bg-white/5 rounded-lg p-3">
+              <span className="text-accent-cyan font-medium">Breakeven:</span>
+              <span className="text-white/70 ml-2">
+                The stock price where you neither profit nor lose at expiration. For calls: Strike + Premium. For puts: Strike - Premium.
+              </span>
+            </div>
+            <div className="bg-white/5 rounded-lg p-3">
+              <span className="text-accent-cyan font-medium">Underlying:</span>
+              <span className="text-white/70 ml-2">
+                The current stock price that the option is based on.
+              </span>
+            </div>
+            <div className="bg-white/5 rounded-lg p-3">
+              <span className="text-accent-cyan font-medium">Intrinsic Value:</span>
+              <span className="text-white/70 ml-2">
+                The "real" value if exercised now. For calls: Stock Price - Strike. For puts: Strike - Stock Price. Can never be negative. If $0, you're "out of the money."
+              </span>
+            </div>
+            <div className="bg-white/5 rounded-lg p-3">
+              <span className="text-accent-cyan font-medium">ITM (In The Money):</span>
+              <span className="text-white/70 ml-2">
+                When the option has intrinsic value. Calls: stock above strike. Puts: stock below strike.
+              </span>
+            </div>
+            <div className="bg-white/5 rounded-lg p-3">
+              <span className="text-accent-cyan font-medium">P(Profit):</span>
+              <span className="text-white/70 ml-2">
+                Estimated probability your position will be profitable at expiration, based on current IV and stock price.
+              </span>
+            </div>
+          </div>
+        </div>
+        </div>
+        {/* End scrollable content */}
+
+        {/* Fixed Footer */}
+        <div className="p-6 pt-4 border-t border-white/10 flex-shrink-0">
+          <button
+            onClick={onClose}
+            className="btn-primary w-full"
+          >
+            Got it!
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Single education item for a Greek
+ */
+function EducationItem({ 
+  symbol, 
+  name, 
+  description, 
+  example, 
+  goodValues, 
+  tip,
+  isNegativeGood = false
+}: {
+  symbol: string;
+  name: string;
+  description: string;
+  example: string;
+  goodValues: string;
+  tip: string;
+  isNegativeGood?: boolean;
+}) {
+  return (
+    <div className="bg-white/5 rounded-lg p-3">
+      <div className="flex items-center gap-2 mb-2">
+        <span className="text-accent-cyan text-lg font-bold">{symbol}</span>
+        <span className="text-white font-semibold">{name}</span>
+      </div>
+      <p className="text-white/80 text-sm mb-2">{description}</p>
+      <p className="text-white/60 text-xs mb-2 italic">Example: {example}</p>
+      <p className="text-white/60 text-xs mb-2">
+        <span className="text-accent-purple">Good values:</span> {goodValues}
+      </p>
+      <p className={`text-xs ${isNegativeGood ? 'text-green-400/80' : 'text-accent-cyan/80'}`}>
+        💡 {tip}
+      </p>
     </div>
   );
 }
