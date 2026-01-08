@@ -164,4 +164,53 @@ class StockCalculations:
         gain_loss_pct = ((current_price - investment_price) / investment_price) * 100
         
         return round(gain_loss, 2), round(gain_loss_pct, 2)
+    
+    @staticmethod
+    def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
+        """
+        Calculate Relative Strength Index (RSI).
+        
+        RSI measures momentum and identifies overbought/oversold conditions.
+        - RSI > 70: Overbought (potential pullback)
+        - RSI < 30: Oversold (potential bounce)
+        
+        Args:
+            prices: List of closing prices (oldest first).
+            period: RSI period (default 14 days).
+            
+        Returns:
+            RSI value (0-100) or None if insufficient data.
+        """
+        if len(prices) < period + 1:
+            return None
+        
+        # Calculate price changes
+        changes = []
+        for i in range(1, len(prices)):
+            changes.append(prices[i] - prices[i-1])
+        
+        # Use only the most recent data
+        recent_changes = changes[-(period + 10):] if len(changes) > period + 10 else changes
+        
+        # Separate gains and losses
+        gains = [c if c > 0 else 0 for c in recent_changes]
+        losses = [-c if c < 0 else 0 for c in recent_changes]
+        
+        # Calculate initial average gain/loss
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+        
+        # Apply smoothing for remaining periods
+        for i in range(period, len(recent_changes)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        
+        # Calculate RSI
+        if avg_loss == 0:
+            return 100.0  # No losses = extremely overbought
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        return round(rsi, 1)
 

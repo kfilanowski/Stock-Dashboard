@@ -5,6 +5,7 @@ export interface Holding {
   shares: number;  // Number of shares owned
   avg_cost?: number | null;  // Average cost per share
   added_at: string;
+  is_pinned?: boolean;  // Pin to top of holdings list
   current_price?: number;
   market_value?: number | null;  // shares × current_price
   cost_basis?: number | null;  // shares × avg_cost
@@ -14,6 +15,8 @@ export interface Holding {
   price_vs_sma?: number;
   gain_loss?: number | null;  // market_value - cost_basis
   gain_loss_pct?: number | null;  // (current_price - avg_cost) / avg_cost × 100
+  high_52w?: number | null;  // 52-week high price
+  low_52w?: number | null;   // 52-week low price
 }
 
 export interface Portfolio {
@@ -113,10 +116,14 @@ export type MetricType =
   | 'rvol'              // Relative Volume
   | 'adx'               // Average Directional Index (trend strength)
   | 'crossPattern'      // Golden Cross / Death Cross
+  | 'cmf'               // Chaikin Money Flow (accumulation/distribution)
+  | 'divergence'        // Price-Volume Divergence
+  | 'alpha'             // Relative strength vs market (SPY)
   | 'roic'              // Return on Invested Capital
   | 'callPutRatio'      // Options Call/Put ratio
   | 'ivPercentile'      // Implied Volatility percentile
-  | 'sectorBeta';       // Beta to sector
+  | 'sectorBeta'        // Beta to sector
+  | 'earningsProximity'; // Days until next earnings
 
 /**
  * A signal from a single metric for a specific action.

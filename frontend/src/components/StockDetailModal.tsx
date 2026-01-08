@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
-import { X, TrendingUp, TrendingDown, Calendar, BarChart2, Sun, Moon, Sunrise, Clock, ArrowUpRight, ArrowDownRight } from 'lucide-react';
+import { X, TrendingUp, TrendingDown, Calendar, BarChart2, Sun, Moon, Sunrise, Clock, ArrowUpRight, ArrowDownRight, ChevronDown, Check } from 'lucide-react';
 import { 
   Line, XAxis, YAxis, Tooltip, ResponsiveContainer, 
   CartesianGrid, ReferenceLine, Area, ComposedChart, ReferenceArea 
@@ -7,6 +7,38 @@ import {
 import type { StockData, HistoryPoint } from '../types';
 import * as api from '../services/api';
 import { ChartPeriodSelector, type ChartPeriod } from './ChartPeriodSelector';
+import { useHistoryForPeriod } from '../hooks/useDataCache';
+import { calculateSMA, calculateEMA, calculateBollingerBands, calculateVWAP } from '../services/technicalIndicators';
+
+// ============================================================================
+// Technical Indicator Configuration
+// ============================================================================
+
+type IndicatorKey = 'sma20' | 'sma50' | 'sma200' | 'ema12' | 'ema26' | 'bbUpper' | 'bbMiddle' | 'bbLower' | 'vwap';
+
+interface IndicatorConfig {
+  key: IndicatorKey;
+  label: string;
+  color: string;
+  strokeDasharray?: string;
+  group: 'moving_averages' | 'bollinger' | 'volume';
+  minPeriod: number; // Minimum data points needed
+}
+
+const INDICATOR_CONFIGS: IndicatorConfig[] = [
+  // Moving Averages
+  { key: 'sma20', label: 'SMA 20', color: '#f59e0b', group: 'moving_averages', minPeriod: 20 },
+  { key: 'sma50', label: 'SMA 50', color: '#3b82f6', group: 'moving_averages', minPeriod: 50 },
+  { key: 'sma200', label: 'SMA 200', color: '#a855f7', group: 'moving_averages', minPeriod: 200 },
+  { key: 'ema12', label: 'EMA 12', color: '#10b981', strokeDasharray: '4 2', group: 'moving_averages', minPeriod: 12 },
+  { key: 'ema26', label: 'EMA 26', color: '#06b6d4', strokeDasharray: '4 2', group: 'moving_averages', minPeriod: 26 },
+  // Bollinger Bands
+  { key: 'bbUpper', label: 'BB Upper', color: '#ec4899', strokeDasharray: '2 2', group: 'bollinger', minPeriod: 20 },
+  { key: 'bbMiddle', label: 'BB Middle', color: '#ec4899', group: 'bollinger', minPeriod: 20 },
+  { key: 'bbLower', label: 'BB Lower', color: '#ec4899', strokeDasharray: '2 2', group: 'bollinger', minPeriod: 20 },
+  // Volume-based
+  { key: 'vwap', label: 'VWAP', color: '#eab308', strokeDasharray: '6 3', group: 'volume', minPeriod: 5 },
+];
 
 // Extended hours trading window (4 AM to 8 PM Eastern)
 const EXTENDED_START_MINUTES = 4 * 60;    // 4:00 AM = 240 minutes
@@ -137,6 +169,10 @@ export function StockDetailModal({
   const [loading, setLoading] = useState(false);
   // Local chart period state - isolated from parent dashboard
   const [chartPeriod, setChartPeriod] = useState<ChartPeriod>(initialChartPeriod);
+  // Technical indicators toggle state
+  const [enabledIndicators, setEnabledIndicators] = useState<Set<IndicatorKey>>(new Set());
+  const [indicatorMenuOpen, setIndicatorMenuOpen] = useState(false);
+  const indicatorMenuRef = useRef<HTMLDivElement>(null);
   
   // Reset chart period to initial value when modal opens for a new ticker
   useEffect(() => {
@@ -145,13 +181,16 @@ export function StockDetailModal({
     }
   }, [ticker, initialChartPeriod]);
   
-  // Chart data managed locally (isolated from parent dashboard)
-  const [chartHistory, setChartHistory] = useState<HistoryPoint[]>([]);
-  const [referenceClose, setReferenceClose] = useState<number | null>(null);
-  const [chartLoading, setChartLoading] = useState(false);
-  const [isDataComplete, setIsDataComplete] = useState(true);
-  const [expectedStart, setExpectedStart] = useState<string | null>(null);
-  const [actualStart, setActualStart] = useState<string | null>(null);
+  // Use centralized cache for chart history
+  // This hook will use cached data if available or fetch if needed
+  const { data: cachedChartData, isLoading: chartLoading } = useHistoryForPeriod(ticker, chartPeriod);
+  
+  // Extract chart data from cache
+  const chartHistory = cachedChartData?.history ?? [];
+  const referenceClose = cachedChartData?.referenceClose ?? null;
+  const isDataComplete = cachedChartData?.isComplete ?? true;
+  const expectedStart = cachedChartData?.expectedStart ?? null;
+  const actualStart = cachedChartData?.actualStart ?? null;
   
   // Ping animation state - triggers when prices API returns
   const [pingKey, setPingKey] = useState(0);
@@ -166,7 +205,7 @@ export function StockDetailModal({
   const [tooltipPosition, setTooltipPosition] = useState<{ x: number; y: number } | null>(null);
   const chartContainerRef = useRef<HTMLDivElement>(null);
 
-  // Fetch stock data on mount and when prices update
+  // Fetch stock data on mount only (not on every price update - live data comes from holding prop)
   useEffect(() => {
     if (!ticker) {
       setStock(null);
@@ -187,40 +226,8 @@ export function StockDetailModal({
     };
 
     fetchStock();
-  }, [ticker, lastPricesFetched]); // Re-fetch when prices update
+  }, [ticker]); // Only fetch once when ticker changes - live updates come via holding prop
 
-  // Fetch chart history when period changes
-  useEffect(() => {
-    if (!ticker) return;
-
-    // Clear old data immediately when period changes to avoid stale display
-    setChartHistory([]);
-    setReferenceClose(null);
-
-    const fetchHistory = async () => {
-      setChartLoading(true);
-      try {
-        const result = await api.getStockHistory(ticker, chartPeriod);
-        setChartHistory(result.history);
-        setReferenceClose(result.reference_close);
-        setIsDataComplete(result.is_complete);
-        setExpectedStart(result.expected_start);
-        setActualStart(result.actual_start);
-      } catch (err) {
-        console.error('Failed to fetch history:', err);
-        setChartHistory([]);
-        setReferenceClose(null);
-        setIsDataComplete(false);
-        setExpectedStart(null);
-        setActualStart(null);
-      } finally {
-        setChartLoading(false);
-      }
-    };
-
-    fetchHistory();
-  }, [ticker, chartPeriod]);
-  
   // Clear selection when chart period changes
   useEffect(() => {
     setSelectionStart(null);
@@ -251,6 +258,47 @@ export function StockDetailModal({
     
     prevTimestampRef.current = currentTimestamp;
   }, [lastPricesFetched]);
+
+  // Close indicator menu when clicking outside
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (indicatorMenuRef.current && !indicatorMenuRef.current.contains(event.target as Node)) {
+        setIndicatorMenuOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Toggle indicator on/off
+  const toggleIndicator = useCallback((key: IndicatorKey) => {
+    setEnabledIndicators(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  }, []);
+
+  // Toggle entire group of indicators
+  const toggleIndicatorGroup = useCallback((group: 'moving_averages' | 'bollinger' | 'volume') => {
+    const groupIndicators = INDICATOR_CONFIGS.filter(c => c.group === group).map(c => c.key);
+    setEnabledIndicators(prev => {
+      const next = new Set(prev);
+      const allEnabled = groupIndicators.every(k => next.has(k));
+      if (allEnabled) {
+        // Disable all in group
+        groupIndicators.forEach(k => next.delete(k));
+      } else {
+        // Enable all in group
+        groupIndicators.forEach(k => next.add(k));
+      }
+      return next;
+    });
+  }, []);
   
   // Merge live holding data with fetched stock data
   const displayStock = useMemo(() => {
@@ -273,6 +321,58 @@ export function StockDetailModal({
   // Check if this is an intraday period
   const isIntraday = ['1d', '3d', '1w'].includes(chartPeriod);
   const hasIntradayData = useMemo(() => isIntradayData(chartHistory), [chartHistory]);
+
+  // Calculate rolling technical indicators for each chart point
+  const chartIndicators = useMemo((): Record<IndicatorKey, (number | null)[]> => {
+    const emptyResult: Record<IndicatorKey, (number | null)[]> = {
+      sma20: [],
+      sma50: [],
+      sma200: [],
+      ema12: [],
+      ema26: [],
+      bbUpper: [],
+      bbMiddle: [],
+      bbLower: [],
+      vwap: [],
+    };
+    
+    if (!chartHistory.length) return emptyResult;
+    
+    const prices = chartHistory.map(h => h.close).filter(p => p > 0);
+    const result = { ...emptyResult };
+    
+    // Calculate rolling values for each point
+    for (let i = 0; i < chartHistory.length; i++) {
+      const slice = prices.slice(0, i + 1);
+      const historySlice = chartHistory.slice(0, i + 1);
+      
+      // SMAs
+      result.sma20.push(slice.length >= 20 ? calculateSMA(slice, 20) : null);
+      result.sma50.push(slice.length >= 50 ? calculateSMA(slice, 50) : null);
+      result.sma200.push(slice.length >= 200 ? calculateSMA(slice, 200) : null);
+      
+      // EMAs
+      result.ema12.push(slice.length >= 12 ? calculateEMA(slice, 12) : null);
+      result.ema26.push(slice.length >= 26 ? calculateEMA(slice, 26) : null);
+      
+      // Bollinger Bands
+      const bb = slice.length >= 20 ? calculateBollingerBands(historySlice, 20) : null;
+      result.bbUpper.push(bb?.upper ?? null);
+      result.bbMiddle.push(bb?.middle ?? null);
+      result.bbLower.push(bb?.lower ?? null);
+      
+      // VWAP (uses volume, so use full history slice)
+      const vwap = historySlice.length >= 5 ? calculateVWAP(historySlice, 20) : null;
+      result.vwap.push(vwap?.value ?? null);
+    }
+    
+    return result;
+  }, [chartHistory]);
+
+  // Get available indicators based on data length
+  const availableIndicators = useMemo(() => {
+    return INDICATOR_CONFIGS.filter(config => chartHistory.length >= config.minPeriod);
+  }, [chartHistory.length]);
 
   // Calculate session-specific changes (pre-market, regular, after-hours)
   const sessionChanges = useMemo((): SessionChanges | null => {
@@ -354,7 +454,7 @@ export function StockDetailModal({
   const lineColor = isAboveReference ? '#22c55e' : '#ef4444'; // green-500 or red-500
   const gradientId = `colorClose-${isAboveReference ? 'green' : 'red'}`;
 
-  // Calculate Y-axis domain to include reference close
+  // Calculate Y-axis domain to include reference close and enabled indicators
   const yAxisDomain = useMemo((): [number, number] | [string, string] => {
     if (!chartHistory.length) return ['auto', 'auto'];
     
@@ -370,16 +470,22 @@ export function StockDetailModal({
       max = Math.max(max, referenceClose);
     }
     
-    // Include SMA if visible
-    if (!isIntraday && displayStock?.sma_200) {
-      min = Math.min(min, displayStock.sma_200);
-      max = Math.max(max, displayStock.sma_200);
-    }
+    // Include enabled indicators in the domain
+    enabledIndicators.forEach(key => {
+      const values = chartIndicators[key];
+      if (values) {
+        const validValues = values.filter((v): v is number => v !== null && v > 0);
+        if (validValues.length) {
+          min = Math.min(min, ...validValues);
+          max = Math.max(max, ...validValues);
+        }
+      }
+    });
     
     // Add 5% padding
     const padding = (max - min) * 0.05;
     return [min - padding, max + padding] as [number, number];
-  }, [chartHistory, referenceClose, isIntraday, displayStock?.sma_200]);
+  }, [chartHistory, referenceClose, enabledIndicators, chartIndicators]);
 
   // Process chart data with time-based positioning for intraday
   const { processedHistory, extendedHoursRanges, xDomain, numTradingDays, tradingDays } = useMemo(() => {
@@ -393,10 +499,24 @@ export function StockDetailModal({
       };
     }
     
+    // Helper to add indicator values to a data point
+    const addIndicatorValues = (h: HistoryPoint, idx: number) => ({
+      ...h,
+      sma20: chartIndicators.sma20?.[idx] ?? null,
+      sma50: chartIndicators.sma50?.[idx] ?? null,
+      sma200: chartIndicators.sma200?.[idx] ?? null,
+      ema12: chartIndicators.ema12?.[idx] ?? null,
+      ema26: chartIndicators.ema26?.[idx] ?? null,
+      bbUpper: chartIndicators.bbUpper?.[idx] ?? null,
+      bbMiddle: chartIndicators.bbMiddle?.[idx] ?? null,
+      bbLower: chartIndicators.bbLower?.[idx] ?? null,
+      vwap: chartIndicators.vwap?.[idx] ?? null,
+    });
+    
     if (!hasIntradayData) {
       // For daily data, use simple index-based positioning
       const processed = chartHistory.map((h, idx) => ({
-        ...h,
+        ...addIndicatorValues(h, idx),
         xValue: idx,
         isExtendedHours: false
       }));
@@ -416,14 +536,14 @@ export function StockDetailModal({
     const numDays = days.length;
     const minutesPerDay = EXTENDED_END_MINUTES - EXTENDED_START_MINUTES; // 960 minutes (4 AM to 8 PM)
     
-    const processed = chartHistory.map((h) => {
+    const processed = chartHistory.map((h, idx) => {
       const dayIndex = days.indexOf(getTradingDay(h.date));
       const minuteOfDay = dateToMinutes(h.date);
       // Position within the full time range: dayIndex * dayWidth + position within day
       const xValue = (dayIndex * minutesPerDay) + (minuteOfDay - EXTENDED_START_MINUTES);
       
       return {
-        ...h,
+        ...addIndicatorValues(h, idx),
         xValue,
         minuteOfDay,
         isExtendedHours: !isMarketHours(h.date)
@@ -452,7 +572,7 @@ export function StockDetailModal({
     }
     
     return { processedHistory: processed, extendedHoursRanges: ranges, xDomain: domain, numTradingDays: numDays, tradingDays: days };
-  }, [chartHistory, hasIntradayData]);
+  }, [chartHistory, hasIntradayData, chartIndicators]);
   
   // Chart selection mouse handlers
   const handleChartMouseDown = useCallback((e: any) => {
@@ -912,9 +1032,110 @@ export function StockDetailModal({
               </div>
             </div>
 
-            {/* Period Selector */}
-            <div className="mb-4">
+            {/* Period Selector and Indicators */}
+            <div className="mb-4 flex items-center justify-between gap-4">
               <ChartPeriodSelector selected={chartPeriod} onSelect={setChartPeriod} />
+              
+              {/* Technical Indicators Toggle */}
+              <div className="relative" ref={indicatorMenuRef}>
+                <button
+                  onClick={() => setIndicatorMenuOpen(!indicatorMenuOpen)}
+                  className={`
+                    flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium
+                    transition-all duration-200 border
+                    ${enabledIndicators.size > 0 
+                      ? 'bg-accent-cyan/20 border-accent-cyan/30 text-accent-cyan' 
+                      : 'bg-white/5 border-white/10 text-white/70 hover:bg-white/10 hover:border-white/20'
+                    }
+                  `}
+                >
+                  <BarChart2 className="w-4 h-4" />
+                  <span>Indicators</span>
+                  {enabledIndicators.size > 0 && (
+                    <span className="bg-accent-cyan/30 text-accent-cyan text-xs px-1.5 py-0.5 rounded-full">
+                      {enabledIndicators.size}
+                    </span>
+                  )}
+                  <ChevronDown className={`w-4 h-4 transition-transform ${indicatorMenuOpen ? 'rotate-180' : ''}`} />
+                </button>
+                
+                {/* Indicator Dropdown Menu */}
+                {indicatorMenuOpen && (
+                  <div className="absolute right-0 top-full mt-2 w-64 bg-[rgba(15,15,20,0.98)] border border-white/10 rounded-xl shadow-2xl z-50 overflow-hidden fade-in">
+                    {/* Moving Averages Group */}
+                    <div className="p-2 border-b border-white/5">
+                      <button
+                        onClick={() => toggleIndicatorGroup('moving_averages')}
+                        className="w-full flex items-center justify-between px-2 py-1.5 text-xs font-semibold text-white/50 uppercase tracking-wider hover:text-white/70"
+                      >
+                        <span>Moving Averages</span>
+                        <span className="text-[10px] normal-case font-normal">Toggle All</span>
+                      </button>
+                      {INDICATOR_CONFIGS.filter(c => c.group === 'moving_averages').map(config => (
+                        <IndicatorToggleItem
+                          key={config.key}
+                          config={config}
+                          enabled={enabledIndicators.has(config.key)}
+                          available={availableIndicators.some(a => a.key === config.key)}
+                          onToggle={() => toggleIndicator(config.key)}
+                        />
+                      ))}
+                    </div>
+                    
+                    {/* Bollinger Bands Group */}
+                    <div className="p-2 border-b border-white/5">
+                      <button
+                        onClick={() => toggleIndicatorGroup('bollinger')}
+                        className="w-full flex items-center justify-between px-2 py-1.5 text-xs font-semibold text-white/50 uppercase tracking-wider hover:text-white/70"
+                      >
+                        <span>Bollinger Bands</span>
+                        <span className="text-[10px] normal-case font-normal">Toggle All</span>
+                      </button>
+                      {INDICATOR_CONFIGS.filter(c => c.group === 'bollinger').map(config => (
+                        <IndicatorToggleItem
+                          key={config.key}
+                          config={config}
+                          enabled={enabledIndicators.has(config.key)}
+                          available={availableIndicators.some(a => a.key === config.key)}
+                          onToggle={() => toggleIndicator(config.key)}
+                        />
+                      ))}
+                    </div>
+                    
+                    {/* Volume-based Group */}
+                    <div className="p-2">
+                      <button
+                        onClick={() => toggleIndicatorGroup('volume')}
+                        className="w-full flex items-center justify-between px-2 py-1.5 text-xs font-semibold text-white/50 uppercase tracking-wider hover:text-white/70"
+                      >
+                        <span>Volume-Based</span>
+                        <span className="text-[10px] normal-case font-normal">Toggle All</span>
+                      </button>
+                      {INDICATOR_CONFIGS.filter(c => c.group === 'volume').map(config => (
+                        <IndicatorToggleItem
+                          key={config.key}
+                          config={config}
+                          enabled={enabledIndicators.has(config.key)}
+                          available={availableIndicators.some(a => a.key === config.key)}
+                          onToggle={() => toggleIndicator(config.key)}
+                        />
+                      ))}
+                    </div>
+                    
+                    {/* Clear All Button */}
+                    {enabledIndicators.size > 0 && (
+                      <div className="p-2 border-t border-white/5">
+                        <button
+                          onClick={() => setEnabledIndicators(new Set())}
+                          className="w-full px-3 py-1.5 text-xs text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
+                        >
+                          Clear All Indicators
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Reference Close Info */}
@@ -1040,20 +1261,28 @@ export function StockDetailModal({
                     />
                   )}
                   
-                  {/* SMA Reference Line (only for longer periods) */}
-                  {!isIntraday && displayStock.sma_200 && (
-                    <ReferenceLine 
-                      y={displayStock.sma_200} 
-                      stroke="#a855f7" 
-                      strokeDasharray="5 5"
-                      label={{ 
-                        value: `SMA(200): $${displayStock.sma_200.toFixed(2)}`, 
-                        fill: '#a855f7',
-                        fontSize: 11,
-                        position: 'right'
-                      }}
-                    />
-                  )}
+                  {/* Technical Indicator Lines */}
+                  {INDICATOR_CONFIGS.map(config => {
+                    if (!enabledIndicators.has(config.key)) return null;
+                    // Check if any data point has this indicator value
+                    const hasData = processedHistory.some((p: any) => p[config.key] !== null);
+                    if (!hasData) return null;
+                    
+                    return (
+                      <Line
+                        key={config.key}
+                        type="monotone"
+                        dataKey={config.key}
+                        stroke={config.color}
+                        strokeWidth={1.5}
+                        strokeDasharray={config.strokeDasharray}
+                        dot={false}
+                        activeDot={false}
+                        isAnimationActive={false}
+                        connectNulls={true}
+                      />
+                    );
+                  })}
                   
                   <Area
                     type="monotone"
@@ -1139,17 +1368,11 @@ export function StockDetailModal({
             )}
 
             {/* Legend */}
-            <div className="mt-3 flex flex-wrap gap-4 text-xs text-white/50">
+            <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2 text-xs text-white/50">
               <span className="flex items-center gap-1.5">
                 <span className="w-3 h-0.5 bg-white/40" style={{ borderStyle: 'dashed' }}></span>
                 Previous Close
               </span>
-              {!isIntraday && displayStock.sma_200 && (
-                <span className="flex items-center gap-1.5">
-                  <span className="w-3 h-0.5 bg-purple-500"></span>
-                  SMA(200)
-                </span>
-              )}
               <span className="flex items-center gap-1.5">
                 <span className={`w-3 h-0.5 ${isAboveReference ? 'bg-green-500' : 'bg-red-500'}`}></span>
                 {isAboveReference ? 'Above' : 'Below'} previous close
@@ -1166,6 +1389,19 @@ export function StockDetailModal({
                   Incomplete Data
                 </span>
               )}
+              {/* Enabled Indicator Legend Items */}
+              {INDICATOR_CONFIGS.filter(c => enabledIndicators.has(c.key)).map(config => (
+                <span key={config.key} className="flex items-center gap-1.5">
+                  <span 
+                    className="w-3 h-0.5" 
+                    style={{ 
+                      backgroundColor: config.color,
+                      borderStyle: config.strokeDasharray ? 'dashed' : 'solid'
+                    }}
+                  ></span>
+                  {config.label}
+                </span>
+              ))}
             </div>
           </>
         ) : (
@@ -1346,5 +1582,59 @@ function SelectionTooltip({
         </div>
       </div>
     </div>
+  );
+}
+
+// Indicator toggle menu item component
+function IndicatorToggleItem({
+  config,
+  enabled,
+  available,
+  onToggle,
+}: {
+  config: IndicatorConfig;
+  enabled: boolean;
+  available: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      onClick={onToggle}
+      disabled={!available}
+      className={`
+        w-full flex items-center gap-3 px-2 py-2 rounded-lg text-sm transition-colors
+        ${!available 
+          ? 'opacity-40 cursor-not-allowed' 
+          : enabled 
+            ? 'bg-white/10 text-white' 
+            : 'text-white/70 hover:bg-white/5 hover:text-white'
+        }
+      `}
+      title={!available ? `Requires at least ${config.minPeriod} data points` : undefined}
+    >
+      {/* Color indicator */}
+      <span 
+        className="w-4 h-0.5 flex-shrink-0 rounded-full"
+        style={{ 
+          backgroundColor: config.color,
+          borderStyle: config.strokeDasharray ? 'dashed' : 'solid'
+        }}
+      />
+      
+      {/* Label */}
+      <span className="flex-1 text-left">{config.label}</span>
+      
+      {/* Check indicator */}
+      {enabled && (
+        <Check className="w-4 h-4 text-accent-cyan" />
+      )}
+      
+      {/* Unavailable indicator */}
+      {!available && (
+        <span className="text-[10px] text-white/30">
+          Need {config.minPeriod}+ pts
+        </span>
+      )}
+    </button>
   );
 }

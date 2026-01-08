@@ -34,9 +34,15 @@ class Settings(BaseSettings):
     data_retention_days: int = 730  # 2 years
     
     # Stock service settings
-    yfinance_max_workers: int = 10
+    # Keep workers low to avoid rate limiting from Yahoo Finance
+    yfinance_max_workers: int = 4
     yfinance_timeout: int = 15
     yfinance_retries: int = 2
+    
+    # Yahoo API retry settings with exponential backoff
+    yahoo_max_retries: int = 5       # Maximum retry attempts
+    yahoo_base_delay: float = 1.0    # Initial delay in seconds
+    yahoo_max_delay: float = 32.0    # Maximum delay cap in seconds
     
     # Market hours (Eastern Time, in minutes from midnight)
     market_open_minutes: int = 570   # 9:30 AM = 9*60 + 30

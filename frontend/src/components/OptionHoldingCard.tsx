@@ -2,10 +2,14 @@ import { useMemo, useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { Trash2, TrendingUp, TrendingDown, Clock, Target, AlertTriangle, HelpCircle, X } from 'lucide-react';
 import type { OptionHoldingWithData } from '../types';
+import { OptionActionBadge } from './options/OptionActionBadge';
+import { OptionAnalysisModal } from './options/OptionAnalysisModal';
+import type { StockAnalysisData } from '../services/optionScoring';
 
 interface OptionHoldingCardProps {
   option: OptionHoldingWithData;
   onDelete: (id: number) => void;
+  stockAnalysis?: StockAnalysisData;
 }
 
 /**
@@ -46,11 +50,12 @@ function getExpirationStatus(daysToExp: number | undefined): { color: string; te
   }
 }
 
-export function OptionHoldingCard({ option, onDelete }: OptionHoldingCardProps) {
+export function OptionHoldingCard({ option, onDelete, stockAnalysis }: OptionHoldingCardProps) {
   const isCall = option.option_type === 'call';
   const isLong = option.position_type === 'long';
   const isPositive = (option.gain_loss ?? 0) >= 0;
   const [showEducation, setShowEducation] = useState(false);
+  const [showAnalysis, setShowAnalysis] = useState(false);
   
   const expStatus = useMemo(() => 
     getExpirationStatus(option.analytics?.days_to_expiration), 
@@ -87,6 +92,11 @@ export function OptionHoldingCard({ option, onDelete }: OptionHoldingCardProps) 
                 ITM
               </span>
             )}
+            <OptionActionBadge 
+              option={option} 
+              stockAnalysis={stockAnalysis}
+              onClick={() => setShowAnalysis(true)}
+            />
           </div>
           
           {/* Strike and expiration */}
@@ -200,6 +210,16 @@ export function OptionHoldingCard({ option, onDelete }: OptionHoldingCardProps) 
       {/* Educational Modal - rendered via portal to escape card container */}
       {showEducation && createPortal(
         <OptionsEducationModal onClose={() => setShowEducation(false)} isLong={isLong} />,
+        document.body
+      )}
+
+      {/* Analysis Modal - rendered via portal */}
+      {showAnalysis && createPortal(
+        <OptionAnalysisModal 
+          option={option} 
+          stockAnalysis={stockAnalysis}
+          onClose={() => setShowAnalysis(false)} 
+        />,
         document.body
       )}
 

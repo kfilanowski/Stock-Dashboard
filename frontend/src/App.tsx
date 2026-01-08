@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Plus, Briefcase, Layers, TrendingUp, RefreshCw } from 'lucide-react';
+import { Plus, Briefcase, Layers, TrendingUp, RefreshCw, Pin } from 'lucide-react';
 import { 
   Header, 
   PortfolioSummary, 
@@ -19,8 +19,11 @@ import {
 } from './components';
 import { usePortfolio, type HoldingChartData } from './hooks/usePortfolio';
 import { getCachedAnalysisScore } from './hooks/useStockAnalysis';
+import { useDataCacheContext } from './context/DataCacheContext';
+import { calculateRSI } from './services/technicalIndicators';
 import * as api from './services/api';
 import type { OptionHoldingWithData, OptionHoldingCreate } from './types';
+import type { StockAnalysisData } from './services/optionScoring';
 
 function App() {
   const [showAddModal, setShowAddModal] = useState(false);
@@ -37,6 +40,11 @@ function App() {
   const [optionHoldings, setOptionHoldings] = useState<OptionHoldingWithData[]>([]);
   const [optionsLoading, setOptionsLoading] = useState(false);
   const [optionsError, setOptionsError] = useState<string | null>(null);
+  
+  // Stock analysis for option underlyings (used for action recommendations)
+  const [optionUnderlyingAnalysis, setOptionUnderlyingAnalysis] = useState<
+    Record<string, StockAnalysisData>
+  >({});
 
   // Callback for when the portfolio hook fetches new history data
   const handleHistoryUpdate = useCallback((ticker: string, data: HoldingChartData) => {
@@ -143,11 +151,10 @@ function App() {
     return getCachedAnalysisScore(ticker);
   }, []);
 
-  // Sort holdings based on current sort option
-  const sortedHoldings = useMemo(() => {
-    if (!portfolio?.holdings) return [];
+  // Sort holdings based on current sort option, split into pinned and unpinned
+  const { pinnedHoldings, unpinnedHoldings } = useMemo(() => {
+    if (!portfolio?.holdings) return { pinnedHoldings: [], unpinnedHoldings: [] };
     
-    const holdings = [...portfolio.holdings];
     const { field, direction } = sortOption;
     const multiplier = direction === 'asc' ? 1 : -1;
 
@@ -156,12 +163,13 @@ function App() {
     const periodGainCache = new Map<string, number | null>();
     const actionScoreCache = new Map<string, number | null>();
     
-    for (const h of holdings) {
+    for (const h of portfolio.holdings) {
       periodGainCache.set(h.ticker, getPeriodGain(h.ticker));
       actionScoreCache.set(h.ticker, getActionScore(h.ticker));
     }
 
-    holdings.sort((a, b) => {
+    // Sorting function used for both pinned and unpinned groups
+    const sortFn = (a: typeof portfolio.holdings[0], b: typeof portfolio.holdings[0]) => {
       let comparison = 0;
 
       switch (field) {
@@ -218,9 +226,13 @@ function App() {
       }
 
       return comparison * multiplier;
-    });
+    };
 
-    return holdings;
+    // Split into pinned and unpinned, then sort each group independently
+    const pinned = portfolio.holdings.filter(h => h.is_pinned).sort(sortFn);
+    const unpinned = portfolio.holdings.filter(h => !h.is_pinned).sort(sortFn);
+
+    return { pinnedHoldings: pinned, unpinnedHoldings: unpinned };
   }, [portfolio?.holdings, sortOption, getPeriodGain, getActionScore]);
 
   const handleAddHolding = async (ticker: string, shares: number, avgCost?: number) => {
@@ -231,15 +243,37 @@ function App() {
     await updateHolding(holdingId, data);
   };
 
+  const handleTogglePin = async (holdingId: number, isPinned: boolean) => {
+    await updateHolding(holdingId, { is_pinned: !isPinned });
+  };
+
   const handleRefreshHistory = async (ticker: string) => {
-    // Clear cached history on backend
+    // Clear cached history on backend (forces full refresh)
     await api.clearStockHistory(ticker);
-    // Clear local chart data to trigger refetch
+    
+    // Clear local chart data
     setHoldingChartData(prev => {
       const newData = { ...prev };
       delete newData[ticker];
       return newData;
     });
+    
+    // Immediately fetch fresh data
+    try {
+      const historyData = await api.getStockHistory(ticker, chartPeriod);
+      setHoldingChartData(prev => ({
+        ...prev,
+        [ticker]: {
+          history: historyData.history,
+          referenceClose: historyData.reference_close,
+          isComplete: historyData.is_complete,
+          expectedStart: historyData.expected_start,
+          actualStart: historyData.actual_start
+        }
+      }));
+    } catch (err) {
+      console.error(`Failed to refresh history for ${ticker}:`, err);
+    }
   };
 
   // ============================================================================
@@ -268,6 +302,53 @@ function App() {
     const interval = setInterval(fetchOptionHoldings, 60000);
     return () => clearInterval(interval);
   }, [fetchOptionHoldings]);
+
+  // Get data cache context for price history (used for RSI calculation)
+  const { historyData: cacheHistory } = useDataCacheContext();
+
+  // Fetch stock analysis for option underlying tickers (for action recommendations)
+  useEffect(() => {
+    if (optionHoldings.length === 0) return;
+    
+    // Get unique underlying tickers
+    const underlyingTickers = [...new Set(optionHoldings.map(opt => opt.underlying_ticker))];
+    if (underlyingTickers.length === 0) return;
+    
+    // Fetch batch analysis
+    api.getBatchAnalysis(underlyingTickers)
+      .then(analysisData => {
+        const analysisMap: Record<string, StockAnalysisData> = {};
+        for (const ticker of underlyingTickers) {
+          const data = analysisData[ticker];
+          
+          // Calculate RSI from price history if available
+          let rsiValue: number | null = null;
+          const tickerHistory = cacheHistory.get(ticker);
+          if (tickerHistory?.history && tickerHistory.history.length > 0) {
+            const rsiResult = calculateRSI(tickerHistory.history);
+            rsiValue = rsiResult?.value ?? null;
+          }
+          
+          if (data?.options || data?.fundamentals) {
+            analysisMap[ticker] = {
+              iv_percentile: data.options?.iv_percentile,
+              options_sentiment: data.options?.options_sentiment,
+              next_earnings_date: data.fundamentals?.next_earnings_date,
+              rsi: rsiValue,
+            };
+          } else {
+            // At least include RSI if we have it
+            analysisMap[ticker] = {
+              rsi: rsiValue,
+            };
+          }
+        }
+        setOptionUnderlyingAnalysis(analysisMap);
+      })
+      .catch(err => {
+        console.error('Failed to fetch analysis for option underlyings:', err);
+      });
+  }, [optionHoldings, cacheHistory]);
 
   const handleAddOption = async (option: OptionHoldingCreate) => {
     await api.addOptionHolding(option);
@@ -404,36 +485,98 @@ function App() {
                     </button>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                    {sortedHoldings.map((holding, index) => {
-                      const chartData = holdingChartData[holding.ticker];
-                      return (
-                        <div 
-                          key={holding.id} 
-                          className="fade-in"
-                          style={{ animationDelay: `${0.1 * (index + 1)}s` }}
-                        >
-                          <SectionErrorBoundary sectionName={`${holding.ticker} card`}>
-                            <HoldingCard
-                              holding={holding}
-                              history={chartData?.history ?? []}
-                              referenceClose={chartData?.referenceClose ?? null}
-                              isDataComplete={chartData?.isComplete ?? false}
-                              expectedStart={chartData?.expectedStart ?? null}
-                              actualStart={chartData?.actualStart ?? null}
-                              onDelete={removeHolding}
-                              onSelect={setSelectedTicker}
-                              onAnalyze={setAnalyzeTicker}
-                              onUpdatePosition={handleUpdatePosition}
-                              onRefreshHistory={handleRefreshHistory}
-                              isRefreshing={false}
-                              isHistoryLoading={!chartData}
-                              lastPricesFetched={lastPricesFetched}
-                            />
-                          </SectionErrorBoundary>
+                  <div className="space-y-6">
+                    {/* Pinned Holdings Section */}
+                    {pinnedHoldings.length > 0 && (
+                      <div>
+                        <div className="flex items-center gap-2 mb-3">
+                          <Pin className="w-4 h-4 text-accent-cyan" />
+                          <span className="text-sm font-medium text-white/70">Pinned</span>
+                          <span className="text-white/30 text-xs">({pinnedHoldings.length})</span>
                         </div>
-                      );
-                    })}
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                          {pinnedHoldings.map((holding, index) => {
+                            const chartData = holdingChartData[holding.ticker];
+                            return (
+                              <div 
+                                key={holding.id} 
+                                className="fade-in"
+                                style={{ animationDelay: `${0.1 * (index + 1)}s` }}
+                              >
+                                <SectionErrorBoundary sectionName={`${holding.ticker} card`}>
+                                  <HoldingCard
+                                    holding={holding}
+                                    history={chartData?.history ?? []}
+                                    referenceClose={chartData?.referenceClose ?? null}
+                                    isDataComplete={chartData?.isComplete ?? false}
+                                    expectedStart={chartData?.expectedStart ?? null}
+                                    actualStart={chartData?.actualStart ?? null}
+                                    onDelete={removeHolding}
+                                    onSelect={setSelectedTicker}
+                                    onAnalyze={setAnalyzeTicker}
+                                    onUpdatePosition={handleUpdatePosition}
+                                    onRefreshHistory={handleRefreshHistory}
+                                    onTogglePin={handleTogglePin}
+                                    isRefreshing={false}
+                                    isHistoryLoading={!chartData}
+                                    lastPricesFetched={lastPricesFetched}
+                                    high52w={holding.high_52w}
+                                    low52w={holding.low_52w}
+                                  />
+                                </SectionErrorBoundary>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Unpinned Holdings Section */}
+                    {unpinnedHoldings.length > 0 && (
+                      <div>
+                        {pinnedHoldings.length > 0 && (
+                          <div className="flex items-center gap-2 mb-3">
+                            <Briefcase className="w-4 h-4 text-white/50" />
+                            <span className="text-sm font-medium text-white/50">Other Holdings</span>
+                            <span className="text-white/30 text-xs">({unpinnedHoldings.length})</span>
+                          </div>
+                        )}
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                          {unpinnedHoldings.map((holding, index) => {
+                            const chartData = holdingChartData[holding.ticker];
+                            return (
+                              <div 
+                                key={holding.id} 
+                                className="fade-in"
+                                style={{ animationDelay: `${0.1 * (index + 1 + pinnedHoldings.length)}s` }}
+                              >
+                                <SectionErrorBoundary sectionName={`${holding.ticker} card`}>
+                                  <HoldingCard
+                                    holding={holding}
+                                    history={chartData?.history ?? []}
+                                    referenceClose={chartData?.referenceClose ?? null}
+                                    isDataComplete={chartData?.isComplete ?? false}
+                                    expectedStart={chartData?.expectedStart ?? null}
+                                    actualStart={chartData?.actualStart ?? null}
+                                    onDelete={removeHolding}
+                                    onSelect={setSelectedTicker}
+                                    onAnalyze={setAnalyzeTicker}
+                                    onUpdatePosition={handleUpdatePosition}
+                                    onRefreshHistory={handleRefreshHistory}
+                                    onTogglePin={handleTogglePin}
+                                    isRefreshing={false}
+                                    isHistoryLoading={!chartData}
+                                    lastPricesFetched={lastPricesFetched}
+                                    high52w={holding.high_52w}
+                                    low52w={holding.low_52w}
+                                  />
+                                </SectionErrorBoundary>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -512,6 +655,7 @@ function App() {
                           <OptionHoldingCard
                             option={option}
                             onDelete={handleDeleteOption}
+                            stockAnalysis={optionUnderlyingAnalysis[option.underlying_ticker]}
                           />
                         </SectionErrorBoundary>
                       </div>
@@ -545,13 +689,18 @@ function App() {
         />
 
         {/* Stock Analysis Modal - uses shared cache with ActionScoreBadge */}
-        {analyzeTicker && (
-          <StockAnalysisModal
-            ticker={analyzeTicker}
-            onClose={() => setAnalyzeTicker(null)}
-            currentPrice={portfolio?.holdings.find(h => h.ticker === analyzeTicker)?.current_price}
-          />
-        )}
+        {analyzeTicker && (() => {
+          const holding = portfolio?.holdings.find(h => h.ticker === analyzeTicker);
+          return (
+            <StockAnalysisModal
+              ticker={analyzeTicker}
+              onClose={() => setAnalyzeTicker(null)}
+              currentPrice={holding?.current_price}
+              high52w={holding?.high_52w}
+              low52w={holding?.low_52w}
+            />
+          );
+        })()}
 
         {/* Stock Compare Modal - overlay multiple holdings on one chart */}
         <StockCompareModal

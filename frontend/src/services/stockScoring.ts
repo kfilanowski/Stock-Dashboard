@@ -39,13 +39,17 @@ import {
 type WeightMatrix = Record<MetricType, Record<ActionType, number>>;
 
 /**
- * OPTIMIZED WEIGHT MATRIX
+ * OPTIMIZED WEIGHT MATRIX v2.0
  * 
  * Key Design Principles:
  * 1. MULTICOLLINEARITY REDUCTION: Momentum weight reduced since MACD/RSI capture velocity
  * 2. STRATEGY SEPARATION: Long Gamma (buyCall/buyPut) vs Short Vega (openCSP/openCC)
  *    have distinct factor exposures
  * 3. REGIME AWARENESS: ADX and BollingerSqueeze now included for regime detection
+ * 4. VALUE vs TREND: Context switch logic handles SMA alignment dynamically
+ * 5. DIVERGENCE DETECTION: Fakeout detection via price-volume divergence
+ * 6. SMART MONEY TRACKING: CMF (Chaikin Money Flow) for accumulation/distribution
+ * 7. ALPHA FACTOR: Relative strength vs market (leaders vs laggards)
  * 
  * Greeks alignment:
  * - buyCall/buyPut: Long Gamma, Long Vega → favor ADX trending + squeeze (cheap vol)
@@ -238,6 +242,54 @@ const DEFAULT_WEIGHTS: WeightMatrix = {
     openCC: 0.6,
     buyCall: 0.5,
     buyPut: 0.5
+  },
+  
+  // ============================================================================
+  // NEW: Advanced Predictive Metrics
+  // ============================================================================
+  
+  // CMF (Chaikin Money Flow): Accumulation/Distribution detection
+  // Tracks "smart money" behavior before price moves
+  cmf: {
+    buyShares: 1.8,   // HIGH - accumulation is bullish signal
+    sellShares: 1.5,  // Important - distribution is sell signal
+    openCSP: 1.2,     // Moderate - accumulation good for puts
+    openCC: 1.0,
+    buyCall: 2.0,     // CRITICAL - accumulation precedes breakouts
+    buyPut: 2.0       // Distribution precedes breakdowns
+  },
+  
+  // Divergence: Price-Volume divergence detection
+  // Detects "fakeouts" where price and volume disagree
+  divergence: {
+    buyShares: 1.5,   // Important - avoid buying fakeouts
+    sellShares: 1.5,
+    openCSP: 1.0,     // Moderate consideration
+    openCC: 1.0,
+    buyCall: 2.2,     // CRITICAL - avoid buying calls on bearish divergence
+    buyPut: 2.2
+  },
+  
+  // Alpha: Relative strength vs market (SPY)
+  // Leaders outperform, laggards underperform in corrections
+  alpha: {
+    buyShares: 1.5,   // Important - buy leaders not laggards
+    sellShares: 1.2,
+    openCSP: 0.8,     // Moderate
+    openCC: 0.8,
+    buyCall: 1.8,     // HIGH - need alpha for momentum plays
+    buyPut: 1.8
+  },
+  
+  // Earnings Proximity: Days until next earnings
+  // Technical setups are unreliable near earnings
+  earningsProximity: {
+    buyShares: 0.8,   // Moderate penalty
+    sellShares: 0.5,
+    openCSP: 1.5,     // Important - avoid selling premium into earnings
+    openCC: 1.5,
+    buyCall: 2.0,     // CRITICAL - technicals fail at earnings
+    buyPut: 2.0
   }
 };
 
@@ -265,10 +317,14 @@ const metricLabels: Record<MetricType, string> = {
   rvol: 'Rel. Volume',
   adx: 'ADX (Trend)',
   crossPattern: 'Cross Pattern',
+  cmf: 'Money Flow',
+  divergence: 'Divergence',
+  alpha: 'Alpha (vs SPY)',
   roic: 'ROIC',
   callPutRatio: 'Call/Put Ratio',
   ivPercentile: 'IV Percentile',
-  sectorBeta: 'Sector Beta'
+  sectorBeta: 'Sector Beta',
+  earningsProximity: 'Earnings'
 };
 
 // ============================================================================
@@ -293,7 +349,12 @@ interface SignalResult {
  * - Trending Market (ADX > 25): RSI 65-85 is a "Bull Regime" - strength, not exhaustion
  * - Range-Bound Market (ADX < 20): RSI 70+ is a ceiling - mean reversion applies
  * 
- * This prevents false momentum signals in sideways markets.
+ * NEW: HOOK LOGIC (Falling Knife Protection)
+ * Never buy the STATE of being oversold; buy the EXIT from being oversold.
+ * - RSI < 30 AND rising (hooking up) = Strong buy signal
+ * - RSI < 30 AND falling = Falling knife, avoid!
+ * 
+ * This prevents false momentum signals in sideways markets and falling knives.
  */
 function interpretRSI(
   indicators: TechnicalIndicators, 
@@ -303,6 +364,7 @@ function interpretRSI(
   if (!rsi) return null;
   
   const value = rsi.value;
+  const prevValue = rsi.prevValue;
   const adx = indicators.adx;
   const isTrending = adx?.isTrending ?? false; // ADX > 25
   const isStrongTrend = adx?.isStrongTrend ?? false; // ADX > 40
@@ -310,6 +372,66 @@ function interpretRSI(
   
   let signal = 0;
   let reasoning = '';
+  
+  // ============================================================================
+  // HOOK LOGIC: Falling Knife Protection (NEW)
+  // ============================================================================
+  
+  // For bullish actions, apply hook logic in oversold territory
+  const bullishActions: ActionType[] = ['buyShares', 'openCSP', 'buyCall'];
+  
+  if (bullishActions.includes(action) && value <= 35 && prevValue !== null) {
+    if (value > prevValue) {
+      // RSI is turning UP from oversold - this is the signal to buy
+      const hookStrength = Math.min((prevValue <= 30 ? 0.3 : 0.15), 1);
+      signal = 0.7 + hookStrength;
+      reasoning = `Oversold + Hooking Up (${prevValue.toFixed(0)}→${value.toFixed(0)})`;
+      
+      return {
+        signal: Math.max(-1, Math.min(1, signal)),
+        rawValue: `RSI: ${value.toFixed(1)}`,
+        reasoning
+      };
+    } else if (value < prevValue) {
+      // RSI is still falling - FALLING KNIFE, drastically reduce signal
+      signal = value <= 20 ? 0.1 : 0.2; // Very weak - don't catch knives
+      reasoning = `Oversold but FALLING (${prevValue.toFixed(0)}→${value.toFixed(0)}) - Knife risk`;
+      
+      return {
+        signal,
+        rawValue: `RSI: ${value.toFixed(1)}`,
+        reasoning
+      };
+    }
+  }
+  
+  // For bearish actions, apply inverse hook logic in overbought territory
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
+  
+  if (bearishActions.includes(action) && value >= 65 && prevValue !== null) {
+    if (value < prevValue) {
+      // RSI is turning DOWN from overbought - this is the signal to sell/short
+      const hookStrength = Math.min((prevValue >= 70 ? 0.3 : 0.15), 1);
+      signal = 0.7 + hookStrength;
+      reasoning = `Overbought + Hooking Down (${prevValue.toFixed(0)}→${value.toFixed(0)})`;
+      
+      return {
+        signal: Math.max(-1, Math.min(1, signal)),
+        rawValue: `RSI: ${value.toFixed(1)}`,
+        reasoning
+      };
+    } else if (value > prevValue) {
+      // RSI still rising - don't short yet
+      signal = value >= 80 ? 0.2 : 0.1;
+      reasoning = `Overbought but RISING (${prevValue.toFixed(0)}→${value.toFixed(0)}) - Wait for turn`;
+      
+      return {
+        signal,
+        rawValue: `RSI: ${value.toFixed(1)}`,
+        reasoning
+      };
+    }
+  }
   
   // ============================================================================
   // REGIME-AWARE MOMENTUM OVERRIDE (Cardwell/Brown Range Shift Theory)
@@ -402,7 +524,6 @@ function interpretRSI(
   }
   
   // Adjust signal direction based on action
-  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
   if (bearishActions.includes(action)) {
     signal = -signal;
   }
@@ -1035,6 +1156,14 @@ export interface AdditionalAnalysisData {
   // Sector correlation
   sectorCorrelation?: number | null;  // -1 to 1
   betaToSector?: number | null;
+  
+  // NEW: Alpha / Relative Strength
+  alpha?: number | null;              // Stock % change - SPY % change (relative strength)
+  spyChange?: number | null;          // SPY % change for context
+  
+  // NEW: Earnings Proximity
+  daysToEarnings?: number | null;     // Days until next earnings announcement
+  nextEarningsDate?: string | null;   // ISO date of next earnings
 }
 
 /**
@@ -1275,6 +1404,263 @@ function interpretSectorBeta(
   };
 }
 
+/**
+ * Interpret Chaikin Money Flow (CMF) for accumulation/distribution.
+ * 
+ * CMF is a LEADING indicator that detects institutional buying/selling
+ * BEFORE price moves manifest. This is the "smart money" signal.
+ * 
+ * - CMF > 0.25: Strong accumulation (institutions aggressively buying)
+ * - CMF > 0.1: Accumulation (buying pressure)
+ * - CMF -0.1 to 0.1: Neutral
+ * - CMF < -0.1: Distribution (selling pressure)
+ * - CMF < -0.25: Strong distribution (institutions aggressively selling)
+ */
+function interpretCMF(
+  indicators: TechnicalIndicators,
+  action: ActionType
+): SignalResult | null {
+  const cmf = indicators.cmf;
+  if (!cmf) return null;
+  
+  let signal = 0;
+  let reasoning = '';
+  
+  const { value, interpretation, volumeStrength, closeLocation } = cmf;
+  
+  // Base signal from CMF value
+  if (interpretation === 'strong_accumulation') {
+    signal = 1.0;
+    reasoning = `Strong accumulation (${(value * 100).toFixed(0)}%)`;
+  } else if (interpretation === 'accumulation') {
+    signal = 0.6;
+    reasoning = `Accumulation (${(value * 100).toFixed(0)}%)`;
+  } else if (interpretation === 'neutral') {
+    signal = value * 2; // Slight lean based on value
+    reasoning = `Neutral money flow (${(value * 100).toFixed(0)}%)`;
+  } else if (interpretation === 'distribution') {
+    signal = -0.6;
+    reasoning = `Distribution (${(value * 100).toFixed(0)}%)`;
+  } else {
+    signal = -1.0;
+    reasoning = `Strong distribution (${(value * 100).toFixed(0)}%)`;
+  }
+  
+  // Volume strength modifier
+  if (volumeStrength === 'high') {
+    signal *= 1.2; // High volume confirms the signal
+    reasoning += ', high volume';
+  } else if (volumeStrength === 'low') {
+    signal *= 0.6; // Low volume weakens the signal
+    reasoning += ', low volume';
+  }
+  
+  // Close location provides additional context
+  if (closeLocation > 0.8 && value > 0) {
+    reasoning += ', closed near high';
+  } else if (closeLocation < 0.2 && value < 0) {
+    reasoning += ', closed near low';
+  }
+  
+  // Invert for bearish actions
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
+  if (bearishActions.includes(action)) {
+    signal = -signal;
+  }
+  
+  return {
+    signal: Math.max(-1, Math.min(1, signal)),
+    rawValue: `CMF: ${(value * 100).toFixed(0)}%`,
+    reasoning
+  };
+}
+
+/**
+ * Interpret Price-Volume Divergence.
+ * 
+ * Divergence is one of the MOST powerful predictive signals.
+ * It detects "fakeouts" where price action and volume disagree.
+ * 
+ * BEARISH DIVERGENCE (Fakeout Warning):
+ * - Price makes new high, but volume is LOWER than previous high
+ * - Smart money is NOT participating in the new high
+ * - High probability of reversal
+ * 
+ * BULLISH DIVERGENCE (Reversal Signal):
+ * - Price makes new low, but volume is LOWER than previous low
+ * - Selling exhaustion - bears are running out of ammunition
+ */
+function interpretDivergence(
+  indicators: TechnicalIndicators,
+  action: ActionType
+): SignalResult | null {
+  const divergence = indicators.divergence;
+  if (!divergence) return null;
+  
+  let signal = 0;
+  let reasoning = divergence.description;
+  
+  const { hasBullishDivergence, hasBearishDivergence, divergenceStrength } = divergence;
+  
+  // Divergence signals are CONTRA-INDICATORS
+  // Bearish divergence = bearish for bullish actions
+  // Bullish divergence = bullish for bullish actions
+  
+  if (hasBearishDivergence) {
+    // Price high on low volume = FAKEOUT WARNING
+    const strength = divergenceStrength === 'strong' ? -0.9 : -0.6;
+    signal = strength;
+  } else if (hasBullishDivergence) {
+    // Price low on low volume = selling exhaustion
+    const strength = divergenceStrength === 'strong' ? 0.8 : 0.5;
+    signal = strength;
+  } else {
+    // No divergence - neutral
+    signal = 0;
+    reasoning = 'No divergence';
+  }
+  
+  // Invert for bearish actions
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
+  if (bearishActions.includes(action)) {
+    signal = -signal;
+  }
+  
+  return {
+    signal: Math.max(-1, Math.min(1, signal)),
+    rawValue: divergence.volumeDivergence !== 'none' 
+      ? `${divergence.volumeDivergence} div.` 
+      : 'No div.',
+    reasoning
+  };
+}
+
+/**
+ * Interpret Alpha (Relative Strength vs Market).
+ * 
+ * A stock rising 1% on a day the SPY rises 3% is actually showing WEAKNESS.
+ * It is a "laggard" that will likely drop first in a correction.
+ * 
+ * Alpha = Stock % Change - SPY % Change
+ * - Positive alpha: Stock is a LEADER (outperforming market)
+ * - Negative alpha: Stock is a LAGGARD (underperforming market)
+ * 
+ * You want to own leaders, not laggards.
+ */
+function interpretAlpha(
+  additionalData: AdditionalAnalysisData | undefined,
+  action: ActionType
+): SignalResult | null {
+  if (additionalData?.alpha === undefined || additionalData?.alpha === null) return null;
+  
+  const alpha = additionalData.alpha;
+  let signal = 0;
+  let reasoning = '';
+  
+  // Alpha interpretation:
+  // > 5%: Strong outperformance (leader)
+  // 2-5%: Moderate outperformance
+  // -2% to 2%: In line with market
+  // -5% to -2%: Moderate underperformance
+  // < -5%: Strong underperformance (laggard)
+  
+  if (alpha > 5) {
+    signal = 1.0;
+    reasoning = `Strong leader (+${alpha.toFixed(1)}% vs SPY)`;
+  } else if (alpha > 2) {
+    signal = 0.6;
+    reasoning = `Outperforming (+${alpha.toFixed(1)}% vs SPY)`;
+  } else if (alpha >= -2) {
+    signal = alpha / 5; // Slight lean based on alpha
+    reasoning = `In line with market (${alpha >= 0 ? '+' : ''}${alpha.toFixed(1)}% vs SPY)`;
+  } else if (alpha >= -5) {
+    signal = -0.5;
+    reasoning = `Underperforming (${alpha.toFixed(1)}% vs SPY)`;
+  } else {
+    signal = -0.9;
+    reasoning = `Laggard (${alpha.toFixed(1)}% vs SPY)`;
+  }
+  
+  // Invert for bearish actions (laggards are good short candidates)
+  const bearishActions: ActionType[] = ['sellShares', 'openCC', 'buyPut'];
+  if (bearishActions.includes(action)) {
+    signal = -signal;
+  }
+  
+  return {
+    signal: Math.max(-1, Math.min(1, signal)),
+    rawValue: `α: ${alpha >= 0 ? '+' : ''}${alpha.toFixed(1)}%`,
+    reasoning
+  };
+}
+
+/**
+ * Interpret Earnings Proximity.
+ * 
+ * Technical setups are UNRELIABLE near earnings announcements.
+ * A "perfect" technical setup can be completely invalidated by earnings.
+ * 
+ * This is an EARNINGS BLACKOUT signal:
+ * - < 3 days to earnings: CRITICAL penalty (technicals unreliable)
+ * - 3-7 days: Moderate penalty
+ * - 7-14 days: Slight caution
+ * - > 14 days: No penalty
+ * 
+ * Especially important for options (IV crush risk).
+ */
+function interpretEarningsProximity(
+  additionalData: AdditionalAnalysisData | undefined,
+  action: ActionType
+): SignalResult | null {
+  if (additionalData?.daysToEarnings === undefined || additionalData?.daysToEarnings === null) {
+    return null;
+  }
+  
+  const days = additionalData.daysToEarnings;
+  let signal = 0;
+  let reasoning = '';
+  
+  // Earnings blackout zones
+  if (days <= 0) {
+    // Earnings today or already passed - could be post-earnings move
+    signal = -0.3;
+    reasoning = `Earnings ${days === 0 ? 'today' : 'passed'} - IV crush risk`;
+  } else if (days <= 3) {
+    // DANGER ZONE: Technicals are unreliable
+    signal = -0.8;
+    reasoning = `Earnings in ${days} day${days === 1 ? '' : 's'} - technicals unreliable`;
+  } else if (days <= 7) {
+    // Caution zone
+    signal = -0.4;
+    reasoning = `Earnings in ${days} days - elevated uncertainty`;
+  } else if (days <= 14) {
+    // Slight caution
+    signal = -0.1;
+    reasoning = `Earnings in ${days} days`;
+  } else {
+    // Clear of earnings
+    signal = 0.1;
+    reasoning = `Earnings ${days}+ days away - technicals reliable`;
+  }
+  
+  // Options are MORE sensitive to earnings (IV crush)
+  const optionActions: ActionType[] = ['openCSP', 'openCC', 'buyCall', 'buyPut'];
+  if (optionActions.includes(action)) {
+    if (days <= 3) {
+      signal = -1.0; // Maximum penalty for options near earnings
+      reasoning += ' (IV crush risk)';
+    } else if (days <= 7) {
+      signal *= 1.5; // Amplify penalty
+    }
+  }
+  
+  return {
+    signal: Math.max(-1, Math.min(1, signal)),
+    rawValue: days <= 0 ? 'Earnings passed' : `${days}d to ER`,
+    reasoning
+  };
+}
+
 // ============================================================================
 // Main Scoring Functions
 // ============================================================================
@@ -1285,8 +1671,9 @@ const ALL_ACTIONS: ActionType[] = [
 
 const ALL_METRICS: MetricType[] = [
   'rsi', 'macd', 'bollingerBands', 'bollingerSqueeze', 'vwap', 'momentum', 
-  'volume', 'pricePosition', 'smaAlignment', 'rvol', 'adx', 'crossPattern', 
-  'roic', 'callPutRatio', 'ivPercentile', 'sectorBeta'
+  'volume', 'pricePosition', 'smaAlignment', 'rvol', 'adx', 'crossPattern',
+  'cmf', 'divergence', 'alpha',  // NEW: Leading indicators
+  'roic', 'callPutRatio', 'ivPercentile', 'sectorBeta', 'earningsProximity'
 ];
 
 /**
@@ -1324,6 +1711,14 @@ function getSignalForMetric(
       return interpretADX(indicators, action);
     case 'crossPattern':
       return interpretCrossPattern(indicators, action);
+    // NEW: Leading indicators
+    case 'cmf':
+      return interpretCMF(indicators, action);
+    case 'divergence':
+      return interpretDivergence(indicators, action);
+    case 'alpha':
+      return interpretAlpha(additionalData, action);
+    // External data
     case 'roic':
       return interpretROIC(additionalData, action);
     case 'callPutRatio':
@@ -1332,9 +1727,113 @@ function getSignalForMetric(
       return interpretIVPercentile(additionalData, action);
     case 'sectorBeta':
       return interpretSectorBeta(additionalData, action);
+    case 'earningsProximity':
+      return interpretEarningsProximity(additionalData, action);
     default:
       return null;
   }
+}
+
+/**
+ * Detect the trading regime context for buyShares action.
+ * 
+ * This resolves the "Identity Crisis" between Value and Trend strategies.
+ * - TREND mode: Price above SMA50, focus on momentum continuation
+ * - VALUE mode: Price below SMA50, focus on mean reversion
+ * 
+ * In VALUE mode, we REDUCE the weight of SMA alignment (broken trend is expected)
+ * and INCREASE the weight of RSI/Bollinger (oversold conditions).
+ */
+function detectBuyingContext(
+  indicators: TechnicalIndicators,
+  currentPrice: number
+): 'trend' | 'value' | 'neutral' {
+  const sma50 = indicators.sma50;
+  const sma200 = indicators.sma200;
+  const bb = indicators.bollingerBands;
+  const rsi = indicators.rsi;
+  
+  if (!sma50) return 'neutral';
+  
+  // Check for VALUE context (dip buying opportunity)
+  // Price is below SMA50, potentially oversold
+  const priceBelowSma50 = currentPrice < sma50;
+  const priceNearLowerBand = bb ? bb.percentB < 0.3 : false;
+  const isOversold = rsi ? rsi.value < 40 : false;
+  
+  // Check for TREND context (momentum following)
+  const priceAboveSma50 = currentPrice > sma50;
+  const priceAboveSma200 = sma200 ? currentPrice > sma200 : priceAboveSma50;
+  
+  // If price is below SMA50 AND (near lower band OR oversold) = VALUE mode
+  if (priceBelowSma50 && (priceNearLowerBand || isOversold)) {
+    return 'value';
+  }
+  
+  // If price is above both SMAs = TREND mode
+  if (priceAboveSma50 && priceAboveSma200) {
+    return 'trend';
+  }
+  
+  return 'neutral';
+}
+
+/**
+ * Get context-adjusted weights for buyShares action.
+ * 
+ * In VALUE mode (dip buying), we don't want the broken trend to kill the score.
+ * Instead, we focus on oversold conditions and mean reversion signals.
+ */
+function getContextAdjustedWeight(
+  metric: MetricType,
+  action: ActionType,
+  context: 'trend' | 'value' | 'neutral',
+  baseWeight: number
+): number {
+  if (action !== 'buyShares') {
+    return baseWeight;
+  }
+  
+  if (context === 'value') {
+    // VALUE mode: Dip buying - ignore broken trend, focus on oversold
+    switch (metric) {
+      case 'smaAlignment':
+        return baseWeight * 0.2; // Drastically reduce - broken trend is expected
+      case 'crossPattern':
+        return baseWeight * 0.3; // Death cross is expected in a dip
+      case 'rsi':
+        return baseWeight * 2.0; // Heavily weight oversold conditions
+      case 'bollingerBands':
+        return baseWeight * 1.8; // Near lower band is good
+      case 'pricePosition':
+        return baseWeight * 1.5; // Low in range is the point
+      case 'cmf':
+        return baseWeight * 2.0; // Accumulation during dip is key signal
+      case 'divergence':
+        return baseWeight * 1.8; // Bullish divergence is key for dip buying
+      default:
+        return baseWeight;
+    }
+  }
+  
+  if (context === 'trend') {
+    // TREND mode: Momentum following - standard weights apply
+    // Slight boost to trend-following indicators
+    switch (metric) {
+      case 'smaAlignment':
+        return baseWeight * 1.2;
+      case 'macd':
+        return baseWeight * 1.2;
+      case 'adx':
+        return baseWeight * 1.3;
+      case 'pricePosition':
+        return baseWeight * 0.7; // High in range is OK in uptrend
+      default:
+        return baseWeight;
+    }
+  }
+  
+  return baseWeight;
 }
 
 /**
@@ -1351,11 +1850,18 @@ function calculateActionScore(
   let rawScore = 0;
   let availableMetrics = 0;
   
+  // Detect context for buyShares to resolve Value vs Trend identity crisis
+  const buyingContext = action === 'buyShares' 
+    ? detectBuyingContext(indicators, currentPrice)
+    : 'neutral';
+  
   for (const metric of ALL_METRICS) {
     const signalResult = getSignalForMetric(metric, indicators, currentPrice, action, additionalData);
     
     if (signalResult) {
-      const weight = weights[metric][action];
+      // Get context-adjusted weight
+      const baseWeight = weights[metric][action];
+      const weight = getContextAdjustedWeight(metric, action, buyingContext, baseWeight);
       const contribution = signalResult.signal * weight;
       
       signals.push({
@@ -1365,7 +1871,11 @@ function calculateActionScore(
         signal: signalResult.signal,
         weight,
         contribution,
-        reasoning: signalResult.reasoning
+        reasoning: signalResult.reasoning + (
+          buyingContext !== 'neutral' && action === 'buyShares' && weight !== baseWeight
+            ? ` [${buyingContext} mode]`
+            : ''
+        )
       });
       
       rawScore += contribution;
@@ -1481,12 +1991,22 @@ export function analyzeStock(
   if (!indicators.rvol) missingMetrics.push('rvol');
   if (!indicators.adx) missingMetrics.push('adx');
   if (!indicators.crossPattern) missingMetrics.push('crossPattern');
+  // NEW: Leading indicators
+  if (!indicators.cmf) missingMetrics.push('cmf');
+  if (!indicators.divergence) missingMetrics.push('divergence');
+  if (additionalData?.alpha === undefined || additionalData?.alpha === null) {
+    missingMetrics.push('alpha');
+  }
+  // External data
   if (!additionalData?.roic) missingMetrics.push('roic');
   if (!additionalData?.hasOptions) missingMetrics.push('callPutRatio');
   if (additionalData?.ivPercentile === undefined || additionalData?.ivPercentile === null) {
     missingMetrics.push('ivPercentile');
   }
   if (!additionalData?.betaToSector && !additionalData?.sectorCorrelation) missingMetrics.push('sectorBeta');
+  if (additionalData?.daysToEarnings === undefined || additionalData?.daysToEarnings === null) {
+    missingMetrics.push('earningsProximity');
+  }
   
   return {
     ticker,

@@ -254,6 +254,22 @@ class PriceHistoryService:
             logger.info(f"Cleared {deleted_count} intraday records for {ticker}")
             return deleted_count
     
+    def clear_all_intraday_cache(self) -> int:
+        """
+        Clear ALL intraday cache data for all tickers.
+        
+        Useful when there's a systemic data issue affecting multiple tickers.
+        
+        Returns:
+            Number of records deleted.
+        """
+        with Session(self._engine) as session:
+            result = session.execute(delete(IntradayPriceHistory))
+            session.commit()
+            deleted_count = result.rowcount
+            logger.info(f"Cleared ALL intraday records: {deleted_count} total")
+            return deleted_count
+    
     # ============ Incremental Fetch Support ============
     
     def get_latest_intraday_timestamp(
@@ -378,13 +394,22 @@ class PriceHistoryService:
         if not history:
             return []
         
+        # Filter out zero-value candles (no trading activity)
+        valid_history = [
+            h for h in history 
+            if h.get('close', 0) > 0 or (h.get('open', 0) > 0 and h.get('high', 0) > 0)
+        ]
+        
+        if not valid_history:
+            return []
+        
         # Map period to number of trading days
         trading_days_map = {"1d": 1, "3d": 3, "1w": 5, "1mo": 21}
         target_days = trading_days_map.get(period, 1)
         
         # Group by date
         by_date: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        for h in history:
+        for h in valid_history:
             ts = h.get('timestamp')
             if ts:
                 date_key = ts.strftime('%Y-%m-%d')
@@ -588,8 +613,10 @@ class PriceHistoryService:
             current_ts = point['timestamp']
             gap_minutes = (current_ts - prev_ts).total_seconds() / 60
             
-            # Only consider large gaps (at least 1 hour or 15 intervals)
-            gap_threshold = max(60, interval_minutes * 15)
+            # Flag gaps that are significant but reasonable to fill
+            # - At least 20 minutes or 5 intervals (whichever is larger)
+            # - This catches 30-minute gaps while avoiding tiny blips
+            gap_threshold = max(20, interval_minutes * 5)
             if gap_minutes > gap_threshold:
                 # Skip overnight/weekend gaps
                 prev_date = prev_ts.date()
@@ -598,21 +625,55 @@ class PriceHistoryService:
                 # If same day and both during trading hours, it's a real gap
                 if prev_date == curr_date:
                     if is_trading_hours(prev_ts) and is_trading_hours(current_ts):
+                        logger.info(
+                            f"Detected intraday gap for {ticker}: {prev_ts} to {current_ts} "
+                            f"({gap_minutes:.0f} min)"
+                        )
                         missing_ranges.append((
                             prev_ts + timedelta(minutes=interval_minutes),
                             current_ts - timedelta(minutes=interval_minutes)
                         ))
-                # Different days - only flag if it's not a normal overnight gap
-                # (e.g., missing data from Friday afternoon or Monday morning within same week)
-                elif (curr_date - prev_date).days == 1:
-                    # Consecutive days - check if gap spans expected close to open
-                    # Normal overnight: 8pm to 4am = expected
-                    # But if prev_ts is 2pm and curr_ts is 10am, that's abnormal
-                    prev_after_close = prev_ts.hour >= 20
-                    curr_before_open = current_ts.hour < 4
-                    if not (prev_after_close or curr_before_open):
-                        # Unusual gap - might be missing data
-                        if is_trading_hours(prev_ts) and is_trading_hours(current_ts):
+                # Different days - check for multi-day gaps
+                else:
+                    days_gap = (curr_date - prev_date).days
+                    
+                    # For consecutive days (1 day gap), check if it's a normal overnight
+                    if days_gap == 1:
+                        # Normal overnight: 8pm to 4am = expected
+                        prev_after_close = prev_ts.hour >= 20
+                        curr_before_open = current_ts.hour < 4
+                        if not (prev_after_close or curr_before_open):
+                            # Unusual gap within 1 day
+                            if is_trading_hours(prev_ts) and is_trading_hours(current_ts):
+                                logger.info(
+                                    f"Detected overnight gap for {ticker}: {prev_ts} to {current_ts}"
+                                )
+                                missing_ranges.append((
+                                    prev_ts + timedelta(minutes=interval_minutes),
+                                    current_ts - timedelta(minutes=interval_minutes)
+                                ))
+                    
+                    # Multi-day gap (2+ days) - this is a significant gap
+                    # Could be weekend (2 days Fri->Mon is normal), or actual missing data
+                    elif days_gap >= 2:
+                        # Calculate expected gap: weekend = Fri 8pm to Mon 4am (valid)
+                        # Any other multi-day gap is suspicious
+                        prev_weekday = prev_ts.weekday()
+                        curr_weekday = current_ts.weekday()
+                        
+                        # Normal weekend gap: Friday (4) to Monday (0) = 3 days or Sat to Mon
+                        is_weekend_gap = (
+                            prev_weekday == 4 and curr_weekday == 0 and days_gap <= 3
+                        ) or (
+                            prev_weekday == 5 and curr_weekday == 0 and days_gap <= 2
+                        )
+                        
+                        if not is_weekend_gap:
+                            # This is a real multi-day gap - data is missing
+                            logger.warning(
+                                f"Detected multi-day gap for {ticker}: {prev_ts} to {current_ts} "
+                                f"({days_gap} days, weekdays {prev_weekday}->{curr_weekday})"
+                            )
                             missing_ranges.append((
                                 prev_ts + timedelta(minutes=interval_minutes),
                                 current_ts - timedelta(minutes=interval_minutes)
@@ -637,6 +698,118 @@ class PriceHistoryService:
         elif interval.endswith('h'):
             return int(interval[:-1]) * 60
         return 1  # Default to 1 minute
+    
+    def check_intraday_data_quality(self, ticker: str, interval: str) -> Dict[str, Any]:
+        """
+        Check if intraday data for a ticker has unfillable gaps.
+        
+        yfinance only provides limited intraday history:
+        - 1m: ~7 days
+        - 5m: ~60 days
+        - 15m/30m: ~60 days
+        - 1h: ~730 days
+        
+        If there are gaps from before the available window, we should clear
+        the data and start fresh rather than showing gaps.
+        
+        Returns:
+            Dict with:
+            - has_gaps: bool
+            - gap_count: int
+            - oldest_gap_date: date or None
+            - should_clear: bool (True if gaps are unfillable)
+        """
+        ticker = ticker.upper()
+        
+        # Approximate days of intraday data available from yfinance
+        available_days = {
+            '1m': 7,
+            '5m': 60,
+            '15m': 60,
+            '30m': 60,
+            '60m': 730,
+            '1h': 730,
+        }
+        
+        max_days = available_days.get(interval, 60)
+        now = datetime.now()
+        start_time = now - timedelta(days=max_days + 5)  # Buffer
+        
+        # Analyze coverage
+        coverage = self.analyze_intraday_coverage(ticker, interval, start_time, now)
+        
+        if not coverage['has_data']:
+            return {
+                "has_gaps": False,
+                "gap_count": 0,
+                "oldest_gap_date": None,
+                "should_clear": False,
+                "reason": "no data"
+            }
+        
+        missing_ranges = coverage.get('missing_ranges', [])
+        
+        if not missing_ranges:
+            return {
+                "has_gaps": False,
+                "gap_count": 0,
+                "oldest_gap_date": None,
+                "should_clear": False,
+                "reason": "no gaps"
+            }
+        
+        # Find the oldest gap
+        oldest_gap = min(r[0] for r in missing_ranges)
+        oldest_gap_date = oldest_gap.date()
+        
+        # Determine if gaps are fillable
+        # Gap is unfillable if it's older than the available data window
+        cutoff_date = (now - timedelta(days=max_days)).date()
+        has_unfillable_gaps = oldest_gap_date < cutoff_date
+        
+        return {
+            "has_gaps": True,
+            "gap_count": len(missing_ranges),
+            "oldest_gap_date": oldest_gap_date.isoformat(),
+            "should_clear": has_unfillable_gaps,
+            "reason": f"{'unfillable' if has_unfillable_gaps else 'fillable'} gaps from {oldest_gap_date}",
+            "available_days": max_days,
+            "cutoff_date": cutoff_date.isoformat()
+        }
+    
+    def auto_cleanup_gapped_intraday(self) -> Dict[str, int]:
+        """
+        Automatically clear intraday data that has unfillable gaps.
+        
+        This should be called on startup to ensure clean data.
+        
+        Returns:
+            Dict of ticker -> deleted count
+        """
+        # Get all tickers with intraday data
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT DISTINCT ticker, interval FROM intraday_price_history"
+            )
+            ticker_intervals = cursor.fetchall()
+        
+        cleared = {}
+        
+        for ticker, interval in ticker_intervals:
+            quality = self.check_intraday_data_quality(ticker, interval)
+            
+            if quality.get('should_clear', False):
+                logger.warning(
+                    f"Auto-clearing gapped intraday data for {ticker} ({interval}): "
+                    f"{quality.get('reason')}"
+                )
+                deleted = self.clear_intraday_cache(ticker)
+                cleared[ticker] = deleted
+        
+        if cleared:
+            logger.info(f"Auto-cleanup cleared intraday data for {len(cleared)} tickers")
+        
+        return cleared
 
 
 # Singleton instance

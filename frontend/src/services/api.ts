@@ -98,6 +98,7 @@ export async function deleteHolding(holdingId: number): Promise<void> {
 export interface UpdateHoldingData {
   shares?: number;
   avg_cost?: number | null;
+  is_pinned?: boolean;
 }
 
 /**
@@ -153,6 +154,42 @@ export async function getStockHistory(ticker: string, period: string = '1y'): Pr
   return handleResponse<StockHistoryResponse>(response);
 }
 
+export interface BatchHistoryData {
+  history: Array<{
+    date: string;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+  }>;
+  reference_close: number | null;
+  is_complete: boolean;
+  from_cache: boolean;
+}
+
+/**
+ * Get historical data for multiple tickers in one efficient batch call.
+ * 
+ * This endpoint checks SQLite cache first and only fetches missing data
+ * from the API. Uses yf.download() for intraday and yahooquery for daily
+ * periods to batch requests efficiently.
+ * 
+ * @param tickers - Array of ticker symbols
+ * @param period - Time period (1d, 3d, 1w, 1mo, 3mo, 6mo, ytd, 1y, 2y, 5y)
+ * @returns Dict of ticker -> history data
+ */
+export async function getBatchHistory(
+  tickers: string[], 
+  period: string = '1d'
+): Promise<Record<string, BatchHistoryData>> {
+  if (!tickers.length) return {};
+  
+  const tickerStr = tickers.join(',');
+  const response = await fetch(`${API_BASE}/history/batch?tickers=${encodeURIComponent(tickerStr)}&period=${period}`);
+  return handleResponse<Record<string, BatchHistoryData>>(response);
+}
+
 /**
  * Clear all cached price history for a stock (forces full refresh).
  */
@@ -161,6 +198,29 @@ export async function clearStockHistory(ticker: string): Promise<void> {
     method: 'DELETE',
   });
   return handleResponse<void>(response);
+}
+
+/**
+ * Clear ALL intraday chart cache for ALL tickers.
+ * Use when there's a systemic data issue (like a gap affecting all holdings).
+ */
+export async function clearAllIntradayCache(): Promise<{ message: string; records_deleted: number }> {
+  const response = await fetch(`${API_BASE}/cache/intraday`, {
+    method: 'DELETE',
+  });
+  return handleResponse<{ message: string; records_deleted: number }>(response);
+}
+
+/**
+ * Automatically detect and clear intraday data with unfillable gaps.
+ * This is useful after the app has been offline for a while - gaps from
+ * too long ago can't be filled from the API, so we clear that data.
+ */
+export async function cleanupGappedData(): Promise<{ message: string; cleared_tickers: Record<string, number> }> {
+  const response = await fetch(`${API_BASE}/cache/cleanup-gaps`, {
+    method: 'POST',
+  });
+  return handleResponse<{ message: string; cleared_tickers: Record<string, number> }>(response);
 }
 
 // ============================================================================
@@ -184,6 +244,8 @@ export interface BatchPriceData {
   change_pct: number;
   market_state: string;
   chart_point: ChartPoint | null;
+  high_52w: number | null;
+  low_52w: number | null;
 }
 
 /**
@@ -220,6 +282,7 @@ export interface StockFundamentals {
   market_cap: number | null;
   forward_pe: number | null;
   dividend_yield: number | null;
+  next_earnings_date: string | null;  // ISO date string for next earnings report
 }
 
 export interface StockOptionsData {
@@ -261,6 +324,17 @@ export interface StockAnalysisData {
 export async function getStockAnalysis(ticker: string): Promise<StockAnalysisData> {
   const response = await fetch(`${API_BASE}/stock/${ticker}/analysis`);
   return handleResponse<StockAnalysisData>(response);
+}
+
+/**
+ * Get analysis data for multiple stocks in one batch call.
+ * Efficiently fetches fundamentals and options data.
+ */
+export async function getBatchAnalysis(tickers: string[]): Promise<Record<string, StockAnalysisData>> {
+  if (!tickers.length) return {};
+  const tickerStr = tickers.join(',');
+  const response = await fetch(`${API_BASE}/analysis/batch?tickers=${encodeURIComponent(tickerStr)}`);
+  return handleResponse<Record<string, StockAnalysisData>>(response);
 }
 
 /**

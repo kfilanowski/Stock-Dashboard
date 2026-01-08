@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Date, ForeignKey, UniqueConstraint, Index
+from sqlalchemy import Column, Integer, String, Float, DateTime, Date, ForeignKey, UniqueConstraint, Index, Boolean
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from .database import Base
@@ -31,6 +31,7 @@ class Holding(Base):
     shares = Column(Float, nullable=False, default=0)  # Number of shares owned
     avg_cost = Column(Float, nullable=True)  # Average cost per share
     added_at = Column(DateTime, default=datetime.utcnow)
+    is_pinned = Column(Boolean, default=False, nullable=False)  # Pin to top of holdings list
     # Legacy column - kept for database compatibility, no longer used
     allocation_pct = Column(Float, nullable=True, default=0)
 
@@ -73,6 +74,50 @@ class IntradayPriceHistory(Base):
         UniqueConstraint('ticker', 'timestamp', 'interval', name='uix_ticker_timestamp_interval'),
         Index('ix_intraday_ticker_interval_time', 'ticker', 'interval', 'timestamp'),
     )
+
+
+class StockAnalysisCache(Base):
+    """
+    Caches stock analysis data (fundamentals, options) with TTL.
+    
+    This data is semi-stale - refreshed every 15 minutes.
+    Fundamentals rarely change, but we want reasonably fresh data.
+    """
+    __tablename__ = "stock_analysis_cache"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String, nullable=False, unique=True, index=True)
+    
+    # Fundamentals
+    sector = Column(String, nullable=True)
+    industry = Column(String, nullable=True)
+    roic = Column(Float, nullable=True)  # Return on Invested Capital (%)
+    roe = Column(Float, nullable=True)   # Return on Equity (%)
+    roa = Column(Float, nullable=True)   # Return on Assets (%)
+    profit_margin = Column(Float, nullable=True)
+    operating_margin = Column(Float, nullable=True)
+    beta = Column(Float, nullable=True)
+    market_cap = Column(Float, nullable=True)
+    forward_pe = Column(Float, nullable=True)
+    dividend_yield = Column(Float, nullable=True)
+    
+    # Options data
+    call_open_interest = Column(Integer, nullable=True)
+    put_open_interest = Column(Integer, nullable=True)
+    call_volume = Column(Integer, nullable=True)
+    put_volume = Column(Integer, nullable=True)
+    call_put_ratio_oi = Column(Float, nullable=True)
+    call_put_ratio_volume = Column(Float, nullable=True)
+    avg_implied_volatility = Column(Float, nullable=True)
+    iv_percentile = Column(Float, nullable=True)
+    options_sentiment = Column(String, nullable=True)  # 'bullish', 'bearish', 'neutral'
+    has_options = Column(Boolean, nullable=True, default=True)
+    
+    # Earnings date (for binary event risk)
+    next_earnings_date = Column(DateTime, nullable=True)
+    
+    # Timestamp for TTL check
+    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
 class OptionHolding(Base):

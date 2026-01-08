@@ -7,7 +7,7 @@ import {
 import type { Holding, HistoryPoint } from '../types';
 import { ChartPeriodSelector, type ChartPeriod } from './ChartPeriodSelector';
 import type { HoldingChartData } from '../hooks/usePortfolio';
-import * as api from '../services/api';
+import { getDataCache } from '../services/dataCache';
 
 // Color palette for multiple stocks (extended for more selections)
 const COMPARE_COLORS = [
@@ -131,6 +131,9 @@ export function StockCompareModal({
   // Local chart data for this modal (fetched when period differs from parent)
   const [localChartData, setLocalChartData] = useState<Record<string, HoldingChartData>>({});
   const [loadingTickers, setLoadingTickers] = useState<Set<string>>(new Set());
+  
+  // Get the singleton cache instance
+  const cache = getDataCache();
 
   // Reset state when modal opens
   useEffect(() => {
@@ -142,6 +145,7 @@ export function StockCompareModal({
   }, [isOpen, initialChartPeriod]);
 
   // Fetch history for selected tickers when period changes
+  // Uses the centralized cache service for efficient fetching
   useEffect(() => {
     if (!isOpen || selectedTickers.size === 0) return;
 
@@ -150,28 +154,43 @@ export function StockCompareModal({
         // Skip if already loading or already have data for this period
         if (loadingTickers.has(ticker)) continue;
         
-        // Check if we need to fetch (period differs from parent data)
-        const parentData = holdingChartData[ticker];
+        // Check if we have local data for this ticker
         const localData = localChartData[ticker];
-        
-        // If we have local data for this ticker, use it
         if (localData) continue;
         
-        // Fetch new data for this period
-        setLoadingTickers(prev => new Set(prev).add(ticker));
-        
-        try {
-          const result = await api.getStockHistory(ticker, chartPeriod);
+        // Check if cache has data for this period
+        const cachedEntry = cache.getHistory(ticker, chartPeriod);
+        if (cachedEntry) {
           setLocalChartData(prev => ({
             ...prev,
             [ticker]: {
-              history: result.history,
-              referenceClose: result.reference_close,
-              isComplete: result.is_complete,
-              expectedStart: result.expected_start,
-              actualStart: result.actual_start
+              history: cachedEntry.history,
+              referenceClose: cachedEntry.referenceClose,
+              isComplete: cachedEntry.isComplete,
+              expectedStart: cachedEntry.expectedStart,
+              actualStart: cachedEntry.actualStart
             }
           }));
+          continue;
+        }
+        
+        // Fetch new data for this period via cache
+        setLoadingTickers(prev => new Set(prev).add(ticker));
+        
+        try {
+          const result = await cache.fetchSingleHistory(ticker, chartPeriod);
+          if (result) {
+            setLocalChartData(prev => ({
+              ...prev,
+              [ticker]: {
+                history: result.history,
+                referenceClose: result.referenceClose,
+                isComplete: result.isComplete,
+                expectedStart: result.expectedStart,
+                actualStart: result.actualStart
+              }
+            }));
+          }
         } catch (err) {
           console.error(`Failed to fetch history for ${ticker}:`, err);
         } finally {
@@ -185,7 +204,7 @@ export function StockCompareModal({
     };
 
     fetchHistoryForTickers();
-  }, [isOpen, selectedTickers, chartPeriod, holdingChartData, localChartData, loadingTickers]);
+  }, [isOpen, selectedTickers, chartPeriod, localChartData, loadingTickers, cache]);
 
   // Clear local data when period changes
   const handlePeriodChange = useCallback((period: ChartPeriod) => {
@@ -431,7 +450,7 @@ export function StockCompareModal({
   }, [viewMode]);
 
   // Custom tooltip
-  const CustomTooltip = useCallback(({ active, payload, label }: any) => {
+  const CustomTooltip = useCallback(({ active, payload }: any) => {
     if (!active || !payload || !payload.length) return null;
     
     const dataPoint = payload[0]?.payload;
@@ -442,7 +461,7 @@ export function StockCompareModal({
     let formattedDate = dateStr;
     if (dateStr.includes(' ')) {
       const [datePart, timePart] = dateStr.split(' ');
-      const [year, month, day] = datePart.split('-').map(Number);
+      const [, month, day] = datePart.split('-').map(Number);
       const [hours, mins] = timePart.split(':').map(Number);
       const ampm = hours >= 12 ? 'PM' : 'AM';
       const hours12 = hours % 12 || 12;
@@ -560,8 +579,6 @@ export function StockCompareModal({
             
             <div className="space-y-2 max-h-80 overflow-y-auto pr-2">
               {sortedHoldings.map((holding) => {
-                const chartData = getChartData(holding.ticker);
-                const hasData = chartData?.history?.length > 0 || holdingChartData[holding.ticker]?.history?.length > 0;
                 const isSelected = selectedTickers.has(holding.ticker);
                 const isLoading = loadingTickers.has(holding.ticker);
                 const color = isSelected ? getTickerColor(holding.ticker) : undefined;

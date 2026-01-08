@@ -53,8 +53,11 @@ export function calculateEMA(prices: number[], period: number): number | null {
 
 export interface RSIResult {
   value: number;        // 0-100 scale
+  prevValue: number | null;  // Previous period RSI for "hook" detection
   isOversold: boolean;  // < 30
   isOverbought: boolean; // > 70
+  isHookingUp: boolean;     // RSI is turning upward (bullish reversal signal)
+  isHookingDown: boolean;   // RSI is turning downward (bearish reversal signal)
 }
 
 /**
@@ -63,11 +66,15 @@ export interface RSIResult {
  * 
  * RSI = 100 - (100 / (1 + RS))
  * RS = Average Gain / Average Loss
+ * 
+ * ENHANCED: Now tracks previous RSI to detect "hooks" (momentum turning points).
+ * A "hook up" from oversold is a stronger buy signal than just being oversold.
+ * This prevents buying "falling knives" where oversold conditions persist.
  */
 export function calculateRSI(history: HistoryPoint[], period: number = 14): RSIResult | null {
   const prices = getClosePrices(history);
   
-  if (prices.length < period + 1) return null;
+  if (prices.length < period + 2) return null; // Need +2 for previous RSI
   
   // Calculate price changes
   const changes: number[] = [];
@@ -79,24 +86,42 @@ export function calculateRSI(history: HistoryPoint[], period: number = 14): RSIR
   const gains = changes.map(c => c > 0 ? c : 0);
   const losses = changes.map(c => c < 0 ? Math.abs(c) : 0);
   
-  // Calculate initial average gain/loss (simple average for first period)
-  let avgGain = gains.slice(0, period).reduce((sum, g) => sum + g, 0) / period;
-  let avgLoss = losses.slice(0, period).reduce((sum, l) => sum + l, 0) / period;
+  // Helper function to calculate RSI at a specific point
+  const calculateRSIAtIndex = (endIndex: number): number | null => {
+    if (endIndex < period) return null;
+    
+    let avgGain = gains.slice(0, period).reduce((sum, g) => sum + g, 0) / period;
+    let avgLoss = losses.slice(0, period).reduce((sum, l) => sum + l, 0) / period;
+    
+    for (let i = period; i < endIndex; i++) {
+      avgGain = (avgGain * (period - 1) + gains[i]) / period;
+      avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
+    }
+    
+    const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+    return 100 - (100 / (1 + rs));
+  };
   
-  // Apply smoothing for subsequent periods
-  for (let i = period; i < gains.length; i++) {
-    avgGain = (avgGain * (period - 1) + gains[i]) / period;
-    avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
-  }
+  // Calculate current RSI
+  const rsi = calculateRSIAtIndex(gains.length);
+  if (rsi === null) return null;
   
-  // Calculate RSI
-  const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-  const rsi = 100 - (100 / (1 + rs));
+  // Calculate previous period RSI (for hook detection)
+  const prevRsi = calculateRSIAtIndex(gains.length - 1);
+  
+  // Detect hooks (momentum turning points)
+  // Hook Up: RSI was low and is now rising (bullish reversal)
+  // Hook Down: RSI was high and is now falling (bearish reversal)
+  const isHookingUp = prevRsi !== null && rsi > prevRsi && prevRsi < 40;
+  const isHookingDown = prevRsi !== null && rsi < prevRsi && prevRsi > 60;
   
   return {
     value: Math.round(rsi * 100) / 100,
+    prevValue: prevRsi !== null ? Math.round(prevRsi * 100) / 100 : null,
     isOversold: rsi < 30,
-    isOverbought: rsi > 70
+    isOverbought: rsi > 70,
+    isHookingUp,
+    isHookingDown
   };
 }
 
@@ -847,6 +872,216 @@ export function detectCrossPatterns(history: HistoryPoint[]): CrossPatternResult
 }
 
 // ============================================================================
+// Chaikin Money Flow (CMF) - Accumulation/Distribution
+// ============================================================================
+
+export interface CMFResult {
+  value: number;                // -1 to +1 scale
+  interpretation: 'strong_accumulation' | 'accumulation' | 'neutral' | 'distribution' | 'strong_distribution';
+  isAccumulating: boolean;      // CMF > 0.1
+  isDistributing: boolean;      // CMF < -0.1
+  closeLocation: number;        // Where price closed in day's range (0-1)
+  volumeStrength: 'high' | 'normal' | 'low';
+}
+
+/**
+ * Calculate Chaikin Money Flow (CMF).
+ * 
+ * CMF measures buying/selling pressure based on where price closes within its range,
+ * weighted by volume. This is a leading indicator that can predict moves BEFORE
+ * MACD crossovers.
+ * 
+ * Logic:
+ * - If price closes in upper half of range on high volume = Accumulation (institutions buying)
+ * - If price closes in lower half of range on high volume = Distribution (institutions selling)
+ * 
+ * CMF = Sum(Money Flow Volume) / Sum(Volume) over N periods
+ * Money Flow Multiplier = ((Close - Low) - (High - Close)) / (High - Low)
+ * Money Flow Volume = MFM * Volume
+ */
+export function calculateCMF(history: HistoryPoint[], period: number = 20): CMFResult | null {
+  if (history.length < period) return null;
+  
+  const recentHistory = history.slice(-period);
+  let sumMFV = 0;
+  let sumVolume = 0;
+  
+  for (const candle of recentHistory) {
+    const { high, low, close, volume } = candle;
+    if (volume === 0 || high === low) continue;
+    
+    // Money Flow Multiplier: ranges from -1 (closed at low) to +1 (closed at high)
+    const mfm = ((close - low) - (high - close)) / (high - low);
+    
+    // Money Flow Volume
+    const mfv = mfm * volume;
+    
+    sumMFV += mfv;
+    sumVolume += volume;
+  }
+  
+  if (sumVolume === 0) return null;
+  
+  const cmf = sumMFV / sumVolume;
+  
+  // Calculate close location for most recent candle
+  const lastCandle = recentHistory[recentHistory.length - 1];
+  const closeLocation = lastCandle.high !== lastCandle.low 
+    ? (lastCandle.close - lastCandle.low) / (lastCandle.high - lastCandle.low)
+    : 0.5;
+  
+  // Determine interpretation
+  let interpretation: CMFResult['interpretation'];
+  if (cmf > 0.25) {
+    interpretation = 'strong_accumulation';
+  } else if (cmf > 0.1) {
+    interpretation = 'accumulation';
+  } else if (cmf >= -0.1) {
+    interpretation = 'neutral';
+  } else if (cmf >= -0.25) {
+    interpretation = 'distribution';
+  } else {
+    interpretation = 'strong_distribution';
+  }
+  
+  // Determine volume strength (compare to average)
+  const avgVolume = recentHistory.reduce((sum, h) => sum + h.volume, 0) / period;
+  const currentVolume = lastCandle.volume;
+  const volumeRatio = avgVolume > 0 ? currentVolume / avgVolume : 1;
+  
+  let volumeStrength: CMFResult['volumeStrength'];
+  if (volumeRatio > 1.5) {
+    volumeStrength = 'high';
+  } else if (volumeRatio < 0.5) {
+    volumeStrength = 'low';
+  } else {
+    volumeStrength = 'normal';
+  }
+  
+  return {
+    value: Math.round(cmf * 1000) / 1000,
+    interpretation,
+    isAccumulating: cmf > 0.1,
+    isDistributing: cmf < -0.1,
+    closeLocation: Math.round(closeLocation * 100) / 100,
+    volumeStrength
+  };
+}
+
+// ============================================================================
+// Price-Volume Divergence Detection
+// ============================================================================
+
+export interface DivergenceResult {
+  hasBullishDivergence: boolean;   // Price making lows but volume/indicators rising
+  hasBearishDivergence: boolean;   // Price making highs but volume/indicators falling
+  priceNewHigh: boolean;           // Price at new recent high
+  priceNewLow: boolean;            // Price at new recent low
+  volumeDivergence: 'bullish' | 'bearish' | 'none';
+  divergenceStrength: 'strong' | 'moderate' | 'weak' | 'none';
+  description: string;
+}
+
+/**
+ * Detect Price-Volume Divergences.
+ * 
+ * Divergence is one of the most powerful predictive signals in technical analysis.
+ * It indicates "smart money" behavior that precedes reversals.
+ * 
+ * Bearish Divergence (Fakeout Warning):
+ * - Price makes new high, but volume is LOWER than previous high
+ * - Indicates weak conviction - smart money not participating
+ * 
+ * Bullish Divergence (Reversal Signal):
+ * - Price makes new low, but volume is LOWER than previous low
+ * - OR: Price makes new low but RSI makes higher low
+ * - Indicates selling exhaustion
+ */
+export function detectDivergence(history: HistoryPoint[], lookback: number = 20): DivergenceResult | null {
+  if (history.length < lookback) return null;
+  
+  const recentHistory = history.slice(-lookback);
+  const currentCandle = recentHistory[recentHistory.length - 1];
+  
+  // Find recent swing highs and lows
+  let prevSwingHigh: { price: number; volume: number; index: number } | null = null;
+  let prevSwingLow: { price: number; volume: number; index: number } | null = null;
+  
+  // Look for swing points (local max/min)
+  for (let i = 2; i < recentHistory.length - 2; i++) {
+    const prev2 = recentHistory[i - 2];
+    const prev1 = recentHistory[i - 1];
+    const curr = recentHistory[i];
+    const next1 = recentHistory[i + 1];
+    const next2 = recentHistory[i + 2];
+    
+    // Swing high: current high is greater than neighbors
+    if (curr.high >= prev1.high && curr.high >= prev2.high && 
+        curr.high >= next1.high && curr.high >= next2.high) {
+      if (!prevSwingHigh || curr.high > prevSwingHigh.price * 0.99) {
+        prevSwingHigh = { price: curr.high, volume: curr.volume, index: i };
+      }
+    }
+    
+    // Swing low: current low is less than neighbors
+    if (curr.low <= prev1.low && curr.low <= prev2.low && 
+        curr.low <= next1.low && curr.low <= next2.low) {
+      if (!prevSwingLow || curr.low < prevSwingLow.price * 1.01) {
+        prevSwingLow = { price: curr.low, volume: curr.volume, index: i };
+      }
+    }
+  }
+  
+  // Check if current price is making new highs/lows
+  const recentHighs = recentHistory.slice(0, -1).map(h => h.high);
+  const recentLows = recentHistory.slice(0, -1).map(h => h.low);
+  const maxRecentHigh = Math.max(...recentHighs);
+  const minRecentLow = Math.min(...recentLows);
+  
+  const priceNewHigh = currentCandle.high > maxRecentHigh;
+  const priceNewLow = currentCandle.low < minRecentLow;
+  
+  // Detect volume divergence
+  let volumeDivergence: DivergenceResult['volumeDivergence'] = 'none';
+  let hasBearishDivergence = false;
+  let hasBullishDivergence = false;
+  let divergenceStrength: DivergenceResult['divergenceStrength'] = 'none';
+  let description = 'No divergence detected';
+  
+  // Bearish Divergence: New high on lower volume
+  if (priceNewHigh && prevSwingHigh) {
+    const volumeRatio = currentCandle.volume / prevSwingHigh.volume;
+    if (volumeRatio < 0.7) {
+      volumeDivergence = 'bearish';
+      hasBearishDivergence = true;
+      divergenceStrength = volumeRatio < 0.5 ? 'strong' : 'moderate';
+      description = `Bearish divergence: New high on ${Math.round((1 - volumeRatio) * 100)}% less volume`;
+    }
+  }
+  
+  // Bullish Divergence: New low on lower volume (selling exhaustion)
+  if (priceNewLow && prevSwingLow) {
+    const volumeRatio = currentCandle.volume / prevSwingLow.volume;
+    if (volumeRatio < 0.7) {
+      volumeDivergence = 'bullish';
+      hasBullishDivergence = true;
+      divergenceStrength = volumeRatio < 0.5 ? 'strong' : 'moderate';
+      description = `Bullish divergence: New low on ${Math.round((1 - volumeRatio) * 100)}% less volume`;
+    }
+  }
+  
+  return {
+    hasBullishDivergence,
+    hasBearishDivergence,
+    priceNewHigh,
+    priceNewLow,
+    volumeDivergence,
+    divergenceStrength,
+    description
+  };
+}
+
+// ============================================================================
 // Aggregate Technical Indicators
 // ============================================================================
 
@@ -862,6 +1097,8 @@ export interface TechnicalIndicators {
   rvol: RVOLResult | null;
   adx: ADXResult | null;
   crossPattern: CrossPatternResult | null;
+  cmf: CMFResult | null;              // Chaikin Money Flow (accumulation/distribution)
+  divergence: DivergenceResult | null; // Price-volume divergence detection
   sma20: number | null;
   sma50: number | null;
   sma200: number | null;
@@ -892,6 +1129,8 @@ export function calculateAllIndicators(
     rvol: calculateRVOL(history),
     adx: calculateADX(history),
     crossPattern: detectCrossPatterns(history),
+    cmf: calculateCMF(history),
+    divergence: detectDivergence(history),
     sma20: calculateSMA(prices, 20),
     sma50: calculateSMA(prices, 50),
     sma200: calculateSMA(prices, 200),

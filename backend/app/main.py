@@ -66,6 +66,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error during startup cleanup: {e}")
     
+    # Auto-cleanup intraday data with unfillable gaps
+    # This prevents showing charts with holes from previous downtime
+    try:
+        from .services.price_history import get_price_history_service
+        price_history = get_price_history_service()
+        cleared = price_history.auto_cleanup_gapped_intraday()
+        if cleared:
+            logger.info(f"Auto-cleared gapped intraday data for: {list(cleared.keys())}")
+    except Exception as e:
+        logger.error(f"Error during intraday gap cleanup: {e}")
+    
     # Start background cleanup task
     cleanup_task = asyncio.create_task(periodic_cleanup(stock_fetcher))
     
@@ -277,6 +288,36 @@ async def get_stock_history(
     }
 
 
+# ============ Batch History Endpoint ============
+
+@app.get("/api/v1/history/batch")
+async def get_batch_history(
+    tickers: str,
+    period: str = "1d",
+    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
+):
+    """
+    Get historical data for multiple tickers in one efficient batch call.
+    
+    This endpoint checks SQLite cache first and only fetches missing data
+    from the API. Uses yf.download() for intraday and yahooquery for daily
+    periods to batch requests efficiently.
+    
+    Args:
+        tickers: Comma-separated list of ticker symbols (e.g., "AAPL,MSFT,GOOG")
+        period: Time period (1d, 3d, 1w, 1mo, 3mo, 6mo, ytd, 1y, 2y, 5y)
+    
+    Returns:
+        Dict of ticker -> history data with history array, reference_close, is_complete
+    """
+    ticker_list = [t.strip().upper() for t in tickers.split(',') if t.strip()]
+    
+    if not ticker_list:
+        return {}
+    
+    return await stock_fetcher.batch_get_history(ticker_list, period)
+
+
 # ============ Batch Prices Endpoint ============
 
 @app.get("/api/v1/prices")
@@ -321,6 +362,43 @@ async def clear_stock_cache(
     }
 
 
+@app.delete("/api/v1/cache/intraday")
+async def clear_all_intraday_cache(
+    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
+):
+    """
+    Clear ALL intraday chart data for ALL tickers.
+    
+    Use this when there's a systemic data issue (like a gap affecting all holdings).
+    The next chart request for each ticker will fetch fresh data.
+    """
+    deleted_count = stock_fetcher.clear_all_intraday_cache()
+    return {
+        "message": "Cleared all intraday cache data",
+        "records_deleted": deleted_count
+    }
+
+
+@app.post("/api/v1/cache/cleanup-gaps")
+async def cleanup_gapped_data(
+    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
+):
+    """
+    Automatically detect and clear intraday data with unfillable gaps.
+    
+    This identifies tickers where historical data has gaps that are too old
+    to fill from the API (yfinance only keeps ~60 days of 5-minute data).
+    Clearing this data allows fresh, gap-free data to be fetched.
+    
+    This runs automatically on server startup but can be triggered manually.
+    """
+    cleared = stock_fetcher.auto_cleanup_gapped_data()
+    return {
+        "message": f"Cleaned up gapped data for {len(cleared)} tickers",
+        "cleared_tickers": cleared
+    }
+
+
 # ============ Stock Analysis Endpoints ============
 
 @app.get("/api/v1/stock/{ticker}/analysis")
@@ -334,6 +412,31 @@ async def get_stock_analysis(
     Returns fundamentals (ROIC, sector, margins) and options data (call/put ratio, IV).
     """
     return await analysis_service.get_analysis_data(ticker)
+
+
+@app.get("/api/v1/analysis/batch")
+async def get_batch_analysis(
+    tickers: str,
+    analysis_service: StockAnalysisService = Depends(get_stock_analysis_service)
+):
+    """
+    Get analysis data for multiple stocks in one batch call.
+    
+    Efficiently fetches fundamentals and options data for multiple tickers,
+    using yahooquery's batch capabilities and SQLite caching.
+    
+    Args:
+        tickers: Comma-separated list of ticker symbols (e.g., "AAPL,MSFT,GOOG")
+    
+    Returns:
+        Dict of ticker -> analysis data (fundamentals + options).
+    """
+    ticker_list = [t.strip().upper() for t in tickers.split(',') if t.strip()]
+    
+    if not ticker_list:
+        return {}
+    
+    return await analysis_service.get_batch_analysis(ticker_list)
 
 
 @app.get("/api/v1/stock/{ticker}/fundamentals")
@@ -435,6 +538,19 @@ async def get_option_holdings(
         )
         analytics = option_analytics.calculate_position_analytics(position)
         
+        # Prefer Greeks from pricing service, fall back to analytics calculation
+        pricing_greeks = prices.get("greeks") or {}
+        analytics_greeks = analytics.get("greeks") or {}
+        
+        # Merge Greeks - use pricing service values if available, otherwise analytics
+        merged_greeks = {
+            "delta": pricing_greeks.get("delta") if pricing_greeks.get("delta") is not None else analytics_greeks.get("delta"),
+            "gamma": pricing_greeks.get("gamma") if pricing_greeks.get("gamma") is not None else analytics_greeks.get("gamma"),
+            "theta": pricing_greeks.get("theta") if pricing_greeks.get("theta") is not None else analytics_greeks.get("theta"),
+            "vega": pricing_greeks.get("vega") if pricing_greeks.get("vega") is not None else analytics_greeks.get("vega"),
+            "rho": pricing_greeks.get("rho") if pricing_greeks.get("rho") is not None else analytics_greeks.get("rho"),
+        }
+        
         result_list.append(OptionHoldingWithData(
             id=oh.id,
             portfolio_id=oh.portfolio_id,
@@ -460,8 +576,8 @@ async def get_option_holdings(
             cost_basis=analytics.get("cost_basis"),
             gain_loss=analytics.get("gain_loss"),
             gain_loss_pct=analytics.get("gain_loss_pct"),
-            # Greeks
-            greeks=prices.get("greeks"),
+            # Greeks - merged from both sources
+            greeks=merged_greeks,
             # Analytics
             analytics={
                 "breakeven_price": analytics.get("breakeven_price"),
@@ -618,6 +734,17 @@ async def get_option_holding(
     )
     analytics = option_analytics.calculate_position_analytics(position)
     
+    # Merge Greeks from both sources
+    pricing_greeks = prices.get("greeks") or {}
+    analytics_greeks = analytics.get("greeks") or {}
+    merged_greeks = {
+        "delta": pricing_greeks.get("delta") if pricing_greeks.get("delta") is not None else analytics_greeks.get("delta"),
+        "gamma": pricing_greeks.get("gamma") if pricing_greeks.get("gamma") is not None else analytics_greeks.get("gamma"),
+        "theta": pricing_greeks.get("theta") if pricing_greeks.get("theta") is not None else analytics_greeks.get("theta"),
+        "vega": pricing_greeks.get("vega") if pricing_greeks.get("vega") is not None else analytics_greeks.get("vega"),
+        "rho": pricing_greeks.get("rho") if pricing_greeks.get("rho") is not None else analytics_greeks.get("rho"),
+    }
+    
     return OptionHoldingWithData(
         id=oh.id,
         portfolio_id=oh.portfolio_id,
@@ -643,8 +770,8 @@ async def get_option_holding(
         cost_basis=analytics.get("cost_basis"),
         gain_loss=analytics.get("gain_loss"),
         gain_loss_pct=analytics.get("gain_loss_pct"),
-        # Greeks
-        greeks=prices.get("greeks"),
+        # Greeks - merged from both sources
+        greeks=merged_greeks,
         # Analytics
         analytics={
             "breakeven_price": analytics.get("breakeven_price"),

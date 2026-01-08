@@ -104,6 +104,15 @@ async def migrate_db(conn):
         CREATE INDEX IF NOT EXISTS ix_option_underlying_exp 
         ON option_holdings(underlying_ticker, expiration_date)
     """))
+    
+    # Migrate stock_analysis_cache table - add next_earnings_date column
+    result = await conn.execute(text("PRAGMA table_info(stock_analysis_cache)"))
+    cache_columns = [row[1] for row in result.fetchall()]
+    
+    if cache_columns:  # Table exists
+        if 'next_earnings_date' not in cache_columns:
+            await conn.execute(text("ALTER TABLE stock_analysis_cache ADD COLUMN next_earnings_date DATETIME"))
+            print("Added next_earnings_date column to stock_analysis_cache table")
 
 
 async def init_db():

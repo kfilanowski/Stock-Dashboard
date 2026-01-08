@@ -9,6 +9,7 @@ pydantic-settings>=2.12.0
 numpy>=2.4.0
 pytz>=2025.2
 yfinance>=1.0
+requests-cache>=1.2.0
 
 # Testing
 pytest>=9.0.2

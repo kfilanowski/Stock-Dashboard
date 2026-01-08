@@ -33,6 +33,7 @@ class HoldingCreate(HoldingBase):
 class HoldingUpdate(BaseModel):
     shares: Optional[float] = Field(None, ge=0)
     avg_cost: Optional[float] = Field(None, ge=0)
+    is_pinned: Optional[bool] = None
 
 
 class HoldingResponse(HoldingBase):
@@ -40,6 +41,7 @@ class HoldingResponse(HoldingBase):
     portfolio_id: int
     added_at: datetime
     avg_cost: Optional[float] = None
+    is_pinned: bool = False
 
     class Config:
         from_attributes = True
@@ -148,9 +150,9 @@ class OptionAnalytics(BaseModel):
     max_profit: Optional[float] = None       # Maximum possible profit
     max_loss: Optional[float] = None         # Maximum possible loss
     profit_probability: Optional[float] = None  # Estimated probability of profit (0-100)
-    days_to_expiration: int
-    is_itm: bool  # In the money
-    is_expired: bool
+    days_to_expiration: Optional[int] = None
+    is_itm: Optional[bool] = None  # In the money
+    is_expired: Optional[bool] = None
     intrinsic_value: Optional[float] = None  # Current intrinsic value per contract
     time_value: Optional[float] = None       # Current time/extrinsic value per contract
 

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Trash2, BarChart3, RefreshCw, TrendingUp, TrendingDown, Activity, RotateCcw } from 'lucide-react';
+import { Trash2, BarChart3, RefreshCw, TrendingUp, TrendingDown, Activity, RotateCcw, Pin } from 'lucide-react';
 import type { Holding, HistoryPoint } from '../types';
 import { PositionEditor, MiniStockChart, ActionScoreBadge } from './holding';
 
@@ -15,6 +15,7 @@ interface HoldingCardProps {
   onAnalyze: (ticker: string) => void;
   onUpdatePosition: (id: number, data: { shares?: number; avg_cost?: number }) => Promise<void>;
   onRefreshHistory: (ticker: string) => Promise<void>;
+  onTogglePin?: (id: number, isPinned: boolean) => void;
   isRefreshing?: boolean;
   isHistoryLoading?: boolean;
   lastPricesFetched?: Date | null;
@@ -34,6 +35,7 @@ export function HoldingCard({
   onAnalyze,
   onUpdatePosition,
   onRefreshHistory,
+  onTogglePin,
   isRefreshing = false,
   isHistoryLoading = false,
   lastPricesFetched,
@@ -103,6 +105,19 @@ export function HoldingCard({
         <div className="flex flex-col items-end gap-1">
           {/* Action buttons */}
           <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            {onTogglePin && (
+              <button
+                onClick={() => onTogglePin(holding.id, holding.is_pinned ?? false)}
+                className={`p-1.5 rounded-lg transition-colors ${
+                  holding.is_pinned 
+                    ? 'bg-accent-cyan/20 hover:bg-accent-cyan/30' 
+                    : 'bg-white/5 hover:bg-white/10'
+                }`}
+                title={holding.is_pinned ? 'Unpin from top' : 'Pin to top'}
+              >
+                <Pin className={`w-4 h-4 ${holding.is_pinned ? 'text-accent-cyan' : 'text-white/70'}`} />
+              </button>
+            )}
             <button
               onClick={handleRefreshHistory}
               disabled={isRefreshingHistory}

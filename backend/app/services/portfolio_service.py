@@ -95,6 +95,7 @@ class PortfolioService:
                 shares=h.shares,
                 avg_cost=h.avg_cost,
                 added_at=h.added_at,
+                is_pinned=h.is_pinned,
                 current_price=None,
                 market_value=None,
                 cost_basis=h.shares * h.avg_cost if h.shares and h.avg_cost else None,
@@ -208,6 +209,7 @@ class PortfolioService:
             shares=holding.shares,
             avg_cost=holding.avg_cost,
             added_at=holding.added_at,
+            is_pinned=holding.is_pinned,
             current_price=current_price,
             market_value=round(market_value, 2) if market_value is not None else None,
             cost_basis=round(cost_basis, 2) if cost_basis is not None else None,
@@ -304,6 +306,9 @@ class PortfolioService:
         
         if update_data.avg_cost is not None:
             holding.avg_cost = update_data.avg_cost
+        
+        if update_data.is_pinned is not None:
+            holding.is_pinned = update_data.is_pinned
         
         await db.commit()
         await db.refresh(holding)

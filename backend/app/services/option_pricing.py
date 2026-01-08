@@ -1,18 +1,21 @@
 """
 Option Pricing Service - Fetches real-time option prices from Yahoo Finance.
 
-Uses yahooquery to fetch option chain data and match user positions
-to current market prices.
+Uses yfinance (primary) and yahooquery (fallback) to fetch option chain data
+and match user positions to current market prices.
 """
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date
 from typing import Dict, Any, Optional, List
+import time
 
+import yfinance as yf
 from yahooquery import Ticker as YQTicker
 
 from ..logging_config import get_logger
 from .option_analytics import get_option_analytics_service
+from .retry import make_yahoo_request
 
 logger = get_logger(__name__)
 
@@ -21,12 +24,54 @@ class OptionPricingService:
     """
     Service for fetching real-time option prices.
     
-    Uses yahooquery to fetch option chains and extract pricing data
+    Uses yfinance to fetch option chains and extract pricing data
     for specific contracts based on strike/expiration/type.
+    
+    Includes caching to avoid repeated API calls during rate limiting.
     """
+    
+    # Class-level cache for option chains (shared across instances)
+    _chain_cache: Dict[str, Dict[str, Any]] = {}
+    _cache_ttl = 300  # Cache for 5 minutes
     
     def __init__(self, max_workers: Optional[int] = None):
         self._executor = ThreadPoolExecutor(max_workers=max_workers or 4)
+    
+    def _get_cached_chain(self, ticker: str, exp_str: str) -> Optional[Any]:
+        """Get cached option chain if still valid."""
+        cache_key = f"{ticker}_{exp_str}"
+        if cache_key in self._chain_cache:
+            cached = self._chain_cache[cache_key]
+            if time.time() - cached['timestamp'] < self._cache_ttl:
+                logger.debug(f"Using cached chain for {ticker} {exp_str}")
+                return cached['data']
+        return None
+    
+    def _set_cached_chain(self, ticker: str, exp_str: str, chain: Any):
+        """Cache option chain data."""
+        cache_key = f"{ticker}_{exp_str}"
+        self._chain_cache[cache_key] = {
+            'data': chain,
+            'timestamp': time.time()
+        }
+    
+    def _get_cached_expirations(self, ticker: str) -> Optional[tuple]:
+        """Get cached expirations if still valid."""
+        cache_key = f"{ticker}_expirations"
+        if cache_key in self._chain_cache:
+            cached = self._chain_cache[cache_key]
+            if time.time() - cached['timestamp'] < self._cache_ttl:
+                logger.debug(f"Using cached expirations for {ticker}")
+                return cached['data']
+        return None
+    
+    def _set_cached_expirations(self, ticker: str, expirations: tuple):
+        """Cache expirations data."""
+        cache_key = f"{ticker}_expirations"
+        self._chain_cache[cache_key] = {
+            'data': expirations,
+            'timestamp': time.time()
+        }
     
     @staticmethod
     def _get_current_price(quote_data: Dict[str, Any]) -> Optional[float]:
@@ -111,21 +156,42 @@ class OptionPricingService:
         try:
             t = YQTicker(ticker)
             
-            # Get the underlying stock price (including after-hours if available)
-            quote_data = t.price.get(ticker, {})
+            # Get the underlying stock price (including after-hours if available) with retry
+            quote_data = make_yahoo_request(
+                lambda: t.price.get(ticker, {}),
+                description=f"fetch option underlying price for {ticker}",
+                default_value={}
+            )
             if isinstance(quote_data, str):
                 quote_data = {}
             underlying_price = self._get_current_price(quote_data)
+            logger.debug(f"Fetching option for {ticker}: underlying_price={underlying_price}")
             
-            # Get option chain
-            option_chain = t.option_chain
+            # Get option chain with retry
+            option_chain = make_yahoo_request(
+                lambda: t.option_chain,
+                description=f"fetch option chain for {ticker}",
+                default_value=None
+            )
             
             if isinstance(option_chain, str) or option_chain is None:
                 logger.warning(f"No options chain available for {ticker}")
-                return self._empty_price_response(ticker, underlying_price)
+                return self._empty_price_response(
+                    ticker, underlying_price,
+                    expiration_date=expiration_date,
+                    option_type=option_type,
+                    strike_price=strike_price
+                )
+            
+            logger.debug(f"Option chain columns: {option_chain.columns.tolist() if hasattr(option_chain, 'columns') else 'N/A'}")
             
             if hasattr(option_chain, 'empty') and option_chain.empty:
-                return self._empty_price_response(ticker, underlying_price)
+                return self._empty_price_response(
+                    ticker, underlying_price,
+                    expiration_date=expiration_date,
+                    option_type=option_type,
+                    strike_price=strike_price
+                )
             
             # Reset index for easier filtering
             if hasattr(option_chain, 'reset_index'):
@@ -152,14 +218,20 @@ class OptionPricingService:
                 filtered = filtered[abs(filtered['strike'] - strike_price) < 0.01]
             
             if filtered.empty:
-                logger.debug(
+                logger.warning(
                     f"No matching contract for {ticker} {option_type} "
                     f"${strike_price} exp {expiration_date}"
                 )
-                return self._empty_price_response(ticker, underlying_price)
+                return self._empty_price_response(
+                    ticker, underlying_price,
+                    expiration_date=expiration_date,
+                    option_type=option_type,
+                    strike_price=strike_price
+                )
             
             # Get the first matching row
             contract = filtered.iloc[0]
+            logger.debug(f"Found contract for {ticker}: IV={contract.get('impliedVolatility')}, delta={contract.get('delta')}")
             
             # Extract price data
             last_price = contract.get('lastPrice')
@@ -172,53 +244,76 @@ class OptionPricingService:
             else:
                 mid_price = last_price
             
+            # Helper to safely extract numeric values from pandas (handles NaN)
+            def safe_float(val):
+                if val is None:
+                    return None
+                try:
+                    import math
+                    f = float(val)
+                    return None if math.isnan(f) else f
+                except (TypeError, ValueError):
+                    return None
+            
             # Extract Greeks (if available from Yahoo)
-            delta = contract.get('delta')
-            gamma = contract.get('gamma')
-            theta = contract.get('theta')
-            vega = contract.get('vega')
-            rho = contract.get('rho')
+            delta = safe_float(contract.get('delta'))
+            gamma = safe_float(contract.get('gamma'))
+            theta = safe_float(contract.get('theta'))
+            vega = safe_float(contract.get('vega'))
+            rho = safe_float(contract.get('rho'))
             
             # Extract other data
-            iv = contract.get('impliedVolatility')
+            iv = safe_float(contract.get('impliedVolatility'))
             open_interest = contract.get('openInterest')
             volume = contract.get('volume')
             
-            # Calculate Greeks ourselves if Yahoo didn't provide them
+            # Build initial Greeks dict from Yahoo data
             greeks = {
-                "delta": round(delta, 4) if delta else None,
-                "gamma": round(gamma, 4) if gamma else None,
-                "theta": round(theta, 4) if theta else None,
-                "vega": round(vega, 4) if vega else None,
-                "rho": round(rho, 4) if rho else None,
+                "delta": round(delta, 4) if delta is not None else None,
+                "gamma": round(gamma, 4) if gamma is not None else None,
+                "theta": round(theta, 4) if theta is not None else None,
+                "vega": round(vega, 4) if vega is not None else None,
+                "rho": round(rho, 4) if rho is not None else None,
             }
             
-            # If Greeks are missing but we have IV and underlying price, calculate them
-            if (not delta or not gamma or not theta) and iv and underlying_price:
+            # Calculate Greeks ourselves if Yahoo didn't provide them
+            # We need IV and underlying price to calculate
+            has_missing_greeks = greeks["delta"] is None or greeks["gamma"] is None or greeks["theta"] is None
+            
+            if has_missing_greeks and iv is not None and iv > 0 and underlying_price is not None:
                 try:
                     analytics = get_option_analytics_service()
                     time_to_exp = analytics.calculate_time_to_expiration(expiration_date)
+                    
                     if time_to_exp > 0:
+                        logger.debug(
+                            f"Calculating Greeks for {ticker} {option_type} ${strike_price}: "
+                            f"S={underlying_price}, T={time_to_exp:.4f}, IV={iv:.4f}"
+                        )
                         calculated = analytics.calculate_greeks(
                             option_type=option_type,
                             strike_price=strike_price,
                             underlying_price=underlying_price,
                             time_to_expiration=time_to_exp,
-                            implied_volatility=iv  # Already decimal from Yahoo
+                            implied_volatility=iv  # Already decimal from Yahoo (e.g., 0.30 for 30%)
                         )
+                        logger.debug(f"Calculated Greeks: {calculated}")
+                        
                         # Use calculated values for any that are missing
-                        if not greeks["delta"] and calculated.get("delta"):
+                        if greeks["delta"] is None and calculated.get("delta") is not None:
                             greeks["delta"] = calculated["delta"]
-                        if not greeks["gamma"] and calculated.get("gamma"):
+                        if greeks["gamma"] is None and calculated.get("gamma") is not None:
                             greeks["gamma"] = calculated["gamma"]
-                        if not greeks["theta"] and calculated.get("theta"):
+                        if greeks["theta"] is None and calculated.get("theta") is not None:
                             greeks["theta"] = calculated["theta"]
-                        if not greeks["vega"] and calculated.get("vega"):
+                        if greeks["vega"] is None and calculated.get("vega") is not None:
                             greeks["vega"] = calculated["vega"]
-                        if not greeks["rho"] and calculated.get("rho"):
+                        if greeks["rho"] is None and calculated.get("rho") is not None:
                             greeks["rho"] = calculated["rho"]
+                    else:
+                        logger.debug(f"Skipping Greeks calculation - option expired or expiring today")
                 except Exception as e:
-                    logger.warning(f"Error calculating Greeks for {ticker}: {e}")
+                    logger.warning(f"Error calculating Greeks for {ticker}: {e}", exc_info=True)
             
             result = {
                 "underlying_ticker": ticker,
@@ -250,9 +345,12 @@ class OptionPricingService:
     def _empty_price_response(
         self, 
         ticker: str, 
-        underlying_price: Optional[float]
+        underlying_price: Optional[float],
+        expiration_date: Optional[date] = None,
+        option_type: Optional[str] = None,
+        strike_price: Optional[float] = None
     ) -> Dict[str, Any]:
-        """Return empty price response."""
+        """Return empty price response when data cannot be fetched."""
         return {
             "underlying_ticker": ticker,
             "underlying_price": underlying_price,
@@ -318,33 +416,117 @@ class OptionPricingService:
             by_ticker[ticker].append(pos)
         
         # Fetch each ticker's option chain once
+        # Note: Removed fixed 2-second delay - exponential backoff in make_yahoo_request
+        # handles rate limiting more efficiently
         for ticker, ticker_positions in by_ticker.items():
+            logger.info(f"Fetching option chain for {ticker} ({len(ticker_positions)} positions)")
             try:
-                t = YQTicker(ticker)
+                # Note: Don't pass session - yfinance now uses curl_cffi which is incompatible with requests_cache
+                yf_ticker = yf.Ticker(ticker)
                 
-                # Get underlying price (including after-hours if available)
-                quote_data = t.price.get(ticker, {})
-                if isinstance(quote_data, str):
-                    quote_data = {}
-                underlying_price = self._get_current_price(quote_data)
+                # Get underlying price with retry
+                underlying_price = make_yahoo_request(
+                    lambda: yf_ticker.fast_info.get('lastPrice') or yf_ticker.fast_info.get('regularMarketPrice'),
+                    description=f"fetch fast_info for {ticker}",
+                    default_value=None
+                )
                 
-                # Get option chain
-                option_chain = t.option_chain
+                # Fallback to history for price
+                if underlying_price is None:
+                    hist = make_yahoo_request(
+                        lambda: yf_ticker.history(period="1d"),
+                        description=f"fetch history for {ticker}",
+                        default_value=None
+                    )
+                    if hist is not None and not hist.empty:
+                        underlying_price = hist['Close'].iloc[-1]
                 
-                if isinstance(option_chain, str) or option_chain is None:
-                    # No options data - return empty for all positions
+                logger.info(f"Underlying price for {ticker}: {underlying_price}")
+                
+                # Check cache first for expirations
+                expirations = self._get_cached_expirations(ticker)
+                
+                if not expirations:
+                    # Get available expiration dates with retry
+                    expirations = make_yahoo_request(
+                        lambda: yf_ticker.options,
+                        description=f"fetch expirations for {ticker}",
+                        default_value=None
+                    )
+                    if expirations:
+                        logger.info(f"Got {len(expirations)} expirations for {ticker}")
+                        self._set_cached_expirations(ticker, expirations)
+                
+                if not expirations:
+                    logger.warning(f"No option expirations for {ticker}")
                     for pos in ticker_positions:
-                        results[pos['id']] = self._empty_price_response(ticker, underlying_price)
+                        exp_date = pos['expiration_date']
+                        if isinstance(exp_date, str):
+                            exp_date = datetime.strptime(exp_date, '%Y-%m-%d').date()
+                        results[pos['id']] = self._empty_price_response(
+                            ticker, underlying_price,
+                            expiration_date=exp_date,
+                            option_type=pos['option_type'],
+                            strike_price=pos['strike_price']
+                        )
                     continue
                 
-                if hasattr(option_chain, 'empty') and option_chain.empty:
+                # Collect required expiration dates from positions
+                required_expirations = set()
+                for pos in ticker_positions:
+                    exp_date = pos['expiration_date']
+                    if isinstance(exp_date, str):
+                        required_expirations.add(exp_date)
+                    else:
+                        required_expirations.add(exp_date.strftime('%Y-%m-%d'))
+                
+                # Fetch option chains for required dates with caching and retry
+                import pandas as pd
+                option_chain_parts = []
+                for exp_str in required_expirations:
+                    if exp_str in expirations:
+                        # Check cache first
+                        chain = self._get_cached_chain(ticker, exp_str)
+                        
+                        if chain is None:
+                            chain = make_yahoo_request(
+                                lambda exp=exp_str: yf_ticker.option_chain(exp),
+                                description=f"fetch chain for {ticker} {exp_str}",
+                                default_value=None
+                            )
+                            if chain is not None:
+                                self._set_cached_chain(ticker, exp_str, chain)
+                        
+                        if chain is not None:
+                            # Combine calls and puts
+                            calls = chain.calls.copy()
+                            calls['optionType'] = 'calls'
+                            calls['exp_date'] = datetime.strptime(exp_str, '%Y-%m-%d').date()
+                            puts = chain.puts.copy()
+                            puts['optionType'] = 'puts'
+                            puts['exp_date'] = datetime.strptime(exp_str, '%Y-%m-%d').date()
+                            option_chain_parts.append(calls)
+                            option_chain_parts.append(puts)
+                            logger.info(f"Fetched {len(calls) + len(puts)} contracts for {ticker} {exp_str}")
+                    else:
+                        logger.warning(f"Expiration {exp_str} not available for {ticker}. Available: {expirations[:5]}...")
+                
+                if not option_chain_parts:
+                    logger.warning(f"No matching option chains for {ticker}")
                     for pos in ticker_positions:
-                        results[pos['id']] = self._empty_price_response(ticker, underlying_price)
+                        exp_date = pos['expiration_date']
+                        if isinstance(exp_date, str):
+                            exp_date = datetime.strptime(exp_date, '%Y-%m-%d').date()
+                        results[pos['id']] = self._empty_price_response(
+                            ticker, underlying_price,
+                            expiration_date=exp_date,
+                            option_type=pos['option_type'],
+                            strike_price=pos['strike_price']
+                        )
                     continue
                 
-                # Reset index
-                if hasattr(option_chain, 'reset_index'):
-                    option_chain = option_chain.reset_index()
+                option_chain = pd.concat(option_chain_parts, ignore_index=True)
+                logger.debug(f"Option chain columns for {ticker}: {option_chain.columns.tolist()}")
                 
                 # Parse expiration dates once
                 if 'expiration' in option_chain.columns:
@@ -362,47 +544,81 @@ class OptionPricingService:
                     option_type = pos['option_type']
                     strike = pos['strike_price']
                     
+                    logger.debug(f"Looking for {ticker} {option_type} ${strike} exp {exp_date}")
+                    
                     # Filter chain
                     filtered = option_chain
+                    initial_count = len(filtered)
                     
                     if 'exp_date' in filtered.columns:
                         filtered = filtered[filtered['exp_date'] == exp_date]
+                        logger.debug(f"  After exp filter: {len(filtered)} rows (was {initial_count})")
                     
                     if 'optionType' in filtered.columns:
                         type_filter = 'calls' if option_type.lower() == 'call' else 'puts'
+                        count_before = len(filtered)
                         filtered = filtered[filtered['optionType'] == type_filter]
+                        logger.debug(f"  After type filter ({type_filter}): {len(filtered)} rows (was {count_before})")
                     
                     if 'strike' in filtered.columns:
+                        count_before = len(filtered)
                         filtered = filtered[abs(filtered['strike'] - strike) < 0.01]
+                        logger.debug(f"  After strike filter (${strike}): {len(filtered)} rows (was {count_before})")
                     
                     if filtered.empty:
-                        results[pos['id']] = self._empty_price_response(ticker, underlying_price)
+                        logger.warning(f"No matching contract for {ticker} {option_type} ${strike} exp {exp_date}")
+                        results[pos['id']] = self._empty_price_response(
+                            ticker, underlying_price,
+                            expiration_date=exp_date,
+                            option_type=option_type,
+                            strike_price=strike
+                        )
                         continue
                     
                     contract = filtered.iloc[0]
                     
+                    # Helper to safely extract numeric values from pandas (handles NaN)
+                    def safe_float(val):
+                        if val is None:
+                            return None
+                        try:
+                            import math
+                            f = float(val)
+                            return None if math.isnan(f) else f
+                        except (TypeError, ValueError):
+                            return None
+                    
                     # Extract data
-                    last_price = contract.get('lastPrice')
-                    bid = contract.get('bid')
-                    ask = contract.get('ask')
-                    iv = contract.get('impliedVolatility')
+                    last_price = safe_float(contract.get('lastPrice'))
+                    bid = safe_float(contract.get('bid'))
+                    ask = safe_float(contract.get('ask'))
+                    iv = safe_float(contract.get('impliedVolatility'))
                     
                     if bid and ask and bid > 0 and ask > 0:
                         mid_price = (bid + ask) / 2
                     else:
                         mid_price = last_price
                     
+                    # Extract Greeks from Yahoo
+                    delta = safe_float(contract.get('delta'))
+                    gamma = safe_float(contract.get('gamma'))
+                    theta = safe_float(contract.get('theta'))
+                    vega = safe_float(contract.get('vega'))
+                    rho = safe_float(contract.get('rho'))
+                    
                     # Build Greeks dict
                     greeks = {
-                        "delta": round(contract.get('delta'), 4) if contract.get('delta') else None,
-                        "gamma": round(contract.get('gamma'), 4) if contract.get('gamma') else None,
-                        "theta": round(contract.get('theta'), 4) if contract.get('theta') else None,
-                        "vega": round(contract.get('vega'), 4) if contract.get('vega') else None,
-                        "rho": round(contract.get('rho'), 4) if contract.get('rho') else None,
+                        "delta": round(delta, 4) if delta is not None else None,
+                        "gamma": round(gamma, 4) if gamma is not None else None,
+                        "theta": round(theta, 4) if theta is not None else None,
+                        "vega": round(vega, 4) if vega is not None else None,
+                        "rho": round(rho, 4) if rho is not None else None,
                     }
                     
                     # Calculate Greeks if Yahoo didn't provide them
-                    if (not greeks["delta"] or not greeks["gamma"]) and iv and underlying_price:
+                    has_missing = greeks["delta"] is None or greeks["gamma"] is None or greeks["theta"] is None
+                    
+                    if has_missing and iv is not None and iv > 0 and underlying_price is not None:
                         try:
                             analytics = get_option_analytics_service()
                             time_to_exp = analytics.calculate_time_to_expiration(exp_date)
@@ -414,18 +630,18 @@ class OptionPricingService:
                                     time_to_expiration=time_to_exp,
                                     implied_volatility=iv
                                 )
-                                if not greeks["delta"] and calculated.get("delta"):
+                                if greeks["delta"] is None and calculated.get("delta") is not None:
                                     greeks["delta"] = calculated["delta"]
-                                if not greeks["gamma"] and calculated.get("gamma"):
+                                if greeks["gamma"] is None and calculated.get("gamma") is not None:
                                     greeks["gamma"] = calculated["gamma"]
-                                if not greeks["theta"] and calculated.get("theta"):
+                                if greeks["theta"] is None and calculated.get("theta") is not None:
                                     greeks["theta"] = calculated["theta"]
-                                if not greeks["vega"] and calculated.get("vega"):
+                                if greeks["vega"] is None and calculated.get("vega") is not None:
                                     greeks["vega"] = calculated["vega"]
-                                if not greeks["rho"] and calculated.get("rho"):
+                                if greeks["rho"] is None and calculated.get("rho") is not None:
                                     greeks["rho"] = calculated["rho"]
                         except Exception as e:
-                            logger.warning(f"Error calculating Greeks for {ticker}: {e}")
+                            logger.warning(f"Error calculating Greeks for {ticker}: {e}", exc_info=True)
                     
                     results[pos['id']] = {
                         "underlying_ticker": ticker,
@@ -472,7 +688,11 @@ class OptionPricingService:
         
         try:
             t = YQTicker(ticker)
-            option_chain = t.option_chain
+            option_chain = make_yahoo_request(
+                lambda: t.option_chain,
+                description=f"fetch expirations for {ticker}",
+                default_value=None
+            )
             
             if isinstance(option_chain, str) or option_chain is None:
                 return []
@@ -520,7 +740,11 @@ class OptionPricingService:
         
         try:
             t = YQTicker(ticker)
-            option_chain = t.option_chain
+            option_chain = make_yahoo_request(
+                lambda: t.option_chain,
+                description=f"fetch strikes for {ticker}",
+                default_value=None
+            )
             
             if isinstance(option_chain, str) or option_chain is None:
                 return []

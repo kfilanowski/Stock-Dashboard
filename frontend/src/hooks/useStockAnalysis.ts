@@ -8,7 +8,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { StockAnalysis } from '../types';
-import { getStockHistory, getStock, getStockAnalysis as fetchStockAnalysisData } from '../services/api';
+import { getStockHistory, getStock, getStockAnalysis as fetchStockAnalysisData, getBatchHistory, getBatchAnalysis } from '../services/api';
 import { analyzeStock, type AdditionalAnalysisData } from '../services/stockScoring';
 
 // ============================================================================
@@ -46,8 +46,9 @@ interface AnalysisRequest {
 // ============================================================================
 
 const CACHE_DURATION_MS = 15 * 60 * 1000; // 15 minutes
-const MAX_CONCURRENT_REQUESTS = 3;
-const REQUEST_DELAY_MS = 200; // Delay between requests to avoid rate limiting
+const MAX_CONCURRENT_REQUESTS = 50; // Process all holdings in one batch
+const REQUEST_DELAY_MS = 100; // Small delay between batches if queue is very large
+const QUEUE_DEBOUNCE_MS = 50; // Wait for queue to fill before processing
 
 // ============================================================================
 // Global Cache (shared across all component instances)
@@ -57,6 +58,7 @@ const analysisCache = new Map<string, CachedAnalysis>();
 const pendingRequests = new Set<string>();
 const requestQueue: AnalysisRequest[] = [];
 let isProcessingQueue = false;
+let queueDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
  * Get cached analysis if it exists and is not expired.
@@ -92,6 +94,9 @@ function setCachedAnalysis(ticker: string, analysis: StockAnalysis): void {
 
 /**
  * Process the request queue, fetching analysis for stocks in background.
+ * 
+ * Uses batch history fetching to minimize API calls - fetches all 1-year
+ * histories in a single request, then processes analysis for each stock.
  */
 async function processQueue(
   onUpdate: (ticker: string, analysis: StockAnalysis) => void,
@@ -105,81 +110,168 @@ async function processQueue(
     // Process up to MAX_CONCURRENT_REQUESTS at a time
     const batch = requestQueue.splice(0, MAX_CONCURRENT_REQUESTS);
     
-    await Promise.all(
-      batch.map(async (request) => {
-        const { ticker, currentPrice, high52w, low52w } = request;
-        
-        // Skip if already being processed
-        if (pendingRequests.has(ticker)) return;
-        pendingRequests.add(ticker);
-        onStart(ticker);
-        
-        try {
-          // Fetch 1-year history and stock data in parallel
-          // Stock data provides: current price (fallback), 52-week high/low
-          // History provides: price data for indicators (need 200+ days for SMA200)
-          const [historyResponse, stockData] = await Promise.all([
-            getStockHistory(ticker, '1y'),
-            getStock(ticker).catch(() => null) // Don't fail if stock data unavailable
-          ]);
+    // Filter out already-pending requests and mark new ones as pending
+    const validRequests = batch.filter(request => {
+      if (pendingRequests.has(request.ticker)) return false;
+      pendingRequests.add(request.ticker);
+      onStart(request.ticker);
+      return true;
+    });
+    
+    if (validRequests.length === 0) continue;
+    
+    const tickers = validRequests.map(r => r.ticker);
+    
+    try {
+      // Batch fetch histories AND analysis data in parallel
+      console.debug(`[Analysis] Batch fetching history and analysis for ${tickers.length} tickers`);
+      const [batchHistories, batchAnalysisData] = await Promise.all([
+        getBatchHistory(tickers, '1y'),
+        getBatchAnalysis(tickers)
+      ]);
+      
+      // Process each ticker's analysis using pre-fetched data
+      await Promise.all(
+        validRequests.map(async (request) => {
+          const { ticker, currentPrice, high52w, low52w } = request;
           
-          const history = historyResponse.history;
-          
-          // Use provided values or fall back to fetched stock data
-          const finalHigh52w = high52w ?? stockData?.high_52w ?? null;
-          const finalLow52w = low52w ?? stockData?.low_52w ?? null;
-          const finalPrice = currentPrice || stockData?.current_price || 0;
-          
-          if (!finalPrice) {
-            throw new Error('Unable to determine current price');
-          }
-          
-          // Try to fetch additional analysis data (fundamentals, options)
-          let additionalData: AdditionalAnalysisData | undefined;
           try {
-            const analysisData = await fetchStockAnalysisData(ticker);
-            additionalData = {
-              roic: analysisData.fundamentals?.roic,
-              roe: analysisData.fundamentals?.roe,
-              sector: analysisData.fundamentals?.sector,
-              industry: analysisData.fundamentals?.industry,
-              beta: analysisData.fundamentals?.beta,
-              callPutRatioOI: analysisData.options?.call_put_ratio_oi,
-              callPutRatioVolume: analysisData.options?.call_put_ratio_volume,
-              optionsSentiment: analysisData.options?.options_sentiment,
-              avgImpliedVolatility: analysisData.options?.avg_implied_volatility,
-              ivPercentile: analysisData.options?.iv_percentile,
-              hasOptions: analysisData.options?.has_options ?? false
-            };
-          } catch {
-            // Continue without additional data if fetch fails
-            console.debug(`[Analysis] Additional data not available for ${ticker}`);
+            // Get history from batch result
+            const historyData = batchHistories[ticker];
+            let history = historyData?.history || [];
+            
+            if (history.length === 0) {
+              // Fallback to individual fetch if batch didn't return data
+              console.debug(`[Analysis] Falling back to individual history fetch for ${ticker}`);
+              const historyResponse = await getStockHistory(ticker, '1y');
+              history = historyResponse.history;
+            }
+            
+            // Fetch stock data for 52-week high/low if needed
+            let stockData = null;
+            if (high52w === null || low52w === null) {
+              stockData = await getStock(ticker).catch(() => null);
+            }
+            
+            // Use provided values or fall back to fetched stock data
+            const finalHigh52w = high52w ?? stockData?.high_52w ?? null;
+            const finalLow52w = low52w ?? stockData?.low_52w ?? null;
+            const finalPrice = currentPrice || stockData?.current_price || 0;
+            
+            if (!finalPrice) {
+              throw new Error('Unable to determine current price');
+            }
+            
+            // Get analysis data from batch result
+            let additionalData: AdditionalAnalysisData | undefined;
+            const analysisData = batchAnalysisData[ticker];
+            if (analysisData) {
+              additionalData = {
+                roic: analysisData.fundamentals?.roic,
+                roe: analysisData.fundamentals?.roe,
+                sector: analysisData.fundamentals?.sector,
+                industry: analysisData.fundamentals?.industry,
+                beta: analysisData.fundamentals?.beta,
+                callPutRatioOI: analysisData.options?.call_put_ratio_oi,
+                callPutRatioVolume: analysisData.options?.call_put_ratio_volume,
+                optionsSentiment: analysisData.options?.options_sentiment,
+                avgImpliedVolatility: analysisData.options?.avg_implied_volatility,
+                ivPercentile: analysisData.options?.iv_percentile,
+                hasOptions: analysisData.options?.has_options ?? false
+              };
+            }
+            
+            // Run the analysis with complete data
+            const analysis = analyzeStock(
+              ticker,
+              history,
+              finalPrice,
+              finalHigh52w,
+              finalLow52w,
+              undefined, // Use default weights
+              additionalData
+            );
+            
+            // Cache the result
+            setCachedAnalysis(ticker, analysis);
+            onUpdate(ticker, analysis);
+            
+          } catch (err) {
+            const message = err instanceof Error ? err.message : 'Analysis failed';
+            console.error(`[Analysis] Failed for ${ticker}:`, message);
+            onError(ticker, message);
+          } finally {
+            pendingRequests.delete(ticker);
           }
+        })
+      );
+      
+    } catch (err) {
+      // If batch fetch completely fails, try individual fetches as fallback
+      console.error('[Analysis] Batch history fetch failed, falling back to individual:', err);
+      
+      await Promise.all(
+        validRequests.map(async (request) => {
+          const { ticker, currentPrice, high52w, low52w } = request;
           
-          // Run the analysis with complete data
-          const analysis = analyzeStock(
-            ticker,
-            history,
-            finalPrice,
-            finalHigh52w,
-            finalLow52w,
-            undefined, // Use default weights
-            additionalData
-          );
-          
-          // Cache the result
-          setCachedAnalysis(ticker, analysis);
-          onUpdate(ticker, analysis);
-          
-        } catch (err) {
-          const message = err instanceof Error ? err.message : 'Analysis failed';
-          console.error(`[Analysis] Failed for ${ticker}:`, message);
-          onError(ticker, message);
-        } finally {
-          pendingRequests.delete(ticker);
-        }
-      })
-    );
+          try {
+            const [historyResponse, stockData] = await Promise.all([
+              getStockHistory(ticker, '1y'),
+              getStock(ticker).catch(() => null)
+            ]);
+            
+            const history = historyResponse.history;
+            const finalHigh52w = high52w ?? stockData?.high_52w ?? null;
+            const finalLow52w = low52w ?? stockData?.low_52w ?? null;
+            const finalPrice = currentPrice || stockData?.current_price || 0;
+            
+            if (!finalPrice) {
+              throw new Error('Unable to determine current price');
+            }
+            
+            let additionalData: AdditionalAnalysisData | undefined;
+            try {
+              const analysisData = await fetchStockAnalysisData(ticker);
+              additionalData = {
+                roic: analysisData.fundamentals?.roic,
+                roe: analysisData.fundamentals?.roe,
+                sector: analysisData.fundamentals?.sector,
+                industry: analysisData.fundamentals?.industry,
+                beta: analysisData.fundamentals?.beta,
+                callPutRatioOI: analysisData.options?.call_put_ratio_oi,
+                callPutRatioVolume: analysisData.options?.call_put_ratio_volume,
+                optionsSentiment: analysisData.options?.options_sentiment,
+                avgImpliedVolatility: analysisData.options?.avg_implied_volatility,
+                ivPercentile: analysisData.options?.iv_percentile,
+                hasOptions: analysisData.options?.has_options ?? false
+              };
+            } catch {
+              console.debug(`[Analysis] Additional data not available for ${ticker}`);
+            }
+            
+            const analysis = analyzeStock(
+              ticker,
+              history,
+              finalPrice,
+              finalHigh52w,
+              finalLow52w,
+              undefined,
+              additionalData
+            );
+            
+            setCachedAnalysis(ticker, analysis);
+            onUpdate(ticker, analysis);
+            
+          } catch (err) {
+            const message = err instanceof Error ? err.message : 'Analysis failed';
+            console.error(`[Analysis] Failed for ${ticker}:`, message);
+            onError(ticker, message);
+          } finally {
+            pendingRequests.delete(ticker);
+          }
+        })
+      );
+    }
     
     // Small delay between batches to be nice to the API
     if (requestQueue.length > 0) {
@@ -249,7 +341,7 @@ export function useStockAnalysis(
     };
   }, [ticker, currentPrice, high52w, low52w]);
   
-  // Queue analysis request
+  // Queue analysis request with debouncing
   const queueAnalysis = useCallback((
     t: string,
     price: number,
@@ -267,8 +359,16 @@ export function useStockAnalysis(
       low52w: low
     });
     
-    // Start processing queue
-    processQueue(
+    // Debounce queue processing to let multiple components queue their requests
+    // before we start processing. This allows us to batch ALL requests together.
+    if (queueDebounceTimer) {
+      clearTimeout(queueDebounceTimer);
+    }
+    
+    queueDebounceTimer = setTimeout(() => {
+      queueDebounceTimer = null;
+      // Start processing queue
+      processQueue(
       // onUpdate
       (updatedTicker, analysis) => {
         if (mountedRef.current && updatedTicker === ticker) {
@@ -298,6 +398,7 @@ export function useStockAnalysis(
         }
       }
     );
+    }, QUEUE_DEBOUNCE_MS); // End of debounce setTimeout
   }, [ticker]);
   
   return state;

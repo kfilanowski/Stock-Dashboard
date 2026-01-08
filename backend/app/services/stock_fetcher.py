@@ -20,12 +20,14 @@ yfinance advantages:
 Note: yfinance is synchronous so we use run_in_executor for FastAPI compatibility.
 """
 import asyncio
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple
 
 import pandas as pd
 import pytz
+import requests_cache
 from yahooquery import Ticker as YQTicker  # For batch quotes
 import yfinance as yf  # For history with prepost=True
 
@@ -35,11 +37,41 @@ from .cache import StockCache, get_stock_cache
 from .price_history import PriceHistoryService, get_price_history_service
 from .calculations import StockCalculations
 from .candle_aggregator import CandleAggregator, get_candle_aggregator
+from .retry import make_yahoo_request
 
 logger = get_logger(__name__)
 
 # US Eastern timezone for market hours
 MARKET_TZ = pytz.timezone('US/Eastern')
+
+# Shared cached session for yfinance - prevents rate limits and cache conflicts
+# The session handles connection pooling and HTTP-level caching
+_yf_session: Optional[requests_cache.CachedSession] = None
+
+
+def get_yf_session() -> requests_cache.CachedSession:
+    """
+    Get the shared yfinance session with HTTP-level caching.
+    
+    This provides:
+    - Connection pooling (reduces connections to Yahoo)
+    - Cookie persistence (helps avoid bot detection)
+    - Thread-safe SQLite caching (prevents locking conflicts)
+    """
+    global _yf_session
+    if _yf_session is None:
+        # Ensure data directory exists
+        os.makedirs("data", exist_ok=True)
+        
+        _yf_session = requests_cache.CachedSession(
+            'data/yfinance_http_cache',
+            backend='sqlite',
+            expire_after=60,  # HTTP cache for 1 minute
+            allowable_methods=['GET', 'POST'],
+        )
+        _yf_session.headers['User-Agent'] = 'StockDashboard/1.0'
+        logger.info("Initialized shared yfinance HTTP cache session")
+    return _yf_session
 
 
 class StockFetcher:
@@ -55,6 +87,11 @@ class StockFetcher:
     
     Both are wrapped appropriately for FastAPI async compatibility.
     """
+    
+    # 52-week data cache (shared across instances) - TTL: 15 minutes
+    _52week_cache: Dict[str, Dict[str, Any]] = {}
+    _52week_cache_time: float = 0
+    _52WEEK_CACHE_TTL = 15 * 60  # 15 minutes
     
     def __init__(
         self,
@@ -155,6 +192,83 @@ class StockFetcher:
         
         return history
     
+    def _yf_download_to_intraday_history(self, df: pd.DataFrame, ticker: str = None) -> List[Dict[str, Any]]:
+        """
+        Convert yf.download() DataFrame to intraday history format.
+        
+        yf.download() returns a DataFrame with:
+        - DatetimeIndex as index
+        - Columns: Open, High, Low, Close, Volume (capital letters)
+        
+        This is different from yahooquery which uses lowercase and multi-index.
+        """
+        history = []
+        calc = StockCalculations()
+        
+        if df.empty:
+            return history
+        
+        # Make a copy to avoid modifying the original
+        df = df.copy()
+        
+        # Flatten MultiIndex columns if present (happens with single ticker from multi-ticker download)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+        
+        # yf.download() uses DatetimeIndex
+        for idx in range(len(df)):
+            row = df.iloc[idx]
+            ts = df.index[idx]
+            
+            # yf.download() uses capital column names
+            # Check for NaN BEFORE converting - batch downloads create NaN for missing data
+            close_val = row.get('Close')
+            if pd.isna(close_val):
+                # Skip rows with no data (happens when batch downloading multiple tickers
+                # with different trading hours - union of timestamps creates NaN gaps)
+                continue
+            
+            open_val = row.get('Open', 0)
+            high_val = row.get('High', 0)
+            low_val = row.get('Low', 0)
+            volume_val = row.get('Volume', 0)
+            
+            # Also skip if all OHLC are NaN or zero (no actual trading)
+            if pd.isna(open_val) and pd.isna(high_val) and pd.isna(low_val):
+                continue
+            
+            # Convert to Python datetime
+            if hasattr(ts, 'to_pydatetime'):
+                timestamp = ts.to_pydatetime()
+            else:
+                timestamp = pd.Timestamp(ts).to_pydatetime()
+            
+            # Convert to US/Eastern timezone for display
+            if timestamp.tzinfo is not None:
+                timestamp = timestamp.astimezone(MARKET_TZ).replace(tzinfo=None)
+            
+            # Now safe to convert (we've filtered out NaN)
+            open_f = calc.safe_float(open_val)
+            high_f = calc.safe_float(high_val)
+            low_f = calc.safe_float(low_val)
+            close_f = calc.safe_float(close_val)
+            
+            # Skip zero-value candles (shouldn't happen now, but safety check)
+            if close_f == 0:
+                continue
+            
+            history.append({
+                "date": timestamp.strftime('%Y-%m-%d %H:%M'),
+                "timestamp": timestamp,
+                "open": round(open_f, 2),
+                "high": round(high_f, 2),
+                "low": round(low_f, 2),
+                "close": round(close_f, 2),
+                "volume": calc.safe_int(volume_val)
+            })
+        
+        return history
+    
     def _dataframe_to_intraday_history(self, df: pd.DataFrame, ticker: str = None) -> List[Dict[str, Any]]:
         """Convert DataFrame to intraday history with full timestamps."""
         history = []
@@ -204,20 +318,24 @@ class StockFetcher:
                 timestamp = timestamp.astimezone(MARKET_TZ).replace(tzinfo=None)
             
             # yahooquery uses lowercase column names
-            open_val = row.get('open') or row.get('Open', 0)
-            high_val = row.get('high') or row.get('High', 0)
-            low_val = row.get('low') or row.get('Low', 0)
-            close_val = row.get('close') or row.get('Close', 0)
-            volume_val = row.get('volume') or row.get('Volume', 0)
+            open_val = calc.safe_float(row.get('open') or row.get('Open', 0))
+            high_val = calc.safe_float(row.get('high') or row.get('High', 0))
+            low_val = calc.safe_float(row.get('low') or row.get('Low', 0))
+            close_val = calc.safe_float(row.get('close') or row.get('Close', 0))
+            volume_val = calc.safe_int(row.get('volume') or row.get('Volume', 0))
+            
+            # Skip candles with zero prices (no trading activity)
+            if close_val == 0 or (open_val == 0 and high_val == 0 and low_val == 0):
+                continue
             
             history.append({
                 "date": timestamp.strftime('%Y-%m-%d %H:%M'),
                 "timestamp": timestamp,
-                "open": round(calc.safe_float(open_val), 2),
-                "high": round(calc.safe_float(high_val), 2),
-                "low": round(calc.safe_float(low_val), 2),
-                "close": round(calc.safe_float(close_val), 2),
-                "volume": calc.safe_int(volume_val)
+                "open": round(open_val, 2),
+                "high": round(high_val, 2),
+                "low": round(low_val, 2),
+                "close": round(close_val, 2),
+                "volume": volume_val
             })
         
         return history
@@ -254,7 +372,11 @@ class StockFetcher:
         
         try:
             t = YQTicker(ticker)
-            price_data = t.price.get(ticker, {})
+            price_data = make_yahoo_request(
+                lambda: t.price.get(ticker, {}),
+                description=f"validate ticker {ticker}",
+                default_value={}
+            )
             
             if isinstance(price_data, str):
                 # Error message returned
@@ -290,123 +412,126 @@ class StockFetcher:
         if cached:
             return cached
         
-        for attempt in range(settings.yfinance_retries):
-            try:
-                t = YQTicker(ticker)
-                
-                # Get price info - yahooquery returns dict keyed by ticker
-                price_data = t.price.get(ticker, {})
-                
-                if isinstance(price_data, str):
-                    # Error message - invalid ticker
-                    logger.warning(f"Invalid ticker {ticker}: {price_data}")
-                    return self._empty_response(ticker)
-                
-                regular_price = price_data.get('regularMarketPrice', 0)
-                previous_close = price_data.get('regularMarketPreviousClose') or price_data.get('previousClose') or regular_price
-                
-                # Check for pre/post market prices
-                current_price = regular_price
-                market_state = price_data.get('marketState', '')
-                
-                if market_state in ('PRE', 'PREPRE'):
-                    pre_market = price_data.get('preMarketPrice')
-                    if pre_market and pre_market > 0:
-                        current_price = pre_market
-                elif market_state in ('POST', 'POSTPOST', 'CLOSED'):
-                    post_market = price_data.get('postMarketPrice')
-                    if post_market and post_market > 0:
-                        current_price = post_market
-                
-                if not current_price or current_price == 0:
-                    if attempt < settings.yfinance_retries - 1:
-                        continue
-                    return self._empty_response(ticker)
-                
-                current_price = float(current_price)
-                previous_close = float(previous_close) if previous_close else current_price
-                
-                # Calculate change
-                change = current_price - previous_close
-                change_pct = (change / previous_close * 100) if previous_close else 0
-                
-                # Get historical data for SMA
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=250)
-                
-                # Try database first
-                history_data = self._price_history.get_daily_history(
-                    ticker,
-                    start_date.strftime('%Y-%m-%d'),
-                    end_date.strftime('%Y-%m-%d')
-                )
-                
-                # Fetch from API if not enough data
-                if len(history_data) < 50:
-                    hist = t.history(
+        try:
+            t = YQTicker(ticker)
+            
+            # Get price info with retry - yahooquery returns dict keyed by ticker
+            price_data = make_yahoo_request(
+                lambda: t.price.get(ticker, {}),
+                description=f"fetch price for {ticker}",
+                default_value={}
+            )
+            
+            if isinstance(price_data, str):
+                # Error message - invalid ticker
+                logger.warning(f"Invalid ticker {ticker}: {price_data}")
+                return self._empty_response(ticker)
+            
+            regular_price = price_data.get('regularMarketPrice', 0)
+            previous_close = price_data.get('regularMarketPreviousClose') or price_data.get('previousClose') or regular_price
+            
+            # Check for pre/post market prices
+            current_price = regular_price
+            market_state = price_data.get('marketState', '')
+            
+            if market_state in ('PRE', 'PREPRE'):
+                pre_market = price_data.get('preMarketPrice')
+                if pre_market and pre_market > 0:
+                    current_price = pre_market
+            elif market_state in ('POST', 'POSTPOST', 'CLOSED'):
+                post_market = price_data.get('postMarketPrice')
+                if post_market and post_market > 0:
+                    current_price = post_market
+            
+            if not current_price or current_price == 0:
+                return self._empty_response(ticker)
+            
+            current_price = float(current_price)
+            previous_close = float(previous_close) if previous_close else current_price
+            
+            # Calculate change
+            change = current_price - previous_close
+            change_pct = (change / previous_close * 100) if previous_close else 0
+            
+            # Get historical data for SMA
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=250)
+            
+            # Try database first
+            history_data = self._price_history.get_daily_history(
+                ticker,
+                start_date.strftime('%Y-%m-%d'),
+                end_date.strftime('%Y-%m-%d')
+            )
+            
+            # Fetch from API if not enough data
+            if len(history_data) < 50:
+                hist = make_yahoo_request(
+                    lambda: t.history(
                         start=start_date.strftime('%Y-%m-%d'),
                         end=end_date.strftime('%Y-%m-%d'),
                         adj_ohlc=True
-                    )
-                    
-                    if isinstance(hist, pd.DataFrame) and not hist.empty:
-                        history_data = self._dataframe_to_daily_history(hist, ticker)
-                        self._price_history.store_daily_history(ticker, history_data)
-                
-                # Calculate SMA(200)
-                sma_200 = None
-                price_vs_sma = None
-                
-                if history_data:
-                    closes = [h['close'] for h in history_data if h.get('close')]
-                    sma_200 = calc.calculate_sma(closes, 200)
-                    if sma_200:
-                        price_vs_sma = calc.calculate_price_vs_sma(current_price, sma_200)
-                
-                # Calculate YTD return
-                ytd_return = calc.calculate_ytd_return(current_price, history_data)
-                
-                # Get 52-week high/low from summary_detail
-                summary = t.summary_detail.get(ticker, {})
-                high_52w = summary.get('fiftyTwoWeekHigh')
-                low_52w = summary.get('fiftyTwoWeekLow')
-                
-                if not high_52w and history_data:
-                    highs = [h['high'] for h in history_data if h.get('high')]
-                    high_52w = max(highs) if highs else None
-                if not low_52w and history_data:
-                    lows = [h['low'] for h in history_data if h.get('low')]
-                    low_52w = min(lows) if lows else None
-                
-                # Return last 30 days for mini chart
-                history = history_data[-30:] if history_data else []
-                
-                result = {
-                    "ticker": ticker,
-                    "current_price": round(current_price, 2),
-                    "previous_close": round(previous_close, 2),
-                    "change": round(change, 2),
-                    "change_pct": round(change_pct, 2),
-                    "ytd_return": round(ytd_return, 2),
-                    "sma_200": round(sma_200, 2) if sma_200 else None,
-                    "price_vs_sma": round(price_vs_sma, 2) if price_vs_sma else None,
-                    "high_52w": round(float(high_52w), 2) if high_52w else None,
-                    "low_52w": round(float(low_52w), 2) if low_52w else None,
-                    "history": history
-                }
-                
-                self._cache.set(f"stock:{ticker}", result)
-                return result
-                
-            except Exception as e:
-                logger.warning(
-                    f"Attempt {attempt + 1}/{settings.yfinance_retries} "
-                    f"failed for {ticker}: {e}"
+                    ),
+                    description=f"fetch history for {ticker}",
+                    default_value=pd.DataFrame()
                 )
-                if attempt < settings.yfinance_retries - 1:
-                    continue
-        
-        return self._empty_response(ticker)
+                
+                if isinstance(hist, pd.DataFrame) and not hist.empty:
+                    history_data = self._dataframe_to_daily_history(hist, ticker)
+                    self._price_history.store_daily_history(ticker, history_data)
+            
+            # Calculate SMA(200)
+            sma_200 = None
+            price_vs_sma = None
+            
+            if history_data:
+                closes = [h['close'] for h in history_data if h.get('close')]
+                sma_200 = calc.calculate_sma(closes, 200)
+                if sma_200:
+                    price_vs_sma = calc.calculate_price_vs_sma(current_price, sma_200)
+            
+            # Calculate YTD return
+            ytd_return = calc.calculate_ytd_return(current_price, history_data)
+            
+            # Get 52-week high/low from summary_detail with retry
+            summary = make_yahoo_request(
+                lambda: t.summary_detail.get(ticker, {}),
+                description=f"fetch summary for {ticker}",
+                default_value={}
+            )
+            high_52w = summary.get('fiftyTwoWeekHigh') if isinstance(summary, dict) else None
+            low_52w = summary.get('fiftyTwoWeekLow') if isinstance(summary, dict) else None
+            
+            if not high_52w and history_data:
+                highs = [h['high'] for h in history_data if h.get('high')]
+                high_52w = max(highs) if highs else None
+            if not low_52w and history_data:
+                lows = [h['low'] for h in history_data if h.get('low')]
+                low_52w = min(lows) if lows else None
+            
+            # Return last 30 days for mini chart
+            history = history_data[-30:] if history_data else []
+            
+            result = {
+                "ticker": ticker,
+                "current_price": round(current_price, 2),
+                "previous_close": round(previous_close, 2),
+                "change": round(change, 2),
+                "change_pct": round(change_pct, 2),
+                "ytd_return": round(ytd_return, 2),
+                "sma_200": round(sma_200, 2) if sma_200 else None,
+                "price_vs_sma": round(price_vs_sma, 2) if price_vs_sma else None,
+                "high_52w": round(float(high_52w), 2) if high_52w else None,
+                "low_52w": round(float(low_52w), 2) if low_52w else None,
+                "history": history
+            }
+            
+            self._cache.set(f"stock:{ticker}", result)
+            return result
+            
+        except Exception as e:
+            logger.warning(f"Failed to fetch stock data for {ticker}: {e}")
+            return self._empty_response(ticker)
     
     def _get_multiple_stocks_sync(self, tickers: List[str]) -> Dict[str, Dict[str, Any]]:
         """Fetch data for multiple stocks using yahooquery's batch capabilities."""
@@ -430,18 +555,30 @@ class StockFetcher:
             # Batch fetch all uncached tickers at once with yahooquery
             t = YQTicker(uncached_tickers)
             
-            # Get all price data in one call (includes pre/post market)
-            all_prices = t.price
-            all_summaries = t.summary_detail
+            # Get all price data in one call (includes pre/post market) with retry
+            all_prices = make_yahoo_request(
+                lambda: t.price,
+                description=f"batch fetch prices for {len(uncached_tickers)} tickers",
+                default_value={}
+            )
+            all_summaries = make_yahoo_request(
+                lambda: t.summary_detail,
+                description=f"batch fetch summaries for {len(uncached_tickers)} tickers",
+                default_value={}
+            )
             
             # Get historical data for all tickers (daily, no extended hours needed)
             end_date = datetime.now()
             start_date = end_date - timedelta(days=250)
             
-            all_history = t.history(
-                start=start_date.strftime('%Y-%m-%d'),
-                end=end_date.strftime('%Y-%m-%d'),
-                adj_ohlc=True
+            all_history = make_yahoo_request(
+                lambda: t.history(
+                    start=start_date.strftime('%Y-%m-%d'),
+                    end=end_date.strftime('%Y-%m-%d'),
+                    adj_ohlc=True
+                ),
+                description=f"batch fetch history for {len(uncached_tickers)} tickers",
+                default_value=pd.DataFrame()
             )
             
             for ticker in uncached_tickers:
@@ -571,6 +708,8 @@ class StockFetcher:
         Also updates the candle aggregator and returns chart_point for
         real-time 1m chart updates.
         
+        Includes 52-week high/low data for analysis (cached, doesn't change frequently).
+        
         No caching - always fetches fresh data from Yahoo.
         """
         import time
@@ -585,12 +724,50 @@ class StockFetcher:
             # This includes pre/post market prices automatically
             start = time.time()
             t = YQTicker(tickers)
-            all_prices = t.price
-            elapsed = time.time() - start
-            logger.info(f"Yahoo prices fetch for {tickers}: {elapsed:.2f}s")
+            
+            # Fetch prices (always fresh)
+            all_prices = make_yahoo_request(
+                lambda: t.price,
+                description=f"batch prices for {len(tickers)} tickers",
+                default_value={}
+            )
+            
+            price_elapsed = time.time() - start
+            
+            # Check if 52-week cache needs refresh (every 15 minutes)
+            current_time = time.time()
+            need_52week_refresh = (
+                current_time - StockFetcher._52week_cache_time > StockFetcher._52WEEK_CACHE_TTL or
+                any(t not in StockFetcher._52week_cache for t in tickers)
+            )
+            
+            # Fetch summaries only if cache is stale or missing data
+            if need_52week_refresh:
+                summary_start = time.time()
+                all_summaries = make_yahoo_request(
+                    lambda: t.summary_detail,
+                    description=f"batch summaries for {len(tickers)} tickers",
+                    default_value={}
+                )
+                # Update cache
+                for ticker in tickers:
+                    summary_data = all_summaries.get(ticker, {})
+                    if isinstance(summary_data, dict):
+                        StockFetcher._52week_cache[ticker] = {
+                            'high_52w': summary_data.get('fiftyTwoWeekHigh'),
+                            'low_52w': summary_data.get('fiftyTwoWeekLow')
+                        }
+                StockFetcher._52week_cache_time = current_time
+                summary_elapsed = time.time() - summary_start
+                logger.info(f"Yahoo prices: {price_elapsed:.2f}s, summaries (refreshed): {summary_elapsed:.2f}s for {len(tickers)} tickers")
+            else:
+                # Use cached summaries
+                all_summaries = {t: StockFetcher._52week_cache.get(t, {}) for t in tickers}
+                logger.info(f"Yahoo prices: {price_elapsed:.2f}s for {len(tickers)} tickers (52-week cached)")
             
             for ticker in tickers:
                 price_data = all_prices.get(ticker, {})
+                summary_data = all_summaries.get(ticker, {})
                 
                 if isinstance(price_data, str):
                     # Error message - invalid ticker
@@ -601,9 +778,19 @@ class StockFetcher:
                         "change": 0,
                         "change_pct": 0,
                         "market_state": "ERROR",
-                        "chart_point": None
+                        "chart_point": None,
+                        "high_52w": None,
+                        "low_52w": None
                     }
                     continue
+                
+                # Extract 52-week data from summary (handles both raw API response and cached format)
+                high_52w = None
+                low_52w = None
+                if isinstance(summary_data, dict):
+                    # Try cached format first (high_52w), then raw API format (fiftyTwoWeekHigh)
+                    high_52w = summary_data.get('high_52w') or summary_data.get('fiftyTwoWeekHigh')
+                    low_52w = summary_data.get('low_52w') or summary_data.get('fiftyTwoWeekLow')
                 
                 regular_price = price_data.get('regularMarketPrice', 0)
                 previous_close = (
@@ -649,7 +836,9 @@ class StockFetcher:
                     "change": round(change, 2),
                     "change_pct": round(change_pct, 2),
                     "market_state": market_state,
-                    "chart_point": chart_point
+                    "chart_point": chart_point,
+                    "high_52w": round(float(high_52w), 2) if high_52w else None,
+                    "low_52w": round(float(low_52w), 2) if low_52w else None
                 }
                 
         except Exception as e:
@@ -664,7 +853,9 @@ class StockFetcher:
                         "change": 0,
                         "change_pct": 0,
                         "market_state": "ERROR",
-                        "chart_point": None
+                        "chart_point": None,
+                        "high_52w": None,
+                        "low_52w": None
                     }
         
         return results
@@ -705,10 +896,14 @@ class StockFetcher:
         # Fetch from API if not in database (daily data, yahooquery is fine)
         try:
             t = YQTicker(ticker)
-            hist = t.history(
-                start=start_date.strftime('%Y-%m-%d'),
-                end=end_date.strftime('%Y-%m-%d'),
-                adj_ohlc=True
+            hist = make_yahoo_request(
+                lambda: t.history(
+                    start=start_date.strftime('%Y-%m-%d'),
+                    end=end_date.strftime('%Y-%m-%d'),
+                    adj_ohlc=True
+                ),
+                description=f"fetch reference close for {ticker}",
+                default_value=pd.DataFrame()
             )
             
             if isinstance(hist, pd.DataFrame) and not hist.empty:
@@ -805,10 +1000,14 @@ class StockFetcher:
                 gap_start, gap_end = coverage["missing_start_range"]
                 logger.info(f"Fetching historical gap for {ticker} from {gap_start} to {gap_end}")
                 
-                hist = t.history(
-                    start=gap_start,
-                    end=gap_end,
-                    adj_ohlc=True
+                hist = make_yahoo_request(
+                    lambda: t.history(
+                        start=gap_start,
+                        end=gap_end,
+                        adj_ohlc=True
+                    ),
+                    description=f"fetch historical gap for {ticker}",
+                    default_value=pd.DataFrame()
                 )
                 
                 if isinstance(hist, pd.DataFrame) and not hist.empty:
@@ -822,10 +1021,14 @@ class StockFetcher:
                 gap_start, gap_end = coverage["missing_end_range"]
                 logger.info(f"Fetching recent data for {ticker} from {gap_start} to {gap_end}")
                 
-                hist = t.history(
-                    start=gap_start,
-                    end=gap_end,
-                    adj_ohlc=True
+                hist = make_yahoo_request(
+                    lambda: t.history(
+                        start=gap_start,
+                        end=gap_end,
+                        adj_ohlc=True
+                    ),
+                    description=f"fetch recent data for {ticker}",
+                    default_value=pd.DataFrame()
                 )
                 
                 if isinstance(hist, pd.DataFrame) and not hist.empty:
@@ -920,20 +1123,30 @@ class StockFetcher:
                     actual_end.date() < end_time_eastern.date()
                 )
                 
-                if not coverage['has_data'] or len(missing_ranges) > 2 or missing_today:
-                    # No data, too fragmented, or missing today's data - fetch full period
+                # Be aggressive about refetching: if ANY gaps detected, do full refetch
+                # This ensures we don't have fragmented data and is simpler than 
+                # trying to surgically fill small gaps
+                if not coverage['has_data'] or len(missing_ranges) > 0 or missing_today:
+                    # No data, any gaps detected, or missing today's data - fetch full period
                     # Using full period fetch is more reliable for intraday data
+                    reason = "no data" if not coverage['has_data'] else \
+                             f"{len(missing_ranges)} gap(s) detected" if missing_ranges else \
+                             "missing today's data"
                     logger.info(
                         f"Fetching full intraday ({interval}) data for {ticker}, "
-                        f"{fetch_days} days with prepost=True"
-                        f"{' (missing today)' if missing_today else ''}"
+                        f"{fetch_days} days with prepost=True (reason: {reason})"
                     )
                     
+                    # Note: Don't pass session - yfinance now uses curl_cffi which is incompatible with requests_cache
                     yf_ticker = yf.Ticker(ticker)
-                    hist = yf_ticker.history(
-                        period=f"{fetch_days}d",
-                        interval=interval,
-                        prepost=True
+                    hist = make_yahoo_request(
+                        lambda: yf_ticker.history(
+                            period=f"{fetch_days}d",
+                            interval=interval,
+                            prepost=True
+                        ),
+                        description=f"fetch intraday {interval} for {ticker}",
+                        default_value=pd.DataFrame()
                     )
                     
                     if not hist.empty:
@@ -947,64 +1160,6 @@ class StockFetcher:
                                 all_history[h['timestamp']] = h
                             stored = list(all_history.values())
                             logger.info(f"Fetched {len(new_history)} points for {ticker}")
-                
-                else:
-                    # Fetch only missing ranges (smart gap-fill)
-                    for gap_start, gap_end in missing_ranges:
-                        gap_duration = gap_end - gap_start
-                        
-                        # Skip tiny gaps (< 5 minutes)
-                        if gap_duration.total_seconds() < 300:
-                            continue
-                        
-                        # Calculate days needed for this gap
-                        gap_days = max(1, gap_duration.days + 1)
-                        
-                        logger.info(
-                            f"Filling gap for {ticker}: {gap_start} to {gap_end} "
-                            f"({gap_days} days)"
-                        )
-                        
-                        try:
-                            yf_ticker = yf.Ticker(ticker)
-                            
-                            # For gaps, use start/end dates instead of period
-                            # Add buffer for timezone handling
-                            start_str = (gap_start - timedelta(hours=1)).strftime('%Y-%m-%d')
-                            end_str = (gap_end + timedelta(hours=1)).strftime('%Y-%m-%d')
-                            
-                            hist = yf_ticker.history(
-                                start=start_str,
-                                end=end_str,
-                                interval=interval,
-                                prepost=True
-                            )
-                            
-                            if not hist.empty:
-                                new_history = self._dataframe_to_intraday_history(hist, ticker)
-                                
-                                # Filter to only the gap range
-                                gap_history = [
-                                    h for h in new_history
-                                    if gap_start <= h['timestamp'] <= gap_end
-                                ]
-                                
-                                if gap_history:
-                                    self._price_history.store_intraday_history(
-                                        ticker, interval, gap_history
-                                    )
-                                    
-                                    # Merge with existing
-                                    all_history = {h['timestamp']: h for h in stored}
-                                    for h in gap_history:
-                                        all_history[h['timestamp']] = h
-                                    stored = list(all_history.values())
-                                    
-                                    logger.info(
-                                        f"Filled gap with {len(gap_history)} points for {ticker}"
-                                    )
-                        except Exception as e:
-                            logger.warning(f"Failed to fill gap for {ticker}: {e}")
                             
             except Exception as e:
                 logger.error(f"Error fetching intraday data for {ticker}: {e}")
@@ -1145,6 +1300,396 @@ class StockFetcher:
             period
         )
     
+    # ============ Batch History Methods ============
+    
+    def _batch_get_intraday_history_sync(
+        self, 
+        tickers: List[str], 
+        period: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Batch fetch intraday history for multiple tickers.
+        
+        Uses yf.download() for efficient batch fetching with built-in
+        threading. Only fetches data that's missing from SQLite.
+        
+        Args:
+            tickers: List of ticker symbols.
+            period: Time period ('1d', '3d', '1w', '1mo').
+            
+        Returns:
+            Dict mapping ticker to history data.
+        """
+        # Period to interval and fetch days mapping
+        intraday_config = {
+            "1d": ("5m", 2),
+            "3d": ("15m", 5),
+            "1w": ("30m", 10),
+            "1mo": ("60m", 35),
+        }
+        
+        if period not in intraday_config:
+            # Not an intraday period, use daily history
+            return self._batch_get_daily_history_sync(tickers, period)
+        
+        interval, fetch_days = intraday_config[period]
+        tickers = [t.upper() for t in tickers]
+        results = {}
+        
+        # Check SQLite coverage for each ticker
+        tickers_needing_data = []
+        end_time = datetime.now()
+        db_start_time = end_time - timedelta(days=fetch_days + 2)
+        
+        for ticker in tickers:
+            coverage = self._price_history.analyze_intraday_coverage(
+                ticker, interval, db_start_time, end_time
+            )
+            
+            stored = coverage.get('stored_data', [])
+            
+            if coverage['needs_fetch']:
+                tickers_needing_data.append(ticker)
+            elif stored:
+                # Have complete data in SQLite
+                stored = sorted(stored, key=lambda x: x['timestamp'])
+                filtered = self._price_history.filter_intraday_by_period(stored, period)
+                
+                if filtered:
+                    result_dates = sorted(set(
+                        h['timestamp'].strftime('%Y-%m-%d') 
+                        for h in filtered if h.get('timestamp')
+                    ))
+                    
+                    reference_close = None
+                    if result_dates:
+                        first_chart_date = datetime.strptime(result_dates[0], '%Y-%m-%d')
+                        reference_close = self._get_reference_close(
+                            ticker, first_chart_date - timedelta(days=1)
+                        )
+                    
+                    # Remove timestamp from response
+                    for h in filtered:
+                        if 'timestamp' in h:
+                            del h['timestamp']
+                    
+                    results[ticker] = {
+                        "history": filtered,
+                        "reference_close": reference_close,
+                        "is_complete": True,
+                        "from_cache": True
+                    }
+        
+        if not tickers_needing_data:
+            logger.info(f"Batch intraday: all {len(tickers)} tickers served from SQLite")
+            return results
+        
+        logger.info(
+            f"Batch intraday: {len(tickers_needing_data)}/{len(tickers)} tickers need API fetch"
+        )
+        
+        # Batch fetch using yf.download() - handles threading internally
+        try:
+            logger.info(
+                f"Calling yf.download() for {len(tickers_needing_data)} tickers, "
+                f"period={fetch_days}d, interval={interval}"
+            )
+            
+            # Note: Don't pass session - yfinance now uses curl_cffi which is incompatible with requests_cache
+            data = yf.download(
+                tickers=tickers_needing_data,
+                period=f"{fetch_days}d",
+                interval=interval,
+                prepost=True,
+                group_by='ticker',
+                threads=True,
+                progress=False
+            )
+            
+            logger.info(
+                f"yf.download() returned: shape={data.shape if not data.empty else 'empty'}, "
+                f"columns={list(data.columns.get_level_values(0).unique()) if hasattr(data.columns, 'get_level_values') else list(data.columns)}"
+            )
+            
+            if data.empty:
+                logger.warning("yf.download() returned empty data - will use fallback")
+                # Skip processing, let fallback handle it
+                raise ValueError("Empty data from yf.download()")
+            
+            # Process each ticker's data
+            for ticker in tickers_needing_data:
+                try:
+                    # Extract ticker data from multi-ticker DataFrame
+                    # yf.download() with group_by='ticker' returns MultiIndex columns
+                    if len(tickers_needing_data) == 1:
+                        ticker_df = data
+                    else:
+                        # Check if ticker exists in the MultiIndex columns
+                        try:
+                            if hasattr(data.columns, 'get_level_values'):
+                                level_0 = data.columns.get_level_values(0)
+                                if ticker not in level_0:
+                                    logger.warning(f"No data for {ticker} in batch download")
+                                    continue
+                            ticker_df = data[ticker]
+                        except KeyError:
+                            logger.warning(f"KeyError accessing {ticker} in batch download")
+                            continue
+                    
+                    if ticker_df.empty:
+                        continue
+                    
+                    # Convert yf.download() DataFrame to history format
+                    # yf.download() has: DatetimeIndex, columns: Open, High, Low, Close, Volume
+                    new_history = self._yf_download_to_intraday_history(ticker_df, ticker)
+                    
+                    if new_history:
+                        # Store in SQLite
+                        self._price_history.store_intraday_history(ticker, interval, new_history)
+                        
+                        # Filter to period
+                        filtered = self._price_history.filter_intraday_by_period(new_history, period)
+                        
+                        if filtered:
+                            result_dates = sorted(set(
+                                h['timestamp'].strftime('%Y-%m-%d') 
+                                for h in filtered if h.get('timestamp')
+                            ))
+                            
+                            reference_close = None
+                            if result_dates:
+                                first_chart_date = datetime.strptime(result_dates[0], '%Y-%m-%d')
+                                reference_close = self._get_reference_close(
+                                    ticker, first_chart_date - timedelta(days=1)
+                                )
+                            
+                            # Remove timestamp from response
+                            for h in filtered:
+                                if 'timestamp' in h:
+                                    del h['timestamp']
+                            
+                            results[ticker] = {
+                                "history": filtered,
+                                "reference_close": reference_close,
+                                "is_complete": True,
+                                "from_cache": False
+                            }
+                            
+                except Exception as e:
+                    logger.error(f"Error processing {ticker} from batch download: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Batch yf.download() failed: {e}")
+        
+        # Fallback: For any tickers that didn't get data, try individual fetch
+        missing_tickers = [t for t in tickers if t not in results]
+        if missing_tickers:
+            logger.info(
+                f"Batch fallback: {len(missing_tickers)}/{len(tickers)} tickers need individual fetch: "
+                f"{missing_tickers[:5]}{'...' if len(missing_tickers) > 5 else ''}"
+            )
+            for ticker in missing_tickers:
+                try:
+                    # Use the existing single-ticker method
+                    single_result = self._get_stock_history_sync(ticker, period)
+                    if single_result.get('history'):
+                        results[ticker] = {
+                            "history": single_result['history'],
+                            "reference_close": single_result.get('reference_close'),
+                            "is_complete": single_result.get('is_complete', True),
+                            "from_cache": False
+                        }
+                        logger.debug(f"Fallback success for {ticker}: {len(single_result['history'])} points")
+                    else:
+                        logger.warning(f"Fallback returned empty history for {ticker}")
+                except Exception as e:
+                    logger.error(f"Fallback fetch failed for {ticker}: {e}", exc_info=True)
+        
+        logger.info(f"Batch intraday complete: {len(results)}/{len(tickers)} tickers returned data")
+        return results
+    
+    def _batch_get_daily_history_sync(
+        self, 
+        tickers: List[str], 
+        period: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Batch fetch daily history for multiple tickers.
+        
+        Uses yahooquery for batch daily history fetching.
+        Only fetches data that's missing from SQLite.
+        
+        Args:
+            tickers: List of ticker symbols.
+            period: Time period ('3mo', '6mo', '1y', 'ytd', '2y', '5y').
+            
+        Returns:
+            Dict mapping ticker to history data.
+        """
+        daily_periods = {
+            "3mo": 90, 
+            "6mo": 180, 
+            "1y": 365, 
+            "2y": 730,
+            "5y": 1825,
+        }
+        
+        tickers = [t.upper() for t in tickers]
+        results = {}
+        
+        end_time = datetime.now()
+        
+        # Handle YTD
+        if period == "ytd":
+            year_start = datetime(end_time.year, 1, 1)
+            days = (end_time - year_start).days
+        else:
+            days = daily_periods.get(period, 365)
+        
+        start_date = end_time - timedelta(days=days)
+        start_str = start_date.strftime('%Y-%m-%d')
+        end_str = end_time.strftime('%Y-%m-%d')
+        
+        # Check SQLite coverage for each ticker
+        tickers_needing_data = []
+        
+        for ticker in tickers:
+            stored_history = self._price_history.get_daily_history(ticker, start_str, end_str)
+            coverage = self._price_history.analyze_coverage(stored_history, start_str, end_str)
+            
+            if (coverage["has_data"] and 
+                not coverage["missing_start_range"] and 
+                not coverage["missing_end_range"]):
+                # Have complete data in SQLite
+                reference_close = self._calculate_daily_reference(ticker, stored_history)
+                
+                # Sample data based on period
+                result = stored_history
+                if period == "2y" and len(result) > 400:
+                    result = result[::2]
+                elif period == "5y" and len(result) > 400:
+                    result = result[::5]
+                
+                results[ticker] = {
+                    "history": result,
+                    "reference_close": reference_close,
+                    "is_complete": True,
+                    "from_cache": True
+                }
+            else:
+                tickers_needing_data.append(ticker)
+        
+        if not tickers_needing_data:
+            logger.info(f"Batch daily: all {len(tickers)} tickers served from SQLite")
+            return results
+        
+        logger.info(
+            f"Batch daily: {len(tickers_needing_data)}/{len(tickers)} tickers need API fetch"
+        )
+        
+        # Batch fetch using yahooquery
+        try:
+            t = YQTicker(tickers_needing_data)
+            all_history = make_yahoo_request(
+                lambda: t.history(
+                    start=start_str,
+                    end=end_str,
+                    adj_ohlc=True
+                ),
+                description=f"batch fetch daily history for {len(tickers_needing_data)} tickers",
+                default_value=pd.DataFrame()
+            )
+            
+            if isinstance(all_history, pd.DataFrame) and not all_history.empty:
+                for ticker in tickers_needing_data:
+                    try:
+                        history_data = self._dataframe_to_daily_history(all_history, ticker)
+                        
+                        if history_data:
+                            self._price_history.store_daily_history(ticker, history_data)
+                            
+                            # Sample data based on period
+                            result = history_data
+                            if period == "2y" and len(result) > 400:
+                                result = result[::2]
+                            elif period == "5y" and len(result) > 400:
+                                result = result[::5]
+                            
+                            reference_close = self._calculate_daily_reference(ticker, result)
+                            
+                            results[ticker] = {
+                                "history": result,
+                                "reference_close": reference_close,
+                                "is_complete": True,
+                                "from_cache": False
+                            }
+                    except Exception as e:
+                        logger.error(f"Error processing daily history for {ticker}: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Batch yahooquery history failed: {e}")
+        
+        # Fallback: For any tickers that didn't get data, try individual fetch
+        missing_tickers = [t for t in tickers if t not in results]
+        if missing_tickers:
+            logger.info(
+                f"Batch daily fallback: {len(missing_tickers)}/{len(tickers)} tickers need individual fetch: "
+                f"{missing_tickers[:5]}{'...' if len(missing_tickers) > 5 else ''}"
+            )
+            for ticker in missing_tickers:
+                try:
+                    single_result = self._get_stock_history_sync(ticker, period)
+                    if single_result.get('history'):
+                        results[ticker] = {
+                            "history": single_result['history'],
+                            "reference_close": single_result.get('reference_close'),
+                            "is_complete": single_result.get('is_complete', True),
+                            "from_cache": False
+                        }
+                        logger.debug(f"Fallback success for {ticker}: {len(single_result['history'])} points")
+                    else:
+                        logger.warning(f"Fallback returned empty history for {ticker}")
+                except Exception as e:
+                    logger.error(f"Fallback fetch failed for {ticker}: {e}", exc_info=True)
+        
+        logger.info(f"Batch daily complete: {len(results)}/{len(tickers)} tickers returned data")
+        return results
+    
+    async def batch_get_history(
+        self, 
+        tickers: List[str], 
+        period: str = "1d"
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Async wrapper for batch history fetching.
+        
+        Args:
+            tickers: List of ticker symbols.
+            period: Time period.
+            
+        Returns:
+            Dict mapping ticker to history data.
+        """
+        loop = asyncio.get_event_loop()
+        
+        # Intraday periods use yf.download
+        intraday_periods = ["1d", "3d", "1w", "1mo"]
+        
+        if period in intraday_periods:
+            return await loop.run_in_executor(
+                self._executor,
+                self._batch_get_intraday_history_sync,
+                tickers,
+                period
+            )
+        else:
+            return await loop.run_in_executor(
+                self._executor,
+                self._batch_get_daily_history_sync,
+                tickers,
+                period
+            )
+    
     # ============ Cleanup ============
     
     def cleanup_old_data(self) -> Tuple[int, int]:
@@ -1158,6 +1703,19 @@ class StockFetcher:
     def clear_ticker_history(self, ticker: str) -> tuple[int, int]:
         """Clear ALL price history for a ticker (daily + intraday). Forces full refresh."""
         return self._price_history.clear_ticker_history(ticker)
+    
+    def clear_all_intraday_cache(self) -> int:
+        """Clear ALL intraday cache for all tickers. Forces full refresh on next request."""
+        return self._price_history.clear_all_intraday_cache()
+    
+    def auto_cleanup_gapped_data(self) -> Dict[str, int]:
+        """
+        Auto-cleanup intraday data with unfillable gaps.
+        
+        Returns:
+            Dict of ticker -> deleted count for cleared tickers
+        """
+        return self._price_history.auto_cleanup_gapped_intraday()
 
 
 # Singleton instance
