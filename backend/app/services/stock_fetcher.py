@@ -1692,10 +1692,6 @@ class StockFetcher:
     
     # ============ Cleanup ============
     
-    def cleanup_old_data(self) -> Tuple[int, int]:
-        """Cleanup old price history data."""
-        return self._price_history.cleanup_old_data()
-    
     def clear_ticker_cache(self, ticker: str) -> int:
         """Clear intraday cache for a ticker."""
         return self._price_history.clear_intraday_cache(ticker)

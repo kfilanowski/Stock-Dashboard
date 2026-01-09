@@ -154,3 +154,116 @@ class OptionHolding(Base):
     __table_args__ = (
         Index('ix_option_underlying_exp', 'underlying_ticker', 'expiration_date'),
     )
+
+
+# ============================================================================
+# Walk-Forward Optimization (WFO) Calibration Models
+# ============================================================================
+
+class CalibrationWeights(Base):
+    """
+    Stores calibrated indicator weights per-stock, per-indicator, per-horizon.
+    
+    These weights are learned through Walk-Forward Optimization and used
+    to customize the scoring engine for each stock's "personality".
+    """
+    __tablename__ = "calibration_weights"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String, nullable=False, index=True)
+    indicator = Column(String, nullable=False)  # 'rsi', 'macd', 'bollinger', etc.
+    action = Column(String, nullable=False)  # 'buyShares', 'sellShares', etc.
+    horizon = Column(Integer, nullable=False)  # 3 (swing) or 15 (trend)
+    
+    # Calibrated values
+    weight = Column(Float, nullable=False, default=1.0)  # 0.0 to 2.5
+    sqn_score = Column(Float, nullable=True)  # SQN at this weight
+    stability_passed = Column(Boolean, default=True)  # Neighbor validation passed
+    
+    # Window tracking
+    window_end_date = Column(String, nullable=True)  # YYYY-MM-DD of training window end
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        UniqueConstraint('ticker', 'indicator', 'action', 'horizon', name='uix_calibration_key'),
+        Index('ix_calibration_ticker_horizon', 'ticker', 'horizon'),
+    )
+
+
+class CalibrationWindow(Base):
+    """
+    Records each rolling window in the Walk-Forward Optimization process.
+    
+    Tracks train/test periods, optimized weights, and performance metrics
+    to enable analysis of weight drift and overfitting detection.
+    """
+    __tablename__ = "calibration_windows"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String, nullable=False, index=True)
+    horizon = Column(Integer, nullable=False)  # 3 or 15
+    
+    # Window boundaries
+    train_start = Column(String, nullable=False)  # YYYY-MM-DD
+    train_end = Column(String, nullable=False)
+    test_start = Column(String, nullable=False)
+    test_end = Column(String, nullable=False)
+    window_days = Column(Integer, nullable=False)  # Actual training window size (adaptive)
+    
+    # Optimized weights (JSON string of {indicator: {action: weight}})
+    weights_json = Column(String, nullable=False)
+    
+    # Performance metrics
+    train_sqn = Column(Float, nullable=True)  # In-sample SQN
+    test_sqn = Column(Float, nullable=True)  # Out-of-sample SQN
+    expectancy = Column(Float, nullable=True)  # Average return per trade
+    trades_count = Column(Integer, nullable=True)  # Number of trades in window
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationship to trades
+    trades = relationship("CalibrationTrade", back_populates="window", cascade="all, delete-orphan")
+    
+    __table_args__ = (
+        Index('ix_window_ticker_horizon', 'ticker', 'horizon'),
+        Index('ix_window_end_date', 'ticker', 'test_end'),
+    )
+
+
+class CalibrationTrade(Base):
+    """
+    Logs simulated trades from the WFO backtesting process.
+    
+    Each trade is tagged with market regime to enable regime-specific
+    performance analysis (e.g., "RSI in BEAR_VOLATILE" queries).
+    """
+    __tablename__ = "calibration_trades"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    window_id = Column(Integer, ForeignKey("calibration_windows.id"), nullable=False)
+    ticker = Column(String, nullable=False, index=True)
+    
+    # Trade details
+    entry_date = Column(String, nullable=False)  # YYYY-MM-DD
+    exit_date = Column(String, nullable=False)
+    horizon = Column(Integer, nullable=False)  # 3 or 15
+    direction = Column(String, nullable=False)  # 'long' or 'short'
+    
+    # Prices and P&L
+    entry_price = Column(Float, nullable=False)
+    exit_price = Column(Float, nullable=False)
+    pnl_pct = Column(Float, nullable=False)  # Profit/loss percentage
+    transaction_cost = Column(Float, nullable=False, default=0.001)  # 0.1% default
+    
+    # 6-State Market Regime at entry
+    # Values: BULL_QUIET, BULL_VOLATILE, BEAR_QUIET, BEAR_VOLATILE, 
+    #         NEUTRAL_CHOP, NEUTRAL_VOLATILE
+    market_regime = Column(String, nullable=True)
+    
+    # Relationship back to window
+    window = relationship("CalibrationWindow", back_populates="trades")
+    
+    __table_args__ = (
+        Index('ix_trade_ticker_regime', 'ticker', 'market_regime'),
+        Index('ix_trade_window', 'window_id'),
+    )

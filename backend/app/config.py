@@ -30,9 +30,6 @@ class Settings(BaseSettings):
     # Cache settings
     cache_ttl_seconds: int = 60  # TTL for stock data cache (used for full stock data, not prices)
     
-    # Data retention
-    data_retention_days: int = 730  # 2 years
-    
     # Stock service settings
     # Keep workers low to avoid rate limiting from Yahoo Finance
     yfinance_max_workers: int = 4

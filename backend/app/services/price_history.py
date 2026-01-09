@@ -303,41 +303,6 @@ class PriceHistoryService:
     
     # ============ Data Cleanup ============
     
-    def cleanup_old_data(self) -> tuple[int, int]:
-        """
-        Delete price history data older than retention period.
-        
-        Returns:
-            Tuple of (daily_deleted, intraday_deleted) counts.
-        """
-        cutoff_date = datetime.now() - timedelta(days=settings.data_retention_days)
-        cutoff_str = cutoff_date.strftime('%Y-%m-%d')
-        
-        with Session(self._engine) as session:
-            # Delete old daily data
-            daily_result = session.execute(
-                delete(PriceHistory).where(PriceHistory.date < cutoff_str)
-            )
-            
-            # Delete old intraday data
-            intraday_result = session.execute(
-                delete(IntradayPriceHistory)
-                .where(IntradayPriceHistory.timestamp < cutoff_date)
-            )
-            
-            session.commit()
-            
-            daily_deleted = daily_result.rowcount
-            intraday_deleted = intraday_result.rowcount
-            
-            if daily_deleted > 0 or intraday_deleted > 0:
-                logger.info(
-                    f"Cleaned up {daily_deleted} daily and {intraday_deleted} intraday "
-                    f"records older than {settings.data_retention_days} days"
-                )
-            
-            return daily_deleted, intraday_deleted
-    
     def clear_ticker_history(self, ticker: str) -> tuple[int, int]:
         """
         Clear ALL price history for a specific ticker (both daily and intraday).

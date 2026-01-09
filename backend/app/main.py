@@ -14,7 +14,7 @@ import os
 from .config import settings
 from .logging_config import setup_logging, get_logger
 from .database import get_db, init_db, engine
-from .models import Portfolio
+from .models import Portfolio, CalibrationWeights, CalibrationWindow, CalibrationTrade
 from .schemas import (
     PortfolioUpdate, PortfolioResponse, PortfolioWithData,
     HoldingCreate, HoldingUpdate, HoldingResponse,
@@ -29,22 +29,19 @@ from .services import (
     OptionPricingService, get_option_pricing_service,
     OptionAnalyticsService, get_option_analytics_service
 )
+from .services.calibration_service import (
+    calibrate_ticker,
+    calibrate_ticker_streaming,
+    load_calibrated_weights,
+    save_calibration_result,
+    CalibrationProgress
+)
+from .services.wfo_optimizer import DEFAULT_WEIGHTS, InsufficientVolatilityError
 from .services.option_analytics import OptionPosition
 
 # Setup logging
 setup_logging()
 logger = get_logger(__name__)
-
-
-async def periodic_cleanup(stock_fetcher: StockFetcher):
-    """Run data cleanup every 24 hours."""
-    while True:
-        await asyncio.sleep(86400)  # 24 hours
-        try:
-            daily, intraday = stock_fetcher.cleanup_old_data()
-            logger.info(f"Periodic cleanup complete: {daily} daily, {intraday} intraday")
-        except Exception as e:
-            logger.error(f"Error during periodic cleanup: {e}")
 
 
 @asynccontextmanager
@@ -57,15 +54,6 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database initialized")
     
-    # Run cleanup on startup
-    stock_fetcher = get_stock_fetcher()
-    try:
-        daily, intraday = stock_fetcher.cleanup_old_data()
-        if daily or intraday:
-            logger.info(f"Startup cleanup: {daily} daily, {intraday} intraday records")
-    except Exception as e:
-        logger.error(f"Error during startup cleanup: {e}")
-    
     # Auto-cleanup intraday data with unfillable gaps
     # This prevents showing charts with holes from previous downtime
     try:
@@ -77,17 +65,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error during intraday gap cleanup: {e}")
     
-    # Start background cleanup task
-    cleanup_task = asyncio.create_task(periodic_cleanup(stock_fetcher))
-    
     yield
-    
-    # Cancel cleanup task
-    cleanup_task.cancel()
-    try:
-        await cleanup_task
-    except asyncio.CancelledError:
-        pass
     
     # Cleanup database connection
     await engine.dispose()
@@ -834,3 +812,410 @@ async def health_check():
         "service": settings.app_name,
         "version": settings.app_version
     }
+
+
+# ============ Calibration Endpoints (Walk-Forward Optimization) ============
+
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import List, Optional
+
+
+class CalibrationRequest(BaseModel):
+    """Request to start calibration for a ticker."""
+    ticker: str
+    horizons: List[int] = [3, 15]  # Default: swing (3d) and trend (15d)
+
+
+class WeightsResponse(BaseModel):
+    """Response containing calibrated weights."""
+    ticker: str
+    horizon: int
+    weights: dict
+    calibrated_at: Optional[str] = None
+    is_default: bool = False
+
+
+@app.post("/api/v1/calibration/start")
+async def start_calibration(
+    request: CalibrationRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Start Walk-Forward Optimization calibration for a ticker.
+    
+    This is an isolated operation that doesn't affect the main dashboard.
+    Returns immediately with a job ID; use the SSE stream to monitor progress.
+    """
+    ticker = request.ticker.upper()
+    logger.info(f"[WFO] Starting calibration for {ticker}, horizons={request.horizons}")
+    
+    try:
+        # Run calibration (this could be made async with background tasks)
+        results = await calibrate_ticker(db, ticker, request.horizons)
+        
+        # Save results to database
+        saved_count = 0
+        response_results = {}
+        
+        for horizon, result in results.items():
+            if result:
+                logger.info(f"[WFO] {ticker} horizon={horizon}: SQN={result.train_sqn:.3f}, trades={result.total_trades}")
+                logger.info(f"[WFO] {ticker} horizon={horizon} weights: {result.weights}")
+                
+                # Save to database
+                try:
+                    await save_calibration_result(db, ticker, result)
+                    saved_count += 1
+                    logger.info(f"[WFO] Saved calibration for {ticker} horizon={horizon} to database")
+                except Exception as save_err:
+                    logger.error(f"[WFO] Failed to save {ticker} horizon={horizon}: {save_err}")
+                
+                response_results[horizon] = {
+                    "sqn": result.train_sqn,
+                    "trades": result.total_trades,
+                    "weights": result.weights,
+                    "error": None
+                }
+            else:
+                logger.warning(f"[WFO] {ticker} horizon={horizon}: No result (insufficient data)")
+                response_results[horizon] = {
+                    "sqn": None,
+                    "trades": 0,
+                    "weights": None,
+                    "error": "Insufficient trades: Stock generated fewer than 30 signals with 0.3 threshold. This stock may not be suitable for WFO calibration with tight thresholds."
+                }
+        
+        logger.info(f"[WFO] Calibration complete for {ticker}: saved {saved_count}/{len(results)} horizons")
+        
+        return {
+            "status": "complete",
+            "ticker": ticker,
+            "horizons": request.horizons,
+            "saved_count": saved_count,
+            "results": response_results
+        }
+    except InsufficientVolatilityError as e:
+        logger.warning(f"[WFO] {ticker}: Insufficient volatility - {e}")
+        return {
+            "status": "error",
+            "ticker": ticker,
+            "error": str(e),
+            "error_code": "INSUFFICIENT_VOLATILITY"
+        }
+    except ValueError as e:
+        logger.warning(f"[WFO] {ticker}: Value error - {e}")
+        return {
+            "status": "error",
+            "ticker": ticker,
+            "error": str(e),
+            "error_code": "INSUFFICIENT_DATA"
+        }
+    except Exception as e:
+        logger.error(f"[WFO] Calibration failed for {ticker}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/calibration/stream/{ticker}")
+async def stream_calibration(
+    ticker: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Stream calibration progress via Server-Sent Events (SSE).
+    
+    Events are formatted as:
+    data: {"ticker": "AAPL", "stage": "optimizing", "progress": 50, ...}
+    
+    Stages: loading, optimizing, testing, saving, complete, error
+    """
+    ticker = ticker.upper()
+    
+    async def event_generator():
+        try:
+            async for event in calibrate_ticker_streaming(db, ticker):
+                yield event
+        except Exception as e:
+            error_event = CalibrationProgress(
+                ticker=ticker,
+                horizon=0,
+                stage="error",
+                progress=0,
+                message=str(e)
+            )
+            yield error_event.to_sse()
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Disable nginx buffering
+        }
+    )
+
+
+@app.get("/api/v1/calibration/weights/{ticker}")
+async def get_calibration_weights(
+    ticker: str,
+    horizon: int = 3,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get calibrated weights for a ticker and horizon.
+    
+    Returns default weights if no calibration exists.
+    This is what the frontend should call to get weights for scoring.
+    """
+    ticker = ticker.upper()
+    
+    weights = await load_calibrated_weights(db, ticker, horizon)
+    
+    if weights:
+        return WeightsResponse(
+            ticker=ticker,
+            horizon=horizon,
+            weights=weights,
+            is_default=False
+        )
+    else:
+        return WeightsResponse(
+            ticker=ticker,
+            horizon=horizon,
+            weights=DEFAULT_WEIGHTS,
+            is_default=True
+        )
+
+
+@app.get("/api/v1/calibration/weights/batch")
+async def get_calibration_weights_batch(
+    tickers: str,  # Comma-separated list
+    horizon: int = 3,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get calibrated weights for multiple tickers.
+    
+    Useful for loading weights for entire portfolio at once.
+    """
+    ticker_list = [t.strip().upper() for t in tickers.split(",")]
+    
+    results = {}
+    for ticker in ticker_list:
+        weights = await load_calibrated_weights(db, ticker, horizon)
+        results[ticker] = {
+            "weights": weights or DEFAULT_WEIGHTS,
+            "is_default": weights is None
+        }
+    
+    return {
+        "horizon": horizon,
+        "tickers": results
+    }
+
+
+@app.get("/api/v1/calibration/defaults")
+async def get_default_weights():
+    """
+    Get default indicator weights.
+    
+    These are used when no calibration exists for a ticker.
+    """
+    return {
+        "weights": DEFAULT_WEIGHTS,
+        "description": "Default weights (all indicators weighted 1.0)"
+    }
+
+
+@app.get("/api/v1/calibration/tickers")
+async def get_calibration_tickers(
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get list of portfolio tickers for the calibration picker.
+    """
+    from sqlalchemy.orm import selectinload
+    
+    result = await db.execute(
+        select(Portfolio).options(selectinload(Portfolio.holdings)).limit(1)
+    )
+    portfolio = result.scalar_one_or_none()
+    
+    if not portfolio:
+        return {"tickers": []}
+    
+    tickers = [h.ticker.upper() for h in portfolio.holdings]
+    return {"tickers": sorted(tickers)}
+
+
+@app.get("/api/v1/calibration/verify/{ticker}")
+async def verify_calibration(
+    ticker: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Verify calibration data exists in database for a ticker.
+    
+    Returns detailed info about what's stored.
+    """
+    from sqlalchemy import func
+    
+    ticker = ticker.upper()
+    
+    # Count weights
+    weights_result = await db.execute(
+        select(func.count(CalibrationWeights.id))
+        .where(CalibrationWeights.ticker == ticker)
+    )
+    weights_count = weights_result.scalar() or 0
+    
+    # Get weight details
+    weights_data = await db.execute(
+        select(CalibrationWeights)
+        .where(CalibrationWeights.ticker == ticker)
+        .order_by(CalibrationWeights.horizon, CalibrationWeights.indicator)
+    )
+    
+    def safe_sqn(val):
+        """Convert -inf/inf/nan to JSON-safe values"""
+        if val is None:
+            return None
+        import math
+        if math.isinf(val) or math.isnan(val):
+            return None
+        return val
+    
+    weights_list = [
+        {
+            "indicator": w.indicator,
+            "horizon": w.horizon,
+            "weight": w.weight,
+            "sqn_score": safe_sqn(w.sqn_score),
+            "stability_passed": w.stability_passed,
+            "updated_at": str(w.updated_at) if w.updated_at else None
+        }
+        for w in weights_data.scalars().all()
+    ]
+    
+    # Count windows
+    windows_result = await db.execute(
+        select(func.count(CalibrationWindow.id))
+        .where(CalibrationWindow.ticker == ticker)
+    )
+    windows_count = windows_result.scalar() or 0
+    
+    # Count trades
+    trades_result = await db.execute(
+        select(func.count(CalibrationTrade.id))
+        .where(CalibrationTrade.ticker == ticker)
+    )
+    trades_count = trades_result.scalar() or 0
+    
+    return {
+        "ticker": ticker,
+        "verified": weights_count > 0,
+        "weights_count": weights_count,
+        "windows_count": windows_count,
+        "trades_count": trades_count,
+        "weights": weights_list,
+        "message": (
+            f"Found {weights_count} weights, {windows_count} windows, {trades_count} trades"
+            if weights_count > 0
+            else "No calibration data found"
+        )
+    }
+
+
+@app.get("/api/v1/calibration/data-status/{ticker}")
+async def get_calibration_data_status(
+    ticker: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Check how much historical data is available for a ticker.
+    
+    WFO requires ~750 trading days (3 years) for swing trading calibration.
+    More data = more trades = better statistical significance.
+    """
+    from sqlalchemy import func
+    from .models import PriceHistory
+    
+    ticker = ticker.upper()
+    
+    # Count available daily records
+    result = await db.execute(
+        select(
+            func.count(PriceHistory.id),
+            func.min(PriceHistory.date),
+            func.max(PriceHistory.date)
+        ).where(PriceHistory.ticker == ticker)
+    )
+    row = result.one()
+    count, min_date, max_date = row
+    
+    # WFO needs ~1260 days (5 years) for swing trading (1-2 trades/month)
+    # This gives ~60-120 potential trades for statistical significance
+    required_days = 1260
+    has_sufficient_data = count >= required_days
+    
+    return {
+        "ticker": ticker,
+        "available_days": count,
+        "required_days": required_days,
+        "has_sufficient_data": has_sufficient_data,
+        "earliest_date": str(min_date) if min_date else None,
+        "latest_date": str(max_date) if max_date else None,
+        "message": (
+            f"Ready for calibration ({count} days available)"
+            if has_sufficient_data
+            else f"Need {required_days - count} more days of data"
+        )
+    }
+
+
+@app.post("/api/v1/calibration/fetch-data/{ticker}")
+async def fetch_calibration_data(
+    ticker: str,
+    stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
+):
+    """
+    Fetch and cache 5 years of daily price history for WFO calibration.
+    
+    5 years provides enough data for swing trading strategies (1-2 trades/month)
+    to generate sufficient samples for statistical significance.
+    The data is stored in SQLite for future use.
+    """
+    ticker = ticker.upper()
+    
+    try:
+        # Fetch 5 years of daily data for better swing trading calibration
+        result = await stock_fetcher.get_stock_history(ticker, "5y")
+        
+        history = result.get('history', [])
+        
+        if not history:
+            return {
+                "status": "error",
+                "ticker": ticker,
+                "message": "No data returned from Yahoo Finance",
+                "days_fetched": 0
+            }
+        
+        return {
+            "status": "success",
+            "ticker": ticker,
+            "days_fetched": len(history),
+            "earliest_date": history[0].get('date') if history else None,
+            "latest_date": history[-1].get('date') if history else None,
+            "message": f"Successfully cached {len(history)} days of history"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch calibration data for {ticker}: {e}")
+        return {
+            "status": "error",
+            "ticker": ticker,
+            "message": str(e),
+            "days_fetched": 0
+        }

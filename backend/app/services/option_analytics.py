@@ -73,9 +73,24 @@ class OptionAnalyticsService:
         self.risk_free_rate = risk_free_rate
     
     def calculate_days_to_expiration(self, expiration_date: date) -> int:
-        """Calculate days until expiration."""
-        today = date.today()
-        delta = expiration_date - today
+        """
+        Calculate days until expiration using US Eastern time (market time).
+        
+        Options expire at 4:00 PM ET on the expiration date, so we use Eastern
+        timezone to ensure consistent calculations regardless of server timezone.
+        """
+        from datetime import datetime
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        
+        # Get current date in US Eastern time (market time)
+        eastern = ZoneInfo("America/New_York")
+        now_eastern = datetime.now(eastern)
+        today_eastern = now_eastern.date()
+        
+        delta = expiration_date - today_eastern
         return max(0, delta.days)
     
     def calculate_time_to_expiration(self, expiration_date: date) -> float:
@@ -84,8 +99,32 @@ class OptionAnalyticsService:
         return days / 365.0
     
     def is_expired(self, expiration_date: date) -> bool:
-        """Check if option has expired."""
-        return date.today() > expiration_date
+        """
+        Check if option has expired.
+        
+        Options expire at 4:00 PM ET on the expiration date. An option is
+        considered expired only after market close on expiration day.
+        """
+        from datetime import datetime, time
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        
+        eastern = ZoneInfo("America/New_York")
+        now_eastern = datetime.now(eastern)
+        today_eastern = now_eastern.date()
+        current_time = now_eastern.time()
+        
+        # Market closes at 4:00 PM ET
+        market_close = time(16, 0)
+        
+        # Expired if: past expiration date, OR on expiration date after 4 PM ET
+        if today_eastern > expiration_date:
+            return True
+        if today_eastern == expiration_date and current_time >= market_close:
+            return True
+        return False
     
     def is_itm(
         self, 

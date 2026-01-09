@@ -35,13 +35,28 @@ function formatPercent(value: number | null | undefined): string {
 
 /**
  * Get expiration status color and text
+ * 
+ * Note: The backend calculates days_to_expiration using US Eastern time and
+ * considers that options expire at 4 PM ET. The is_expired field indicates
+ * whether the option has truly expired (past 4 PM ET on expiration day).
  */
-function getExpirationStatus(daysToExp: number | undefined): { color: string; text: string; urgent: boolean } {
+function getExpirationStatus(
+  daysToExp: number | undefined, 
+  isExpired: boolean | undefined
+): { color: string; text: string; urgent: boolean } {
   if (daysToExp === undefined) return { color: 'text-white/50', text: '', urgent: false };
   
-  if (daysToExp <= 0) {
+  // Check is_expired flag from backend (considers 4 PM ET market close)
+  if (isExpired) {
     return { color: 'text-red-400', text: 'EXPIRED', urgent: true };
-  } else if (daysToExp <= 7) {
+  }
+  
+  // Today is expiration day but market hasn't closed yet
+  if (daysToExp === 0) {
+    return { color: 'text-red-400', text: 'TODAY', urgent: true };
+  }
+  
+  if (daysToExp <= 7) {
     return { color: 'text-red-400', text: `${daysToExp}d`, urgent: true };
   } else if (daysToExp <= 30) {
     return { color: 'text-yellow-400', text: `${daysToExp}d`, urgent: false };
@@ -58,8 +73,8 @@ export function OptionHoldingCard({ option, onDelete, stockAnalysis }: OptionHol
   const [showAnalysis, setShowAnalysis] = useState(false);
   
   const expStatus = useMemo(() => 
-    getExpirationStatus(option.analytics?.days_to_expiration), 
-    [option.analytics?.days_to_expiration]
+    getExpirationStatus(option.analytics?.days_to_expiration, option.analytics?.is_expired), 
+    [option.analytics?.days_to_expiration, option.analytics?.is_expired]
   );
   
   // Color themes based on option type

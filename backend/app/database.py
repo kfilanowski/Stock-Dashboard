@@ -113,6 +113,91 @@ async def migrate_db(conn):
         if 'next_earnings_date' not in cache_columns:
             await conn.execute(text("ALTER TABLE stock_analysis_cache ADD COLUMN next_earnings_date DATETIME"))
             print("Added next_earnings_date column to stock_analysis_cache table")
+    
+    # ========================================================================
+    # WFO Calibration Tables
+    # ========================================================================
+    
+    # Create calibration_weights table
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS calibration_weights (
+            id INTEGER PRIMARY KEY,
+            ticker VARCHAR NOT NULL,
+            indicator VARCHAR NOT NULL,
+            action VARCHAR NOT NULL,
+            horizon INTEGER NOT NULL,
+            weight FLOAT NOT NULL DEFAULT 1.0,
+            sqn_score FLOAT,
+            stability_passed BOOLEAN DEFAULT 1,
+            window_end_date VARCHAR,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(ticker, indicator, action, horizon)
+        )
+    """))
+    await conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_calibration_weights_ticker 
+        ON calibration_weights(ticker)
+    """))
+    await conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_calibration_ticker_horizon 
+        ON calibration_weights(ticker, horizon)
+    """))
+    
+    # Create calibration_windows table
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS calibration_windows (
+            id INTEGER PRIMARY KEY,
+            ticker VARCHAR NOT NULL,
+            horizon INTEGER NOT NULL,
+            train_start VARCHAR NOT NULL,
+            train_end VARCHAR NOT NULL,
+            test_start VARCHAR NOT NULL,
+            test_end VARCHAR NOT NULL,
+            window_days INTEGER NOT NULL,
+            weights_json VARCHAR NOT NULL,
+            train_sqn FLOAT,
+            test_sqn FLOAT,
+            expectancy FLOAT,
+            trades_count INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """))
+    await conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_window_ticker_horizon 
+        ON calibration_windows(ticker, horizon)
+    """))
+    await conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_window_end_date 
+        ON calibration_windows(ticker, test_end)
+    """))
+    
+    # Create calibration_trades table
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS calibration_trades (
+            id INTEGER PRIMARY KEY,
+            window_id INTEGER NOT NULL REFERENCES calibration_windows(id),
+            ticker VARCHAR NOT NULL,
+            entry_date VARCHAR NOT NULL,
+            exit_date VARCHAR NOT NULL,
+            horizon INTEGER NOT NULL,
+            direction VARCHAR NOT NULL,
+            entry_price FLOAT NOT NULL,
+            exit_price FLOAT NOT NULL,
+            pnl_pct FLOAT NOT NULL,
+            transaction_cost FLOAT NOT NULL DEFAULT 0.001,
+            market_regime VARCHAR
+        )
+    """))
+    await conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_trade_ticker_regime 
+        ON calibration_trades(ticker, market_regime)
+    """))
+    await conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_trade_window 
+        ON calibration_trades(window_id)
+    """))
+    
+    print("WFO calibration tables created/verified")
 
 
 async def init_db():

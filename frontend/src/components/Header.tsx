@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { TrendingUp, Copy, Check } from 'lucide-react';
+import { TrendingUp, Copy, Check, Settings } from 'lucide-react';
 import type { Holding } from '../types';
 
 interface HeaderProps {
@@ -44,6 +44,15 @@ export function Header({ totalValue, lastUpdated, isDataReady, holdings = [] }: 
       </div>
       
       <div className="flex items-center gap-4">
+        {/* Calibration Link */}
+        <a
+          href="/calibration"
+          className="p-2 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 hover:border-accent-cyan/30 transition-all duration-200 group"
+          title="Walk-Forward Optimization"
+        >
+          <Settings className="w-5 h-5 text-white/50 group-hover:text-accent-cyan" />
+        </a>
+        
         {/* Copy Holdings Button */}
         {holdings.length > 0 && (
           <button
