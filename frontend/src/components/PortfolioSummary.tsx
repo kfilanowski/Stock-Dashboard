@@ -24,7 +24,8 @@ export function PortfolioSummary({ portfolio }: PortfolioSummaryProps) {
   const isPositive = (portfolio.total_gain_loss_pct ?? 0) >= 0;
   
   return (
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+    <div className="mb-8">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
       {/* Total Market Value */}
       <div className="glass-card p-5 fade-in fade-in-delay-1">
         <div className="flex items-center gap-3 mb-3">
@@ -108,6 +109,7 @@ export function PortfolioSummary({ portfolio }: PortfolioSummaryProps) {
           <p className="text-2xl font-bold text-white/30">Loading...</p>
         )}
       </div>
+    </div>
     </div>
   );
 }

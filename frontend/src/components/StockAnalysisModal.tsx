@@ -9,7 +9,7 @@
  */
 
 import { useState, useMemo, useCallback } from 'react';
-import { X, TrendingUp, TrendingDown, Minus, ChevronDown, ChevronUp, AlertCircle, RefreshCw, HelpCircle } from 'lucide-react';
+import { X, TrendingUp, TrendingDown, Minus, ChevronDown, ChevronUp, AlertCircle, RefreshCw, HelpCircle, Shield } from 'lucide-react';
 import {
   RadarChart,
   PolarGrid,
@@ -21,6 +21,7 @@ import {
 } from 'recharts';
 import type { ActionScore, ActionType } from '../types';
 import { useStockAnalysis, refreshAnalysis } from '../hooks/useStockAnalysis';
+import { useViewContext } from '../context/ViewContext';
 
 interface StockAnalysisModalProps {
   ticker: string | null;
@@ -294,6 +295,11 @@ function ActionScoreCard({
                 <div className="flex items-center gap-2">
                   <SignalIndicator signal={signal.signal} />
                   <span className="text-white/70">{signal.metricLabel}</span>
+                  {signal.weight !== 1.0 && (
+                    <span className="text-[10px] text-purple-400/70 bg-purple-500/10 px-1 rounded" title={`Custom Weight: ${signal.weight}`}>
+                      x{signal.weight.toFixed(1)}
+                    </span>
+                  )}
                 </div>
                 <div className="flex items-center gap-3">
                   <span className="text-white/50 text-xs">{signal.rawValue}</span>
@@ -323,12 +329,15 @@ export function StockAnalysisModal({
   high52w,
   low52w
 }: StockAnalysisModalProps) {
+  const { predictionHorizon } = useViewContext();
+
   // Use the shared analysis cache - same data as ActionScoreBadge
   const { analysis, isLoading, isStale, error, lastUpdated } = useStockAnalysis(
     ticker,
     currentPrice,
     high52w,
-    low52w
+    low52w,
+    predictionHorizon
   );
   
   const [expandedAction, setExpandedAction] = useState<ActionType | null>(null);
@@ -344,9 +353,9 @@ export function StockAnalysisModal({
   // Force refresh handler
   const handleRefresh = useCallback(() => {
     if (ticker && currentPrice) {
-      refreshAnalysis(ticker, currentPrice, high52w ?? null, low52w ?? null);
+      refreshAnalysis(ticker, currentPrice, high52w ?? null, low52w ?? null, predictionHorizon);
     }
-  }, [ticker, currentPrice, high52w, low52w]);
+  }, [ticker, currentPrice, high52w, low52w, predictionHorizon]);
   
   // Options-related actions to filter when stock has no options
   const optionsActions = useMemo<ActionType[]>(
@@ -398,6 +407,18 @@ export function StockAnalysisModal({
                   <div className="animate-spin rounded-full h-3 w-3 border border-accent-cyan/50 border-t-accent-cyan" />
                   <span>Updating...</span>
                 </div>
+              )}
+              {/* WFO Status Indicator */}
+              {analysis?.calibration ? (
+                 <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-purple-500/20 border border-purple-500/40 text-xs font-medium text-purple-300" title={`Weights optimized via Walk-Forward Optimization (Last: ${new Date(analysis.calibration.lastCalibrated).toLocaleDateString()})`}>
+                    <Shield className="w-3.5 h-3.5" />
+                    <span>WFO Optimized (SQN {analysis.calibration.sqn?.toFixed(2)})</span>
+                 </div>
+              ) : (
+                 <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/10 border border-white/20 text-xs font-medium text-white/50" title="Using standard horizon-based weights (not calibrated for this specific stock)">
+                    <Minus className="w-3.5 h-3.5" />
+                    <span>Default Weights</span>
+                 </div>
               )}
             </div>
             <p className="text-sm text-white/50">
@@ -458,6 +479,20 @@ export function StockAnalysisModal({
           {/* Show analysis content - keep visible even during background refresh */}
           {analysis && (
             <>
+              {/* Low Confidence Warning */}
+              {analysis.status === 'low_confidence' && (
+                <div className="flex items-center gap-3 p-3 mb-4 rounded-lg bg-amber-500/10 border border-amber-500/30">
+                  <Shield className="w-5 h-5 text-amber-400" />
+                  <div>
+                    <h4 className="text-sm font-medium text-amber-400">Low Calibration Confidence</h4>
+                    <p className="text-xs text-amber-400/70">
+                      The predictive model (SQN {analysis.calibration?.sqn?.toFixed(2)}) is not confident in this {predictionHorizon}d forecast. 
+                      Signals may be unreliable.
+                    </p>
+                  </div>
+                </div>
+              )}
+
               {/* Collapsible Indicator Guide */}
               <IndicatorGuide 
                 isOpen={showIndicatorGuide} 
@@ -579,6 +614,14 @@ export function StockAnalysisModal({
                   </>
                 ) : (
                   'Analysis performed just now'
+                )}
+                {analysis.calibration && (
+                    <div className="text-xs text-purple-400/50 mt-1 flex items-center gap-1">
+                        <Shield className="w-3 h-3" />
+                        Weights calibrated {new Date(analysis.calibration.lastCalibrated).toLocaleDateString()}
+                        • SQN {analysis.calibration.sqn?.toFixed(2)}
+                        • Horizon {analysis.calibration.period}d
+                    </div>
                 )}
               </div>
               <div className="flex items-center gap-2">

@@ -32,6 +32,7 @@ import type {
 } from '../types/calibration';
 import * as calibrationApi from '../services/calibrationApi';
 import type { DataStatus, CalibrationVerification } from '../services/calibrationApi';
+import { refreshAnalysis } from '../hooks/useStockAnalysis';
 
 // ============================================================================
 // Local Types
@@ -80,7 +81,6 @@ function WeightBar({
   
   const isAboveDefault = weight > defaultWeight;
   const isBelowDefault = weight < defaultWeight;
-  const isDefault = Math.abs(weight - defaultWeight) < 0.01;
   
   return (
     <div className="flex items-center gap-3 group">
@@ -350,7 +350,7 @@ function CalibrationCard({
                 onClick={() => onFetchData(ticker)}
                 disabled={fetchingData}
                 className="btn-secondary flex items-center gap-2"
-                title="Fetch 2 years of daily data"
+                title="Fetch comprehensive history (5y daily + intraday)"
               >
                 {fetchingData ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
@@ -541,6 +541,7 @@ export default function CalibrationPage() {
   const [defaultWeights, setDefaultWeights] = useState<Record<string, number>>({});
   const [isLoading, setIsLoading] = useState(true);
   const [calibratedTickers, setCalibratedTickers] = useState<Set<string>>(new Set());
+  const [isBatchRunning, setIsBatchRunning] = useState(false);
   
   // Add log entry helper
   const addLog = useCallback((ticker: string, type: LogEntry['type'], message: string) => {
@@ -552,6 +553,23 @@ export default function CalibrationPage() {
       }
     }));
   }, []);
+
+  // Initialize calibration state for a ticker if needed
+  const ensureTickerState = useCallback((ticker: string) => {
+    setCalibrations(prev => {
+      if (prev[ticker]) return prev;
+      return {
+        ...prev,
+        [ticker]: {
+          ticker,
+          status: 'idle',
+          progress: 0,
+          results: {},
+          logs: []
+        }
+      };
+    });
+  }, []);
   
   // Load portfolio tickers and default weights on mount
   useEffect(() => {
@@ -561,7 +579,7 @@ export default function CalibrationPage() {
     ])
       .then(([tickers, defaults]) => {
         setPortfolioTickers(tickers);
-        setDefaultWeights(defaults.weights || {});
+        setDefaultWeights((defaults.weights || {}) as unknown as Record<string, number>);
         
         // Check which tickers have calibration
         tickers.forEach(async (ticker) => {
@@ -586,22 +604,11 @@ export default function CalibrationPage() {
   // Handle ticker selection
   const handleSelectTicker = useCallback(async (ticker: string) => {
     setSelectedTicker(ticker);
+    ensureTickerState(ticker);
     
-    if (!calibrations[ticker]) {
-      // Initialize calibration state
-      setCalibrations(prev => ({
-        ...prev,
-        [ticker]: {
-          ticker,
-          status: 'idle',
-          progress: 0,
-          results: {},
-          logs: []
-        }
-      }));
-      
-      // Fetch data status and verification
-      try {
+    // Fetch data status and verification if not already loaded
+    // We check via ref or just blindly fetch for simplicity as it's cheap
+    try {
         const [dataStatus, verification] = await Promise.all([
           calibrationApi.getDataStatus(ticker),
           calibrationApi.verifyCalibration(ticker)
@@ -615,11 +622,10 @@ export default function CalibrationPage() {
             verification
           }
         }));
-      } catch (err) {
+    } catch (err) {
         console.error('Failed to get status for', ticker, err);
-      }
     }
-  }, [calibrations]);
+  }, [ensureTickerState]);
   
   // View weights for a ticker
   const handleViewWeights = useCallback(async (ticker: string) => {
@@ -648,13 +654,13 @@ export default function CalibrationPage() {
       }
     }));
     
-    addLog(ticker, 'info', 'Fetching 2 years of price history...');
+    addLog(ticker, 'info', 'Fetching comprehensive price history (5y daily + intraday)...');
     
     try {
       const result = await calibrationApi.fetchCalibrationData(ticker);
       
       if (result.status === 'success') {
-        addLog(ticker, 'success', `Fetched ${result.days_fetched} days of data`);
+        addLog(ticker, 'success', `Fetched ${result.days_fetched} days of daily data + intraday history`);
         
         const status = await calibrationApi.getDataStatus(ticker);
         setCalibrations(prev => ({
@@ -665,6 +671,7 @@ export default function CalibrationPage() {
             dataStatus: status
           }
         }));
+        return true;
       } else {
         addLog(ticker, 'error', result.message);
         setCalibrations(prev => ({
@@ -675,6 +682,7 @@ export default function CalibrationPage() {
             error: result.message
           }
         }));
+        return false;
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to fetch data';
@@ -687,6 +695,7 @@ export default function CalibrationPage() {
           error: msg
         }
       }));
+      return false;
     }
   }, [addLog]);
   
@@ -761,6 +770,9 @@ export default function CalibrationPage() {
         if (verification.verified) {
           addLog(ticker, 'success', `Verified: ${verification.weights_count} weights saved to database`);
           setCalibratedTickers(prev => new Set([...prev, ticker]));
+          
+          // Force refresh analysis cache so dashboard picks up new weights
+          refreshAnalysis(ticker, 0, null, null);
         } else {
           addLog(ticker, 'warning', 'Calibration completed but no weights found in database');
         }
@@ -777,6 +789,7 @@ export default function CalibrationPage() {
             verification
           }
         }));
+        return true;
         
       } else if (result.status === 'error') {
         addLog(ticker, 'error', result.error || 'Unknown error');
@@ -789,6 +802,7 @@ export default function CalibrationPage() {
             error: result.error
           }
         }));
+        return false;
       } else {
         // Check if all horizons failed due to insufficient trades
         const allFailed = result.results && Object.values(result.results).every(
@@ -810,6 +824,7 @@ export default function CalibrationPage() {
             }
           }));
         }
+        return false;
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
@@ -822,8 +837,42 @@ export default function CalibrationPage() {
           error: msg
         }
       }));
+      return false;
     }
   }, [addLog]);
+
+  // Batch Calibration
+  const handleBatchCalibration = useCallback(async () => {
+    if (portfolioTickers.length === 0) return;
+    
+    if (!window.confirm(`This will sequentially fetch data and calibrate all ${portfolioTickers.length} holdings. This may take a while. Continue?`)) {
+        return;
+    }
+
+    setIsBatchRunning(true);
+    
+    for (const ticker of portfolioTickers) {
+        // Select the ticker so the user sees progress
+        setSelectedTicker(ticker);
+        ensureTickerState(ticker);
+        
+        // 1. Fetch Data
+        const fetchSuccess = await handleFetchData(ticker);
+        
+        if (fetchSuccess) {
+            // 2. Calibrate
+            await handleStartCalibration(ticker);
+        } else {
+            addLog(ticker, 'error', 'Skipping calibration due to fetch failure');
+        }
+        
+        // Small delay between tickers
+        await new Promise(r => setTimeout(r, 1000));
+    }
+    
+    setIsBatchRunning(false);
+    alert('Batch calibration complete!');
+  }, [portfolioTickers, ensureTickerState, handleFetchData, handleStartCalibration, addLog]);
   
   if (isLoading) {
     return (
@@ -858,6 +907,28 @@ export default function CalibrationPage() {
               </p>
             </div>
           </div>
+          
+          <button
+            onClick={handleBatchCalibration}
+            disabled={isBatchRunning || portfolioTickers.length === 0}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
+                isBatchRunning 
+                    ? 'bg-cyan-500/20 text-cyan-400 cursor-not-allowed'
+                    : 'bg-cyan-500 hover:bg-cyan-600 text-white shadow-lg shadow-cyan-500/20'
+            }`}
+          >
+            {isBatchRunning ? (
+                <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Auto-Calibrating...
+                </>
+            ) : (
+                <>
+                    <Play className="w-4 h-4" />
+                    Auto-Calibrate All
+                </>
+            )}
+          </button>
         </div>
         
         {/* Holdings Picker */}
@@ -882,7 +953,7 @@ export default function CalibrationPage() {
                   ticker={ticker}
                   selected={selectedTicker === ticker}
                   hasCalibration={calibratedTickers.has(ticker)}
-                  onClick={() => handleSelectTicker(ticker)}
+                  onClick={() => !isBatchRunning && handleSelectTicker(ticker)}
                 />
               ))}
             </div>

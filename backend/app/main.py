@@ -6,15 +6,16 @@ Main FastAPI application with versioned API endpoints.
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete, func
 from contextlib import asynccontextmanager
 import asyncio
+import math
 import os
 
 from .config import settings
 from .logging_config import setup_logging, get_logger
 from .database import get_db, init_db, engine
-from .models import Portfolio, CalibrationWeights, CalibrationWindow, CalibrationTrade
+from .models import Portfolio, CalibrationWeights, CalibrationWindow, CalibrationTrade, StockAnalysisCache, PriceHistory, IntradayPriceHistory
 from .schemas import (
     PortfolioUpdate, PortfolioResponse, PortfolioWithData,
     HoldingCreate, HoldingUpdate, HoldingResponse,
@@ -956,6 +957,57 @@ async def stream_calibration(
     )
 
 
+@app.get("/api/v1/calibration/weights/batch")
+async def get_calibration_weights_batch(
+    tickers: str,  # Comma-separated list
+    horizon: int = 3,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get calibrated weights for multiple tickers.
+
+    Useful for loading weights for entire portfolio at once.
+
+    NOTE: This endpoint must be defined BEFORE /{ticker} to avoid path matching issues.
+    """
+    ticker_list = [t.strip().upper() for t in tickers.split(",")]
+
+    results = {}
+    for ticker in ticker_list:
+        weights = await load_calibrated_weights(db, ticker, horizon)
+
+        # Get metadata directly from CalibrationWeights (not CalibrationWindow which may be empty)
+        weights_meta = await db.execute(
+            select(
+                func.avg(CalibrationWeights.sqn_score),
+                func.max(CalibrationWeights.updated_at)
+            )
+            .where(CalibrationWeights.ticker == ticker)
+            .where(CalibrationWeights.horizon == horizon)
+        )
+        meta = weights_meta.one()
+        avg_sqn, last_updated = meta
+
+        # Handle -inf/inf/nan values which are not JSON compliant
+        sqn_value = None
+        if avg_sqn is not None and weights:
+            if math.isfinite(avg_sqn):
+                sqn_value = float(avg_sqn)
+            # else: leave as None for -inf/inf/nan
+
+        results[ticker] = {
+            "weights": weights or DEFAULT_WEIGHTS,
+            "is_default": weights is None,
+            "sqn": sqn_value,
+            "updated_at": last_updated.isoformat() if last_updated and weights else None
+        }
+
+    return {
+        "horizon": horizon,
+        "tickers": results
+    }
+
+
 @app.get("/api/v1/calibration/weights/{ticker}")
 async def get_calibration_weights(
     ticker: str,
@@ -964,14 +1016,14 @@ async def get_calibration_weights(
 ):
     """
     Get calibrated weights for a ticker and horizon.
-    
+
     Returns default weights if no calibration exists.
     This is what the frontend should call to get weights for scoring.
     """
     ticker = ticker.upper()
-    
+
     weights = await load_calibrated_weights(db, ticker, horizon)
-    
+
     if weights:
         return WeightsResponse(
             ticker=ticker,
@@ -986,33 +1038,6 @@ async def get_calibration_weights(
             weights=DEFAULT_WEIGHTS,
             is_default=True
         )
-
-
-@app.get("/api/v1/calibration/weights/batch")
-async def get_calibration_weights_batch(
-    tickers: str,  # Comma-separated list
-    horizon: int = 3,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Get calibrated weights for multiple tickers.
-    
-    Useful for loading weights for entire portfolio at once.
-    """
-    ticker_list = [t.strip().upper() for t in tickers.split(",")]
-    
-    results = {}
-    for ticker in ticker_list:
-        weights = await load_calibrated_weights(db, ticker, horizon)
-        results[ticker] = {
-            "weights": weights or DEFAULT_WEIGHTS,
-            "is_default": weights is None
-        }
-    
-    return {
-        "horizon": horizon,
-        "tickers": results
-    }
 
 
 @app.get("/api/v1/calibration/defaults")
@@ -1154,9 +1179,9 @@ async def get_calibration_data_status(
     row = result.one()
     count, min_date, max_date = row
     
-    # WFO needs ~1260 days (5 years) for swing trading (1-2 trades/month)
-    # This gives ~60-120 potential trades for statistical significance
-    required_days = 1260
+    # WFO optimally needs ~1260 days (5 years), but we accept 750 (3 years)
+    # as a minimum to allow newer stocks to be calibrated.
+    required_days = 750
     has_sufficient_data = count >= required_days
     
     return {
@@ -1180,17 +1205,22 @@ async def fetch_calibration_data(
     stock_fetcher: StockFetcher = Depends(get_stock_fetcher)
 ):
     """
-    Fetch and cache 5 years of daily price history for WFO calibration.
+    Fetch and cache comprehensive price history for WFO calibration.
     
-    5 years provides enough data for swing trading strategies (1-2 trades/month)
-    to generate sufficient samples for statistical significance.
+    This performs a deep fetch of:
+    - 5 years of Daily data (no downsampling)
+    - 2 years of Hourly data
+    - 60 days of 5-minute data
+    - 7 days of 1-minute data
+    
     The data is stored in SQLite for future use.
+    Returns the daily history to the frontend.
     """
     ticker = ticker.upper()
     
     try:
-        # Fetch 5 years of daily data for better swing trading calibration
-        result = await stock_fetcher.get_stock_history(ticker, "5y")
+        # Fetch comprehensive data
+        result = await stock_fetcher.fetch_comprehensive_history(ticker)
         
         history = result.get('history', [])
         
@@ -1219,3 +1249,149 @@ async def fetch_calibration_data(
             "message": str(e),
             "days_fetched": 0
         }
+
+
+# ============================================================================
+# Admin / Cache Management Endpoints
+# ============================================================================
+
+@app.delete("/api/v1/admin/clear/analysis-cache")
+async def clear_analysis_cache(
+    ticker: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Clear the stock analysis cache (fundamentals + options data).
+    If ticker is provided, only clear that ticker. Otherwise clear all.
+    """
+    try:
+        if ticker:
+            ticker = ticker.upper()
+            result = await db.execute(
+                delete(StockAnalysisCache).where(StockAnalysisCache.ticker == ticker)
+            )
+            count = result.rowcount
+            await db.commit()
+            return {"status": "success", "message": f"Cleared analysis cache for {ticker}", "rows_deleted": count}
+        else:
+            result = await db.execute(delete(StockAnalysisCache))
+            count = result.rowcount
+            await db.commit()
+            return {"status": "success", "message": "Cleared all analysis cache", "rows_deleted": count}
+    except Exception as e:
+        logger.error(f"Failed to clear analysis cache: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/v1/admin/clear/calibration-weights")
+async def clear_calibration_weights(
+    ticker: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Clear WFO calibration weights.
+    If ticker is provided, only clear that ticker. Otherwise clear all.
+    Also clears related CalibrationWindow and CalibrationTrade records.
+    """
+    try:
+        if ticker:
+            ticker = ticker.upper()
+            # Clear weights
+            r1 = await db.execute(
+                delete(CalibrationWeights).where(CalibrationWeights.ticker == ticker)
+            )
+            # Clear windows
+            r2 = await db.execute(
+                delete(CalibrationWindow).where(CalibrationWindow.ticker == ticker)
+            )
+            # Clear trades
+            r3 = await db.execute(
+                delete(CalibrationTrade).where(CalibrationTrade.ticker == ticker)
+            )
+            await db.commit()
+            total = r1.rowcount + r2.rowcount + r3.rowcount
+            return {"status": "success", "message": f"Cleared calibration data for {ticker}", "rows_deleted": total}
+        else:
+            r1 = await db.execute(delete(CalibrationWeights))
+            r2 = await db.execute(delete(CalibrationWindow))
+            r3 = await db.execute(delete(CalibrationTrade))
+            await db.commit()
+            total = r1.rowcount + r2.rowcount + r3.rowcount
+            return {"status": "success", "message": "Cleared all calibration data", "rows_deleted": total}
+    except Exception as e:
+        logger.error(f"Failed to clear calibration weights: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/v1/admin/clear/price-history")
+async def clear_price_history(
+    ticker: Optional[str] = None,
+    history_type: str = "all",  # "daily", "intraday", or "all"
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Clear price history cache.
+    history_type: "daily", "intraday", or "all"
+    If ticker is provided, only clear that ticker.
+    """
+    try:
+        total = 0
+        ticker_upper = ticker.upper() if ticker else None
+
+        if history_type in ("daily", "all"):
+            if ticker_upper:
+                r = await db.execute(
+                    delete(PriceHistory).where(PriceHistory.ticker == ticker_upper)
+                )
+            else:
+                r = await db.execute(delete(PriceHistory))
+            total += r.rowcount
+
+        if history_type in ("intraday", "all"):
+            if ticker_upper:
+                r = await db.execute(
+                    delete(IntradayPriceHistory).where(IntradayPriceHistory.ticker == ticker_upper)
+                )
+            else:
+                r = await db.execute(delete(IntradayPriceHistory))
+            total += r.rowcount
+
+        await db.commit()
+        scope = f"for {ticker_upper}" if ticker_upper else "all"
+        return {"status": "success", "message": f"Cleared {history_type} price history {scope}", "rows_deleted": total}
+    except Exception as e:
+        logger.error(f"Failed to clear price history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/admin/cache-stats")
+async def get_cache_stats(db: AsyncSession = Depends(get_db)):
+    """
+    Get statistics about cached data.
+    """
+    try:
+        from sqlalchemy import func
+
+        # Count records in each table
+        analysis_count = (await db.execute(select(func.count(StockAnalysisCache.id)))).scalar() or 0
+        weights_count = (await db.execute(select(func.count(CalibrationWeights.id)))).scalar() or 0
+        windows_count = (await db.execute(select(func.count(CalibrationWindow.id)))).scalar() or 0
+        daily_count = (await db.execute(select(func.count(PriceHistory.id)))).scalar() or 0
+        intraday_count = (await db.execute(select(func.count(IntradayPriceHistory.id)))).scalar() or 0
+
+        # Get unique tickers with calibration
+        calibrated_tickers = (await db.execute(
+            select(func.count(func.distinct(CalibrationWeights.ticker)))
+        )).scalar() or 0
+
+        return {
+            "analysis_cache": analysis_count,
+            "calibration_weights": weights_count,
+            "calibration_windows": windows_count,
+            "calibrated_tickers": calibrated_tickers,
+            "daily_price_history": daily_count,
+            "intraday_price_history": intraday_count
+        }
+    except Exception as e:
+        logger.error(f"Failed to get cache stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

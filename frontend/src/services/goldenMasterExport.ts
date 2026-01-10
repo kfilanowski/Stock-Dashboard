@@ -214,7 +214,7 @@ function rvolToSignal(rvol: number | null): number | null {
  */
 function smaToSignal(
   currentPrice: number,
-  sma20: number | null,
+  _sma20: number | null,
   sma50: number | null,
   sma200: number | null
 ): number | null {
@@ -265,7 +265,7 @@ function squeezeToSignal(isSqueeze: boolean, isExpansion: boolean): number {
 export function exportGoldenMaster(
   ticker: string,
   history: HistoryPoint[],
-  currentPrice: number,
+  _currentPrice: number,
   high52w: number | null,
   low52w: number | null
 ): GoldenMasterExport {

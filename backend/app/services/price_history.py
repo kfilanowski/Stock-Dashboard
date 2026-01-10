@@ -303,6 +303,27 @@ class PriceHistoryService:
     
     # ============ Data Cleanup ============
     
+    def clear_daily_history(self, ticker: str) -> int:
+        """
+        Clear daily price history for a specific ticker.
+        
+        Args:
+            ticker: Stock ticker symbol.
+            
+        Returns:
+            Number of records deleted.
+        """
+        ticker = ticker.upper()
+        
+        with Session(self._engine) as session:
+            result = session.execute(
+                delete(PriceHistory).where(PriceHistory.ticker == ticker)
+            )
+            session.commit()
+            deleted_count = result.rowcount
+            logger.info(f"Cleared {deleted_count} daily records for {ticker}")
+            return deleted_count
+    
     def clear_ticker_history(self, ticker: str) -> tuple[int, int]:
         """
         Clear ALL price history for a specific ticker (both daily and intraday).

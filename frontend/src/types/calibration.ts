@@ -246,6 +246,8 @@ export interface BatchWeightsResponse {
   tickers: Record<string, {
     weights: WeightMatrix;
     is_default: boolean;
+    sqn: number | null;
+    updated_at: string | null;
   }>;
 }
 

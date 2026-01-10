@@ -447,7 +447,7 @@ export interface OptionStrikesResponse {
  * Use this to populate the strike price picker when adding an option.
  */
 export async function getOptionStrikes(
-  ticker: string, 
+  ticker: string,
   expiration: string,
   optionType?: 'call' | 'put'
 ): Promise<OptionStrikesResponse> {
@@ -457,4 +457,72 @@ export async function getOptionStrikes(
   }
   const response = await fetch(url);
   return handleResponse<OptionStrikesResponse>(response);
+}
+
+// ============================================================================
+// Admin / Cache Management API
+// ============================================================================
+
+export interface CacheStats {
+  analysis_cache: number;
+  calibration_weights: number;
+  calibration_windows: number;
+  calibrated_tickers: number;
+  daily_price_history: number;
+  intraday_price_history: number;
+}
+
+export interface ClearResult {
+  status: string;
+  message: string;
+  rows_deleted: number;
+}
+
+/**
+ * Get cache statistics.
+ */
+export async function getCacheStats(): Promise<CacheStats> {
+  const response = await fetch(`${API_BASE}/admin/cache-stats`);
+  return handleResponse<CacheStats>(response);
+}
+
+/**
+ * Clear analysis cache (fundamentals + options data).
+ * @param ticker - Optional ticker to clear. If not provided, clears all.
+ */
+export async function clearAnalysisCache(ticker?: string): Promise<ClearResult> {
+  const url = ticker
+    ? `${API_BASE}/admin/clear/analysis-cache?ticker=${ticker}`
+    : `${API_BASE}/admin/clear/analysis-cache`;
+  const response = await fetch(url, { method: 'DELETE' });
+  return handleResponse<ClearResult>(response);
+}
+
+/**
+ * Clear WFO calibration weights.
+ * @param ticker - Optional ticker to clear. If not provided, clears all.
+ */
+export async function clearCalibrationWeights(ticker?: string): Promise<ClearResult> {
+  const url = ticker
+    ? `${API_BASE}/admin/clear/calibration-weights?ticker=${ticker}`
+    : `${API_BASE}/admin/clear/calibration-weights`;
+  const response = await fetch(url, { method: 'DELETE' });
+  return handleResponse<ClearResult>(response);
+}
+
+/**
+ * Clear price history cache.
+ * @param ticker - Optional ticker to clear. If not provided, clears all.
+ * @param historyType - "daily", "intraday", or "all"
+ */
+export async function clearPriceHistory(
+  ticker?: string,
+  historyType: 'daily' | 'intraday' | 'all' = 'all'
+): Promise<ClearResult> {
+  let url = `${API_BASE}/admin/clear/price-history?history_type=${historyType}`;
+  if (ticker) {
+    url += `&ticker=${ticker}`;
+  }
+  const response = await fetch(url, { method: 'DELETE' });
+  return handleResponse<ClearResult>(response);
 }

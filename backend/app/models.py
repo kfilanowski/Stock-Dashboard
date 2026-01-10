@@ -111,7 +111,7 @@ class StockAnalysisCache(Base):
     avg_implied_volatility = Column(Float, nullable=True)
     iv_percentile = Column(Float, nullable=True)
     options_sentiment = Column(String, nullable=True)  # 'bullish', 'bearish', 'neutral'
-    has_options = Column(Boolean, nullable=True, default=True)
+    has_options = Column(Boolean, nullable=True, default=False)
     
     # Earnings date (for binary event risk)
     next_earnings_date = Column(DateTime, nullable=True)
@@ -162,31 +162,39 @@ class OptionHolding(Base):
 
 class CalibrationWeights(Base):
     """
-    Stores calibrated indicator weights per-stock, per-indicator, per-horizon.
-    
+    Stores calibrated indicator weights per-stock, per-indicator, per-horizon, per-strategy.
+
     These weights are learned through Walk-Forward Optimization and used
     to customize the scoring engine for each stock's "personality".
+
+    Strategy classes:
+    - 'all': Universal weights (legacy, applied to all actions)
+    - 'directional': Optimized for price direction (buyShares, sellShares)
+    - 'premium_sell': Optimized for premium selling (openCSP, openCC)
+    - 'premium_buy': Optimized for breakout trades (buyCall, buyPut)
     """
     __tablename__ = "calibration_weights"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     ticker = Column(String, nullable=False, index=True)
     indicator = Column(String, nullable=False)  # 'rsi', 'macd', 'bollinger', etc.
-    action = Column(String, nullable=False)  # 'buyShares', 'sellShares', etc.
+    action = Column(String, nullable=False)  # 'buyShares', 'sellShares', etc. or 'all'
     horizon = Column(Integer, nullable=False)  # 3 (swing) or 15 (trend)
-    
+    strategy_class = Column(String, nullable=False, default='all')  # 'all', 'directional', 'premium_sell', 'premium_buy'
+
     # Calibrated values
     weight = Column(Float, nullable=False, default=1.0)  # 0.0 to 2.5
     sqn_score = Column(Float, nullable=True)  # SQN at this weight
     stability_passed = Column(Boolean, default=True)  # Neighbor validation passed
-    
+
     # Window tracking
     window_end_date = Column(String, nullable=True)  # YYYY-MM-DD of training window end
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
+
     __table_args__ = (
-        UniqueConstraint('ticker', 'indicator', 'action', 'horizon', name='uix_calibration_key'),
+        UniqueConstraint('ticker', 'indicator', 'action', 'horizon', 'strategy_class', name='uix_calibration_key_v2'),
         Index('ix_calibration_ticker_horizon', 'ticker', 'horizon'),
+        Index('ix_calibration_strategy', 'ticker', 'horizon', 'strategy_class'),
     )
 
 

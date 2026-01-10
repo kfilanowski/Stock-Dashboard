@@ -32,10 +32,10 @@ SLIPPAGE = 0.0005
 
 # Minimum trades required for statistical significance
 # For swing trading (1-2 trades/month), we need a lower bar:
-# - 30 is too aggressive for 2 years of daily data
-# - 10 trades gives rough but usable SQN estimates
-# - Combined with 5-year data fetch, this becomes more robust
-MIN_TRADES_FOR_SIGNIFICANCE = 10
+# - 30 trades is the statistical standard for reliable SQN estimates
+# - With 750+ days of history (3+ years), this is achievable for most stocks
+# - Reduces overfitting risk from low-sample optimization
+MIN_TRADES_FOR_SIGNIFICANCE = 30
 
 
 # ============================================================================

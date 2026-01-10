@@ -108,7 +108,7 @@ class StockAnalysisService:
                 existing.avg_implied_volatility = options.get('avg_implied_volatility')
                 existing.iv_percentile = options.get('iv_percentile')
                 existing.options_sentiment = options.get('options_sentiment')
-                existing.has_options = options.get('has_options', True)
+                existing.has_options = options.get('has_options', False)
                 existing.fetched_at = datetime.utcnow()
             else:
                 # Create new
@@ -135,7 +135,7 @@ class StockAnalysisService:
                     avg_implied_volatility=options.get('avg_implied_volatility'),
                     iv_percentile=options.get('iv_percentile'),
                     options_sentiment=options.get('options_sentiment'),
-                    has_options=options.get('has_options', True),
+                    has_options=options.get('has_options', False),
                     fetched_at=datetime.utcnow()
                 )
                 session.add(new_cache)
@@ -198,7 +198,7 @@ class StockAnalysisService:
             "avg_implied_volatility": cached.avg_implied_volatility,
             "iv_percentile": cached.iv_percentile,
             "options_sentiment": cached.options_sentiment,
-            "has_options": cached.has_options if cached.has_options is not None else True,
+            "has_options": cached.has_options if cached.has_options is not None else False,
         }
     
     # ============================================================================

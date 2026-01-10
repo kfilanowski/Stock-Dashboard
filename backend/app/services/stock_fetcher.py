@@ -919,7 +919,7 @@ class StockFetcher:
     
     # ============ Stock History ============
     
-    def _get_stock_history_sync(self, ticker: str, period: str = "1y") -> Dict[str, Any]:
+    def _get_stock_history_sync(self, ticker: str, period: str = "1y", disable_sampling: bool = False) -> Dict[str, Any]:
         """Get historical data for a stock."""
         ticker = ticker.upper()
         
@@ -1048,10 +1048,11 @@ class StockFetcher:
         # Sample data based on period to reduce data points
         # - 2y: every 2 days (~365 points)
         # - 5y: every 5 days (~365 points) - weekly would be too sparse
-        if period == "2y" and len(result) > 400:
-            result = result[::2]  # Every 2nd day
-        elif period == "5y" and len(result) > 400:
-            result = result[::5]  # Every 5th day (~365 points for 5 years)
+        if not disable_sampling:
+            if period == "2y" and len(result) > 400:
+                result = result[::2]  # Every 2nd day
+            elif period == "5y" and len(result) > 400:
+                result = result[::5]  # Every 5th day (~365 points for 5 years)
         
         reference_close = self._calculate_daily_reference(ticker, result)
         result_start = result[0]['date'] if result else None
@@ -1290,16 +1291,138 @@ class StockFetcher:
             return self._get_reference_close(ticker, first_date_dt - timedelta(days=1))
         return None
     
-    async def get_stock_history(self, ticker: str, period: str = "1y") -> Dict[str, Any]:
+    async def get_stock_history(self, ticker: str, period: str = "1y", disable_sampling: bool = False) -> Dict[str, Any]:
         """Async wrapper for fetching stock history."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             self._executor,
             self._get_stock_history_sync,
             ticker,
-            period
+            period,
+            disable_sampling
         )
     
+    def _ensure_intraday_data_sync(self, ticker: str, interval: str, days: int):
+        """
+        Ensure we have intraday data for a specific range/interval.
+        Used by fetch_comprehensive_history.
+        """
+        end_time = datetime.now()
+        start_time = end_time - timedelta(days=days)
+        
+        # Analyze coverage
+        coverage = self._price_history.analyze_intraday_coverage(
+            ticker, interval, start_time, end_time
+        )
+        
+        if coverage['needs_fetch']:
+            try:
+                # Determine what to fetch
+                # We can't be too surgical with yf.download/history or we get rate limited
+                # or fragmented data. If we have gaps, it's often safer to fetch the
+                # full missing chunks or the whole period if gaps are large.
+                
+                # Check for missing ranges
+                missing_ranges = coverage.get('missing_ranges', [])
+                
+                # If we have no data at all, or complex gaps, fetch the full period
+                # yfinance limits: 1m=7d, 5m=60d, 1h=730d
+                if not coverage['has_data'] or len(missing_ranges) > 2:
+                    logger.info(f"Fetching full {days}d of {interval} data for {ticker}")
+                    
+                    # Note: yfinance 1h allows 730d (2y)
+                    # 5m allows 60d
+                    yf_ticker = yf.Ticker(ticker)
+                    hist = make_yahoo_request(
+                        lambda: yf_ticker.history(
+                            period=f"{days}d",
+                            interval=interval,
+                            prepost=True
+                        ),
+                        description=f"fetch {interval} history for {ticker}",
+                        default_value=pd.DataFrame()
+                    )
+                    
+                    if not hist.empty:
+                        new_history = self._dataframe_to_intraday_history(hist, ticker)
+                        self._price_history.store_intraday_history(ticker, interval, new_history)
+                else:
+                    # Fetch specific ranges if possible? 
+                    # yfinance doesn't easily support "fetch from X to Y" for intraday reliably
+                    # across all intervals without `start/end` params which are sometimes flaky
+                    # for intraday. 
+                    # Simpler strategy: Just fetch the last X days if we are missing "recent" data,
+                    # or if we are missing "old" data, maybe fetch the full history.
+                    
+                    # For simplicity and reliability in this specific task ("fetch as much as possible"),
+                    # we will just fetch the full period requested if ANY meaningful data is missing.
+                    # This avoids complex gap logic and ensures best quality.
+                     logger.info(f"Filling gaps: Fetching full {days}d of {interval} data for {ticker}")
+                     yf_ticker = yf.Ticker(ticker)
+                     hist = make_yahoo_request(
+                        lambda: yf_ticker.history(
+                            period=f"{days}d",
+                            interval=interval,
+                            prepost=True
+                        ),
+                        description=f"fetch {interval} history for {ticker}",
+                        default_value=pd.DataFrame()
+                     )
+                     if not hist.empty:
+                        new_history = self._dataframe_to_intraday_history(hist, ticker)
+                        self._price_history.store_intraday_history(ticker, interval, new_history)
+                        
+            except Exception as e:
+                logger.error(f"Failed to fetch {interval} data for {ticker}: {e}")
+
+    def _fetch_comprehensive_history_sync(self, ticker: str) -> Dict[str, Any]:
+        """
+        Fetch comprehensive history for a ticker:
+        - 5 years of Daily data (no sampling)
+        - 2 years of Hourly data (1h)
+        - 60 days of 5-minute data (5m) - closest to requested 2m which isn't supported
+        - 30 days of 1-minute data (1m)
+        """
+        ticker = ticker.upper()
+        logger.info(f"Starting comprehensive data fetch for {ticker}...")
+        
+        # 1. Fetch 5 years of Daily data (base layer)
+        # disable_sampling=True ensures we get the full dataset in the return
+        # and store it all in the DB.
+        daily_result = self._get_stock_history_sync(ticker, "5y", disable_sampling=True)
+        
+        # 2. Ensure 2 years (730 days) of Hourly data
+        self._ensure_intraday_data_sync(ticker, "1h", 730)
+        
+        # 3. Ensure 60 days of 5-minute data
+        # Requested 2m, but yfinance standard intervals are 1m, 2m, 5m... 
+        # However 2m support is spotty/often mapped to 1m or 5m in some libs.
+        # yfinance DOES support 2m, but let's check if our system supports it.
+        # Our IntradayPriceHistory model stores interval as string, so "2m" is valid.
+        # Let's try 2m first, fallback to 5m if needed?
+        # Actually yfinance documentation says 2m is supported for last 60 days.
+        try:
+            self._ensure_intraday_data_sync(ticker, "2m", 60)
+        except Exception:
+            logger.warning(f"2m interval failed for {ticker}, falling back to 5m")
+            self._ensure_intraday_data_sync(ticker, "5m", 60)
+        
+        # 4. Ensure 30 days of 1-minute data
+        self._ensure_intraday_data_sync(ticker, "1m", 30)
+        
+        logger.info(f"Comprehensive data fetch complete for {ticker}")
+        
+        return daily_result
+
+    async def fetch_comprehensive_history(self, ticker: str) -> Dict[str, Any]:
+        """Async wrapper for comprehensive history fetch."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self._fetch_comprehensive_history_sync,
+            ticker
+        )
+
     # ============ Batch History Methods ============
     
     def _batch_get_intraday_history_sync(
@@ -1696,6 +1819,10 @@ class StockFetcher:
         """Clear intraday cache for a ticker."""
         return self._price_history.clear_intraday_cache(ticker)
     
+    def clear_daily_history(self, ticker: str) -> int:
+        """Clear daily price history for a ticker. Forces full refresh of daily data."""
+        return self._price_history.clear_daily_history(ticker)
+
     def clear_ticker_history(self, ticker: str) -> tuple[int, int]:
         """Clear ALL price history for a ticker (daily + intraday). Forces full refresh."""
         return self._price_history.clear_ticker_history(ticker)

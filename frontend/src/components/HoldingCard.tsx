@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Trash2, BarChart3, RefreshCw, TrendingUp, TrendingDown, Activity, RotateCcw, Pin } from 'lucide-react';
 import type { Holding, HistoryPoint } from '../types';
-import { PositionEditor, MiniStockChart, ActionScoreBadge } from './holding';
+import { PositionEditor, MiniStockChart, DualActionScoreBadge } from './holding';
 
 interface HoldingCardProps {
   holding: Holding;
@@ -71,9 +71,9 @@ export function HoldingCard({
           <div className="flex items-center gap-2">
             <h3 className="font-bold text-white text-xl">{holding.ticker}</h3>
             {isRefreshing && <RefreshCw className="w-3 h-3 text-accent-cyan/60 animate-spin" />}
-            {/* Action Score Badge - runs analysis in background */}
+            {/* Dual Action Score Badge - shows both swing (3d) and trend (15d) */}
             {holding.current_price && (
-              <ActionScoreBadge
+              <DualActionScoreBadge
                 ticker={holding.ticker}
                 currentPrice={holding.current_price}
                 high52w={high52w}

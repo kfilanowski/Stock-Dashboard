@@ -107,20 +107,20 @@ class WindowResult:
 async def load_price_history(
     db: AsyncSession,
     ticker: str,
-    min_days: int = 1260
+    min_days: int = 750
 ) -> pd.DataFrame:
     """
     Load price history from SQLite cache.
     
     Following GUIDELINES.md: SQLite-first approach, no API calls.
     
-    Defaults to 1260 days (~5 years) to ensure sufficient trade count
-    for swing trading strategies (1-2 trades/month max).
+    Defaults to 750 days (~3 years) to allow newer stocks while ensuring
+    sufficient trade count for swing trading strategies.
     
     Args:
         db: Database session
         ticker: Stock ticker
-        min_days: Minimum required history (default: 5 years)
+        min_days: Minimum required history (default: 3 years)
         
     Returns:
         DataFrame with OHLCV data
@@ -364,32 +364,35 @@ async def save_calibration_result(
     db: AsyncSession,
     ticker: str,
     result: FullOptimizationResult,
-    window_results: Optional[List[WindowResult]] = None
+    window_results: Optional[List[WindowResult]] = None,
+    strategy_class: str = 'all'
 ) -> None:
     """
     Save calibration results to database.
-    
+
     Args:
         db: Database session
         ticker: Stock ticker
         result: Optimization result
         window_results: Optional rolling window results
+        strategy_class: Strategy class ('all', 'directional', 'premium_sell', 'premium_buy')
     """
     # 1. Save/update weights
     for indicator, weight in result.weights.items():
         per_ind = result.per_indicator.get(indicator)
-        
-        # Upsert weight
+
+        # Upsert weight (including strategy_class in query)
         existing = await db.execute(
             select(CalibrationWeights).where(
                 CalibrationWeights.ticker == ticker,
                 CalibrationWeights.indicator == indicator,
                 CalibrationWeights.horizon == result.horizon,
-                CalibrationWeights.action == 'all'  # Default action
+                CalibrationWeights.action == 'all',
+                CalibrationWeights.strategy_class == strategy_class
             )
         )
         row = existing.scalar_one_or_none()
-        
+
         if row:
             row.weight = weight
             row.sqn_score = per_ind.sqn_score if per_ind else None
@@ -401,6 +404,7 @@ async def save_calibration_result(
                 indicator=indicator,
                 action='all',
                 horizon=result.horizon,
+                strategy_class=strategy_class,
                 weight=weight,
                 sqn_score=per_ind.sqn_score if per_ind else None,
                 stability_passed=per_ind.stability_passed if per_ind else True
@@ -431,25 +435,36 @@ async def save_calibration_result(
 async def load_calibrated_weights(
     db: AsyncSession,
     ticker: str,
-    horizon: int
+    horizon: int,
+    strategy_class: str = 'all'
 ) -> Optional[Dict[str, float]]:
     """
     Load calibrated weights from database.
-    
+
+    Args:
+        db: Database session
+        ticker: Stock ticker
+        horizon: Trading horizon (3 or 15)
+        strategy_class: Strategy class to load weights for
+
     Returns None if no calibration exists (will use defaults).
     """
     result = await db.execute(
         select(CalibrationWeights).where(
             CalibrationWeights.ticker == ticker,
-            CalibrationWeights.horizon == horizon
+            CalibrationWeights.horizon == horizon,
+            CalibrationWeights.strategy_class == strategy_class
         )
     )
-    
+
     rows = result.scalars().all()
-    
+
     if not rows:
+        # Fall back to 'all' strategy if specific strategy not found
+        if strategy_class != 'all':
+            return await load_calibrated_weights(db, ticker, horizon, 'all')
         return None
-    
+
     return {row.indicator: row.weight for row in rows}
 
 

@@ -12,7 +12,6 @@ import type {
   WeightsResponse,
   BatchWeightsResponse,
   WeightMatrix,
-  CalibrationWindow,
   WeightDrift
 } from '../types/calibration';
 

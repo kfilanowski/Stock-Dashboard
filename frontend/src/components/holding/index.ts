@@ -1,4 +1,4 @@
 export { PositionEditor } from './PositionEditor';
 export { MiniStockChart } from './MiniStockChart';
-export { ActionScoreBadge } from './ActionScoreBadge';
+export { ActionScoreBadge, DualActionScoreBadge } from './ActionScoreBadge';
 

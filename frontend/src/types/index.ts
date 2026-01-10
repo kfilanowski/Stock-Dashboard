@@ -123,7 +123,8 @@ export type MetricType =
   | 'callPutRatio'      // Options Call/Put ratio
   | 'ivPercentile'      // Implied Volatility percentile
   | 'sectorBeta'        // Beta to sector
-  | 'earningsProximity'; // Days until next earnings
+  | 'earningsProximity' // Days until next earnings
+  | 'optionsSentiment'; // Options market sentiment (bullish/bearish/neutral)
 
 /**
  * A signal from a single metric for a specific action.
@@ -160,6 +161,12 @@ export interface StockAnalysis {
   scores: ActionScore[];
   bestAction: ActionScore;
   hasOptions: boolean;          // Whether options are available for this stock
+  calibration?: {               // NEW: Calibration metadata
+    lastCalibrated: string;     // ISO Date
+    sqn: number | null;         // System Quality Number
+    period: number;             // Horizon (e.g. 3 or 15)
+  };
+  status?: 'ok' | 'low_confidence' | 'error'; // NEW: Status flag
   dataQuality: {
     availableMetrics: number;
     totalMetrics: number;
