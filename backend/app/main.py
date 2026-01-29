@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func
 from contextlib import asynccontextmanager
 import asyncio
+from datetime import datetime
 import math
 import os
 
@@ -35,14 +36,31 @@ from .services.calibration_service import (
     calibrate_ticker_streaming,
     load_calibrated_weights,
     save_calibration_result,
-    CalibrationProgress
+    CalibrationProgress,
+    CalibrationErrorResult
 )
-from .services.wfo_optimizer import DEFAULT_WEIGHTS, InsufficientVolatilityError
+from .services.wfo_optimizer import DEFAULT_WEIGHTS, InsufficientVolatilityError, OptimizerType, DEFAULT_OPTIMIZER
 from .services.option_analytics import OptionPosition
 
 # Setup logging
 setup_logging()
 logger = get_logger(__name__)
+
+
+def sanitize_float(value: float) -> float | None:
+    """Convert nan/inf to None for JSON serialization."""
+    if value is None:
+        return None
+    if math.isnan(value) or math.isinf(value):
+        return None
+    return value
+
+
+def sanitize_weights(weights: dict) -> dict:
+    """Sanitize all weight values for JSON serialization."""
+    if weights is None:
+        return None
+    return {k: sanitize_float(v) if isinstance(v, float) else v for k, v in weights.items()}
 
 
 @asynccontextmanager
@@ -150,6 +168,182 @@ async def update_portfolio(
     
     logger.info(f"Updated portfolio: {portfolio.name}, ${portfolio.total_value:,.2f}")
     return portfolio
+
+
+# ============ Portfolio Export/Import ============
+
+@app.get("/api/v1/portfolio/export")
+async def export_portfolio(db: AsyncSession = Depends(get_db)):
+    """
+    Export portfolio holdings (stocks and options) to JSON for backup.
+
+    Use this before database migrations or schema changes.
+    Returns a downloadable JSON file.
+    """
+    from sqlalchemy.orm import selectinload
+    from fastapi.responses import JSONResponse
+
+    result = await db.execute(
+        select(Portfolio)
+        .options(selectinload(Portfolio.holdings))
+        .options(selectinload(Portfolio.option_holdings))
+        .limit(1)
+    )
+    portfolio = result.scalar_one_or_none()
+
+    if not portfolio:
+        return JSONResponse(
+            content={"error": "No portfolio found"},
+            status_code=404
+        )
+
+    export_data = {
+        "exported_at": datetime.utcnow().isoformat(),
+        "version": "1.0",
+        "portfolio": {
+            "name": portfolio.name,
+            "total_value": portfolio.total_value,
+            "chart_period": portfolio.chart_period,
+            "sort_field": portfolio.sort_field,
+            "sort_direction": portfolio.sort_direction,
+        },
+        "holdings": [
+            {
+                "ticker": h.ticker,
+                "shares": h.shares,
+                "avg_cost": h.avg_cost,
+                "is_pinned": h.is_pinned,
+            }
+            for h in portfolio.holdings
+        ],
+        "option_holdings": [
+            {
+                "underlying_ticker": o.underlying_ticker,
+                "option_type": o.option_type,
+                "position_type": o.position_type,
+                "strike_price": o.strike_price,
+                "expiration_date": o.expiration_date.isoformat() if o.expiration_date else None,
+                "contracts": o.contracts,
+                "premium_per_contract": o.premium_per_contract,
+                "notes": o.notes,
+            }
+            for o in portfolio.option_holdings
+        ],
+    }
+
+    logger.info(f"Exported portfolio: {len(export_data['holdings'])} holdings, {len(export_data['option_holdings'])} options")
+
+    return JSONResponse(
+        content=export_data,
+        headers={
+            "Content-Disposition": f"attachment; filename=portfolio_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        }
+    )
+
+
+@app.post("/api/v1/portfolio/import")
+async def import_portfolio(
+    import_data: dict,
+    db: AsyncSession = Depends(get_db),
+    clear_existing: bool = True
+):
+    """
+    Import portfolio holdings from a previously exported JSON backup.
+
+    Args:
+        import_data: The exported JSON data
+        clear_existing: If True, clears existing holdings before import (default: True)
+
+    Returns:
+        Summary of imported holdings
+    """
+    from sqlalchemy.orm import selectinload
+    from datetime import date
+
+    # Validate import data
+    if "holdings" not in import_data and "option_holdings" not in import_data:
+        raise HTTPException(status_code=400, detail="Invalid import data: missing holdings")
+
+    # Get or create portfolio
+    result = await db.execute(
+        select(Portfolio)
+        .options(selectinload(Portfolio.holdings))
+        .options(selectinload(Portfolio.option_holdings))
+        .limit(1)
+    )
+    portfolio = result.scalar_one_or_none()
+
+    if not portfolio:
+        portfolio = Portfolio()
+        db.add(portfolio)
+        await db.flush()
+
+    # Optionally restore portfolio settings
+    if "portfolio" in import_data:
+        p_data = import_data["portfolio"]
+        if "name" in p_data:
+            portfolio.name = p_data["name"]
+        if "total_value" in p_data:
+            portfolio.total_value = p_data["total_value"]
+        if "chart_period" in p_data:
+            portfolio.chart_period = p_data["chart_period"]
+        if "sort_field" in p_data:
+            portfolio.sort_field = p_data["sort_field"]
+        if "sort_direction" in p_data:
+            portfolio.sort_direction = p_data["sort_direction"]
+
+    # Clear existing holdings if requested
+    if clear_existing:
+        for h in list(portfolio.holdings):
+            await db.delete(h)
+        for o in list(portfolio.option_holdings):
+            await db.delete(o)
+        await db.flush()
+
+    # Import stock holdings
+    holdings_imported = 0
+    for h_data in import_data.get("holdings", []):
+        holding = Holding(
+            portfolio_id=portfolio.id,
+            ticker=h_data["ticker"].upper(),
+            shares=h_data.get("shares", 0),
+            avg_cost=h_data.get("avg_cost"),
+            is_pinned=h_data.get("is_pinned", False),
+        )
+        db.add(holding)
+        holdings_imported += 1
+
+    # Import option holdings
+    options_imported = 0
+    for o_data in import_data.get("option_holdings", []):
+        exp_date = o_data.get("expiration_date")
+        if isinstance(exp_date, str):
+            exp_date = date.fromisoformat(exp_date)
+
+        option = OptionHolding(
+            portfolio_id=portfolio.id,
+            underlying_ticker=o_data["underlying_ticker"].upper(),
+            option_type=o_data["option_type"],
+            position_type=o_data["position_type"],
+            strike_price=o_data["strike_price"],
+            expiration_date=exp_date,
+            contracts=o_data.get("contracts", 1),
+            premium_per_contract=o_data.get("premium_per_contract"),
+            notes=o_data.get("notes"),
+        )
+        db.add(option)
+        options_imported += 1
+
+    await db.commit()
+
+    logger.info(f"Imported portfolio: {holdings_imported} holdings, {options_imported} options")
+
+    return {
+        "status": "success",
+        "holdings_imported": holdings_imported,
+        "options_imported": options_imported,
+        "cleared_existing": clear_existing,
+    }
 
 
 # ============ Holdings Endpoints ============
@@ -825,7 +1019,12 @@ from typing import List, Optional
 class CalibrationRequest(BaseModel):
     """Request to start calibration for a ticker."""
     ticker: str
-    horizons: List[int] = [3, 15]  # Default: swing (3d) and trend (15d)
+    horizons: Optional[List[int]] = None  # If None and auto_discover=True, uses discovered horizons
+    strategy_classes: Optional[List[str]] = None  # If None, uses all: ['directional', 'premium_sell', 'premium_buy']
+    auto_discover_horizons: bool = True   # Auto-discover optimal horizons via IC analysis
+    min_horizon: int = 2                  # Min horizon for discovery
+    max_horizon: int = 30                 # Max horizon for discovery
+    optimizer: str = 'coordinate_descent' # 'coordinate_descent', 'differential_evolution', or 'hybrid'
 
 
 class WeightsResponse(BaseModel):
@@ -844,58 +1043,185 @@ async def start_calibration(
 ):
     """
     Start Walk-Forward Optimization calibration for a ticker.
-    
+
+    If auto_discover_horizons=True (default), first runs resonance analysis to find
+    the stock's optimal trading horizons based on Information Coefficient.
+
+    Calibrates for each strategy class:
+    - directional: For buyShares, sellShares
+    - premium_sell: For openCSP, openCC
+    - premium_buy: For buyCall, buyPut
+
     This is an isolated operation that doesn't affect the main dashboard.
     Returns immediately with a job ID; use the SSE stream to monitor progress.
     """
+    from .services.horizon_resonance import analyze_resonance
+    from .services.calibration_service import load_price_history, DEFAULT_STRATEGY_CLASSES
+
     ticker = request.ticker.upper()
-    logger.info(f"[WFO] Starting calibration for {ticker}, horizons={request.horizons}")
-    
+
+    # Determine which strategy classes to use
+    strategy_classes = request.strategy_classes or DEFAULT_STRATEGY_CLASSES
+
+    # Determine which horizons to use
+    horizons = request.horizons
+    resonance_result = None
+
+    if request.auto_discover_horizons and horizons is None:
+        # Auto-discover optimal horizons using IC analysis
+        logger.info(f"[WFO] Auto-discovering optimal horizons for {ticker}...")
+        try:
+            df = await load_price_history(db, ticker, min_days=252)
+            resonance_result = analyze_resonance(
+                df=df,
+                ticker=ticker,
+                min_horizon=request.min_horizon,
+                max_horizon=request.max_horizon
+            )
+
+            # Use recommended horizons from resonance analysis
+            # Pick best from short and medium/long ranges for diversity
+            discovered = []
+            if resonance_result.recommended_short:
+                discovered.append(resonance_result.recommended_short)
+            if resonance_result.recommended_medium:
+                discovered.append(resonance_result.recommended_medium)
+            elif resonance_result.recommended_long:
+                discovered.append(resonance_result.recommended_long)
+
+            # Fallback to top horizons if recommendations are empty
+            if not discovered:
+                discovered = resonance_result.top_horizons[:2]
+
+            # Final fallback to defaults
+            horizons = discovered if discovered else [5, 21]
+
+            logger.info(f"[WFO] Discovered optimal horizons for {ticker}: {horizons}")
+            logger.info(f"[WFO] Resonance: top={resonance_result.top_horizons}, "
+                       f"short={resonance_result.recommended_short}, "
+                       f"medium={resonance_result.recommended_medium}, "
+                       f"long={resonance_result.recommended_long}")
+
+        except Exception as e:
+            logger.warning(f"[WFO] Resonance discovery failed for {ticker}: {e}, using defaults")
+            horizons = [5, 21]  # Fallback defaults (better than 3, 15)
+    elif horizons is None:
+        # No auto-discover, no explicit horizons - use improved defaults
+        horizons = [5, 21]
+
+    # Parse optimizer type
     try:
-        # Run calibration (this could be made async with background tasks)
-        results = await calibrate_ticker(db, ticker, request.horizons)
-        
+        optimizer_type = OptimizerType(request.optimizer)
+    except ValueError:
+        optimizer_type = DEFAULT_OPTIMIZER
+        logger.warning(f"[WFO] Unknown optimizer '{request.optimizer}', using default")
+
+    logger.info(f"[WFO] Starting calibration for {ticker}, horizons={horizons}, strategies={strategy_classes}, optimizer={optimizer_type.value}")
+
+    try:
+        # Run calibration with discovered/specified horizons and strategy classes
+        # New return structure: {strategy_class: {horizon: result}}
+        results = await calibrate_ticker(
+            db=db,
+            ticker=ticker,
+            horizons=horizons,
+            strategy_classes=strategy_classes,
+            optimizer=optimizer_type
+        )
+
         # Save results to database
         saved_count = 0
         response_results = {}
-        
-        for horizon, result in results.items():
-            if result:
-                logger.info(f"[WFO] {ticker} horizon={horizon}: SQN={result.train_sqn:.3f}, trades={result.total_trades}")
-                logger.info(f"[WFO] {ticker} horizon={horizon} weights: {result.weights}")
-                
-                # Save to database
-                try:
-                    await save_calibration_result(db, ticker, result)
-                    saved_count += 1
-                    logger.info(f"[WFO] Saved calibration for {ticker} horizon={horizon} to database")
-                except Exception as save_err:
-                    logger.error(f"[WFO] Failed to save {ticker} horizon={horizon}: {save_err}")
-                
-                response_results[horizon] = {
-                    "sqn": result.train_sqn,
-                    "trades": result.total_trades,
-                    "weights": result.weights,
-                    "error": None
-                }
-            else:
-                logger.warning(f"[WFO] {ticker} horizon={horizon}: No result (insufficient data)")
-                response_results[horizon] = {
-                    "sqn": None,
-                    "trades": 0,
-                    "weights": None,
-                    "error": "Insufficient trades: Stock generated fewer than 30 signals with 0.3 threshold. This stock may not be suitable for WFO calibration with tight thresholds."
-                }
-        
-        logger.info(f"[WFO] Calibration complete for {ticker}: saved {saved_count}/{len(results)} horizons")
-        
-        return {
+
+        for strategy_class, horizon_results in results.items():
+            response_results[strategy_class] = {}
+
+            for horizon, result in horizon_results.items():
+                # Check if result is a successful optimization or an error
+                if isinstance(result, CalibrationErrorResult):
+                    # Calibration failed with detailed error info
+                    logger.warning(f"[WFO] {ticker} {strategy_class} horizon={horizon}: {result.error_type} - {result.trades_found} trades in {result.window_days} days")
+                    response_results[strategy_class][horizon] = {
+                        "sqn": None,
+                        "trades": result.trades_found,
+                        "weights": None,
+                        "reduced_confidence": False,
+                        "error": f"Insufficient trades: Only {result.trades_found} signals generated over {result.window_days} days (need 20+). This stock may be too stable for WFO calibration - it doesn't trigger enough buy/sell signals with the current thresholds."
+                    }
+                elif result is not None:
+                    # Successful optimization
+                    logger.info(f"[WFO] {ticker} {strategy_class} horizon={horizon}: SQN={result.train_sqn:.3f}, trades={result.total_trades}")
+                    logger.info(f"[WFO] {ticker} {strategy_class} horizon={horizon} weights: {result.weights}")
+
+                    # Save to database (including window results and trades if available)
+                    save_error = None
+                    try:
+                        window_results = getattr(result, 'window_results', None)
+                        await save_calibration_result(
+                            db, ticker, result,
+                            window_results=window_results,
+                            strategy_class=strategy_class
+                        )
+                        saved_count += 1
+                        windows_saved = len(window_results) if window_results else 0
+                        logger.info(f"[WFO] Saved calibration for {ticker} {strategy_class} horizon={horizon} to database ({windows_saved} windows)")
+                    except Exception as save_err:
+                        save_error = str(save_err)
+                        logger.error(f"[WFO] Failed to save {ticker} {strategy_class} horizon={horizon}: {save_err}")
+
+                    response_results[strategy_class][horizon] = {
+                        "sqn": sanitize_float(result.train_sqn),
+                        "gross_sqn": sanitize_float(result.avg_gross_sqn) if result.avg_gross_sqn else None,
+                        "trades": result.total_trades,
+                        "weights": sanitize_weights(result.weights),
+                        "reduced_confidence": result.reduced_confidence,
+                        "error": None,
+                        "save_error": save_error  # Surface database save failures to frontend
+                    }
+                else:
+                    # Fallback for None results (shouldn't happen anymore)
+                    logger.warning(f"[WFO] {ticker} {strategy_class} horizon={horizon}: No result (unknown error)")
+                    response_results[strategy_class][horizon] = {
+                        "sqn": None,
+                        "trades": 0,
+                        "weights": None,
+                        "reduced_confidence": False,
+                        "error": "Calibration failed for unknown reason"
+                    }
+
+        total_results = sum(len(hr) for hr in results.values())
+        logger.info(f"[WFO] Calibration complete for {ticker}: saved {saved_count}/{total_results} strategy+horizon combinations")
+
+        # Check for save failures
+        save_warnings = []
+        if saved_count < total_results:
+            save_warnings.append(f"Only {saved_count}/{total_results} results saved to database")
+
+        # Build response with resonance info if available
+        response = {
             "status": "complete",
             "ticker": ticker,
-            "horizons": request.horizons,
+            "horizons": horizons,  # Actual horizons used (may be discovered)
+            "strategy_classes": strategy_classes,
+            "horizons_auto_discovered": resonance_result is not None,
             "saved_count": saved_count,
+            "total_results": total_results,
+            "save_warnings": save_warnings if save_warnings else None,
             "results": response_results
         }
+
+        # Include resonance analysis details if we discovered horizons
+        if resonance_result:
+            response["resonance"] = {
+                "top_horizons": resonance_result.top_horizons,
+                "recommended_short": resonance_result.recommended_short,
+                "recommended_medium": resonance_result.recommended_medium,
+                "recommended_long": resonance_result.recommended_long,
+                "best_ic": float(resonance_result.heatmap[resonance_result.top_horizons[0]].ic)
+                    if resonance_result.top_horizons else None
+            }
+
+        return response
     except InsufficientVolatilityError as e:
         logger.warning(f"[WFO] {ticker}: Insufficient volatility - {e}")
         return {
@@ -920,21 +1246,35 @@ async def start_calibration(
 @app.get("/api/v1/calibration/stream/{ticker}")
 async def stream_calibration(
     ticker: str,
+    horizons: Optional[str] = None,  # Comma-separated list of horizons, e.g., "6,7,8"
     db: AsyncSession = Depends(get_db)
 ):
     """
     Stream calibration progress via Server-Sent Events (SSE).
-    
+
     Events are formatted as:
     data: {"ticker": "AAPL", "stage": "optimizing", "progress": 50, ...}
-    
+
     Stages: loading, optimizing, testing, saving, complete, error
+
+    Args:
+        ticker: Stock ticker
+        horizons: Comma-separated list of horizons (e.g., "6,7,8"). If not provided, uses defaults.
     """
     ticker = ticker.upper()
-    
+
+    # Parse horizons from query string
+    horizon_list = None
+    if horizons:
+        try:
+            horizon_list = [int(h.strip()) for h in horizons.split(',') if h.strip()]
+            logger.info(f"[SSE] Streaming calibration for {ticker} with horizons: {horizon_list}")
+        except ValueError:
+            logger.warning(f"[SSE] Invalid horizons format: {horizons}, using defaults")
+
     async def event_generator():
         try:
-            async for event in calibrate_ticker_streaming(db, ticker):
+            async for event in calibrate_ticker_streaming(db, ticker, horizons=horizon_list):
                 yield event
         except Exception as e:
             error_event = CalibrationProgress(
@@ -961,6 +1301,7 @@ async def stream_calibration(
 async def get_calibration_weights_batch(
     tickers: str,  # Comma-separated list
     horizon: int = 3,
+    strategy_class: str = 'all',  # 'all', 'directional', 'premium_sell', 'premium_buy'
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -968,13 +1309,18 @@ async def get_calibration_weights_batch(
 
     Useful for loading weights for entire portfolio at once.
 
+    Args:
+        tickers: Comma-separated list of ticker symbols
+        horizon: Trading horizon (3 or 15)
+        strategy_class: Strategy class to load weights for ('all', 'directional', 'premium_sell', 'premium_buy')
+
     NOTE: This endpoint must be defined BEFORE /{ticker} to avoid path matching issues.
     """
     ticker_list = [t.strip().upper() for t in tickers.split(",")]
 
     results = {}
     for ticker in ticker_list:
-        weights = await load_calibrated_weights(db, ticker, horizon)
+        weights = await load_calibrated_weights(db, ticker, horizon, strategy_class)
 
         # Get metadata directly from CalibrationWeights (not CalibrationWindow which may be empty)
         weights_meta = await db.execute(
@@ -984,6 +1330,7 @@ async def get_calibration_weights_batch(
             )
             .where(CalibrationWeights.ticker == ticker)
             .where(CalibrationWeights.horizon == horizon)
+            .where(CalibrationWeights.strategy_class == strategy_class)
         )
         meta = weights_meta.one()
         avg_sqn, last_updated = meta
@@ -1004,6 +1351,7 @@ async def get_calibration_weights_batch(
 
     return {
         "horizon": horizon,
+        "strategy_class": strategy_class,
         "tickers": results
     }
 
@@ -1012,17 +1360,24 @@ async def get_calibration_weights_batch(
 async def get_calibration_weights(
     ticker: str,
     horizon: int = 3,
+    strategy_class: str = 'directional',  # Default to 'directional' for backward compat
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Get calibrated weights for a ticker and horizon.
+    Get calibrated weights for a ticker, horizon, and strategy class.
+
+    Strategy classes:
+    - 'directional': For buyShares, sellShares (default)
+    - 'premium_sell': For openCSP, openCC
+    - 'premium_buy': For buyCall, buyPut
 
     Returns default weights if no calibration exists.
+    Falls back to 'all' strategy if specific strategy not found.
     This is what the frontend should call to get weights for scoring.
     """
     ticker = ticker.upper()
 
-    weights = await load_calibrated_weights(db, ticker, horizon)
+    weights = await load_calibrated_weights(db, ticker, horizon, strategy_class)
 
     if weights:
         return WeightsResponse(
@@ -1099,7 +1454,7 @@ async def verify_calibration(
     weights_data = await db.execute(
         select(CalibrationWeights)
         .where(CalibrationWeights.ticker == ticker)
-        .order_by(CalibrationWeights.horizon, CalibrationWeights.indicator)
+        .order_by(CalibrationWeights.horizon, CalibrationWeights.strategy_class, CalibrationWeights.indicator)
     )
     
     def safe_sqn(val):
@@ -1115,8 +1470,10 @@ async def verify_calibration(
         {
             "indicator": w.indicator,
             "horizon": w.horizon,
+            "strategy_class": w.strategy_class or "all",
             "weight": w.weight,
             "sqn_score": safe_sqn(w.sqn_score),
+            "gross_sqn": safe_sqn(w.avg_gross_sqn),
             "stability_passed": w.stability_passed,
             "updated_at": str(w.updated_at) if w.updated_at else None
         }
@@ -1152,6 +1509,36 @@ async def verify_calibration(
     }
 
 
+@app.get("/api/v1/calibration/diagnostic/{ticker}")
+async def run_calibration_diagnostic(
+    ticker: str,
+    horizon: int = 5,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Run comprehensive diagnostic to establish ground truth.
+
+    This helps answer: "Are the signals predictive, or are costs killing us?"
+
+    Returns:
+    - Buy-and-hold baseline (what did the market do?)
+    - Gross vs Net SQN (signals before/after costs)
+    - Random baseline (are signals better than random?)
+    - Sample trades (for manual inspection)
+    - Verdict and recommendations
+    """
+    from .services.calibration_diagnostic import run_diagnostic, diagnostic_to_dict
+
+    try:
+        report = await run_diagnostic(db, ticker, horizon)
+        return diagnostic_to_dict(report)
+    except ValueError as e:
+        return {"error": str(e), "ticker": ticker.upper()}
+    except Exception as e:
+        logger.error(f"[DIAGNOSTIC] Failed for {ticker}: {e}", exc_info=True)
+        return {"error": str(e), "ticker": ticker.upper()}
+
+
 @app.get("/api/v1/calibration/data-status/{ticker}")
 async def get_calibration_data_status(
     ticker: str,
@@ -1159,15 +1546,15 @@ async def get_calibration_data_status(
 ):
     """
     Check how much historical data is available for a ticker.
-    
+
     WFO requires ~750 trading days (3 years) for swing trading calibration.
     More data = more trades = better statistical significance.
     """
     from sqlalchemy import func
     from .models import PriceHistory
-    
+
     ticker = ticker.upper()
-    
+
     # Count available daily records
     result = await db.execute(
         select(
@@ -1178,12 +1565,12 @@ async def get_calibration_data_status(
     )
     row = result.one()
     count, min_date, max_date = row
-    
+
     # WFO optimally needs ~1260 days (5 years), but we accept 750 (3 years)
     # as a minimum to allow newer stocks to be calibrated.
     required_days = 750
     has_sufficient_data = count >= required_days
-    
+
     return {
         "ticker": ticker,
         "available_days": count,
@@ -1197,6 +1584,105 @@ async def get_calibration_data_status(
             else f"Need {required_days - count} more days of data"
         )
     }
+
+
+@app.get("/api/v1/calibration/resonance/{ticker}")
+async def analyze_horizon_resonance(
+    ticker: str,
+    min_horizon: int = 2,
+    max_horizon: int = 30,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Discover optimal trading horizons for a stock using Information Coefficient analysis.
+
+    Instead of hard-coding horizons (3d, 15d), this finds the "resonant frequency"
+    for each stock by testing multiple horizons and measuring signal-return correlation.
+
+    Different stocks have different natural trading cycles:
+    - TSLA might resonate at 5-day volatility cycles
+    - KO might resonate at 20-day trend cycles
+
+    Returns:
+        - heatmap: IC values for each horizon (2-30 days)
+        - top_horizons: Best horizons sorted by predictive power
+        - recommended: Best horizon in each range (short/medium/long)
+    """
+    from .services.horizon_resonance import analyze_resonance, format_heatmap_for_display
+    from .services.calibration_service import load_price_history
+
+    ticker = ticker.upper()
+    logger.info(f"[RESONANCE] Starting horizon analysis for {ticker}")
+
+    try:
+        # Load price history
+        df = await load_price_history(db, ticker, min_days=252)  # Need at least 1 year
+
+        # Run resonance analysis
+        result = analyze_resonance(
+            df=df,
+            ticker=ticker,
+            min_horizon=min_horizon,
+            max_horizon=max_horizon
+        )
+
+        # Format for response
+        heatmap_data = format_heatmap_for_display(result)
+
+        return {
+            "status": "success",
+            "ticker": ticker,
+            "horizons_tested": result.horizons_tested,
+            "top_horizons": result.top_horizons,
+            "recommended": {
+                "short": result.recommended_short,
+                "medium": result.recommended_medium,
+                "long": result.recommended_long
+            },
+            "heatmap": heatmap_data,
+            "interpretation": _interpret_resonance(result)
+        }
+
+    except ValueError as e:
+        return {
+            "status": "error",
+            "ticker": ticker,
+            "error": str(e),
+            "message": "Insufficient data for resonance analysis"
+        }
+    except Exception as e:
+        logger.error(f"[RESONANCE] Analysis failed for {ticker}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _interpret_resonance(result) -> str:
+    """Generate human-readable interpretation of resonance results."""
+    from .services.horizon_resonance import ResonanceResult
+
+    significant_count = sum(1 for r in result.heatmap.values() if r.is_significant)
+
+    if significant_count == 0:
+        return (
+            f"{result.ticker} shows weak signal-return correlation across all horizons. "
+            "Technical indicators may have limited predictive power for this stock. "
+            "Consider using default horizons (5d, 21d) or fundamental analysis."
+        )
+
+    best_horizon = result.top_horizons[0] if result.top_horizons else None
+    best_ic = result.heatmap[best_horizon].ic if best_horizon else 0
+
+    if best_horizon and best_horizon <= 7:
+        style = "swing trading (mean reversion)"
+    elif best_horizon and best_horizon <= 15:
+        style = "short-term trend following"
+    else:
+        style = "position trading (longer trends)"
+
+    return (
+        f"{result.ticker} resonates best at {best_horizon}-day horizon (IC={best_ic:.3f}). "
+        f"This suggests {style} may be most effective. "
+        f"Found {significant_count} statistically significant horizons."
+    )
 
 
 @app.post("/api/v1/calibration/fetch-data/{ticker}")

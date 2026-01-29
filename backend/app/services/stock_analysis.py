@@ -20,8 +20,10 @@ from yahooquery import Ticker as YQTicker
 
 from ..config import settings
 from ..logging_config import get_logger
-from ..models import StockAnalysisCache
+from ..models import StockAnalysisCache, IVHistory
 from .retry import make_yahoo_request
+from .regime import calculate_market_regime, MarketRegime
+from .price_history import get_price_history_service
 
 logger = get_logger(__name__)
 
@@ -181,6 +183,13 @@ class StockAnalysisService:
     
     def _cache_to_options(self, cached: StockAnalysisCache) -> Dict[str, Any]:
         """Convert cached data to options dict."""
+        # Calculate IV rank dynamically from history (not cached)
+        iv_rank = None
+        if cached.avg_implied_volatility:
+            # avg_implied_volatility is stored as percentage (e.g., 35.5), convert to decimal
+            current_iv = cached.avg_implied_volatility / 100.0
+            iv_rank = self._get_iv_rank_sync(cached.ticker, current_iv)
+
         return {
             "ticker": cached.ticker,
             "call_open_interest": cached.call_open_interest,
@@ -197,6 +206,7 @@ class StockAnalysisService:
             "call_put_ratio_volume": cached.call_put_ratio_volume,
             "avg_implied_volatility": cached.avg_implied_volatility,
             "iv_percentile": cached.iv_percentile,
+            "iv_rank": iv_rank,
             "options_sentiment": cached.options_sentiment,
             "has_options": cached.has_options if cached.has_options is not None else False,
         }
@@ -417,12 +427,19 @@ class StockAnalysisService:
             
             avg_iv = None
             iv_percentile = None
+            iv_rank = None
             if 'impliedVolatility' in near_term.columns:
                 iv_values = near_term['impliedVolatility'].dropna()
                 if len(iv_values) > 0:
                     avg_iv = iv_values.mean()
                     iv_percentile = min(100, max(0, (avg_iv - 0.2) / 0.6 * 100))
-            
+
+                    # Store IV history for future IV rank calculations
+                    self._store_iv_history(ticker, avg_iv)
+
+                    # Calculate true IV rank if we have enough history
+                    iv_rank = self._get_iv_rank_sync(ticker, avg_iv)
+
             options_sentiment = 'neutral'
             if call_put_ratio_oi:
                 if call_put_ratio_oi > 1.5:
@@ -442,6 +459,7 @@ class StockAnalysisService:
                 "call_put_ratio_volume": round(call_put_ratio_vol, 3) if call_put_ratio_vol else None,
                 "avg_implied_volatility": round(avg_iv * 100, 2) if avg_iv else None,
                 "iv_percentile": round(iv_percentile, 1) if iv_percentile else None,
+                "iv_rank": iv_rank,  # True 52-week IV rank (None if insufficient history)
                 "options_sentiment": options_sentiment,
                 "has_options": True
             }
@@ -601,6 +619,7 @@ class StockAnalysisService:
             "call_put_ratio_volume": None,
             "avg_implied_volatility": None,
             "iv_percentile": None,
+            "iv_rank": None,
             "options_sentiment": None,
             "has_options": False
         }
@@ -630,10 +649,13 @@ class StockAnalysisService:
         # Check cache first
         cached = self._get_cached_analysis(ticker)
         if cached:
+            # Get market regime (not cached, always fresh)
+            market_regime = self._get_market_regime_sync(ticker)
             return {
                 "ticker": ticker,
                 "fundamentals": self._cache_to_fundamentals(cached),
                 "options": self._cache_to_options(cached),
+                "market_regime": market_regime,
                 "fetched_at": cached.fetched_at.isoformat(),
                 "from_cache": True
             }
@@ -646,11 +668,15 @@ class StockAnalysisService:
             
             # Store in cache
             self._store_analysis_cache(ticker, fundamentals, options)
-            
+
+            # Get market regime
+            market_regime = self._get_market_regime_sync(ticker)
+
             return {
                 "ticker": ticker,
                 "fundamentals": fundamentals,
                 "options": options,
+                "market_regime": market_regime,
                 "fetched_at": datetime.now().isoformat(),
                 "from_cache": False
             }
@@ -660,6 +686,7 @@ class StockAnalysisService:
                 "ticker": ticker,
                 "fundamentals": self._fetch_fundamentals_from_api(YQTicker(ticker), ticker),
                 "options": self._empty_options_response(ticker),
+                "market_regime": None,
                 "fetched_at": datetime.now().isoformat(),
                 "from_cache": False
             }
@@ -697,7 +724,8 @@ class StockAnalysisService:
             if cached:
                 results[ticker] = {
                     "fundamentals": self._cache_to_fundamentals(cached),
-                    "options": self._cache_to_options(cached)
+                    "options": self._cache_to_options(cached),
+                    "market_regime": self._get_market_regime_sync(ticker)
                 }
             else:
                 tickers_needing_fetch.append(ticker)
@@ -794,19 +822,21 @@ class StockAnalysisService:
                     
                     # Store in cache
                     self._store_analysis_cache(ticker, fundamentals, options)
-                    
+
                     results[ticker] = {
                         "fundamentals": fundamentals,
-                        "options": options
+                        "options": options,
+                        "market_regime": self._get_market_regime_sync(ticker)
                     }
-                    
+
                 except Exception as e:
                     logger.error(f"Error processing batch analysis for {ticker}: {e}")
                     results[ticker] = {
                         "fundamentals": self._empty_fundamentals_response(ticker),
-                        "options": self._empty_options_response(ticker)
+                        "options": self._empty_options_response(ticker),
+                        "market_regime": None
                     }
-                    
+
         except Exception as e:
             logger.error(f"Batch analysis fetch failed: {e}")
             # Return empty responses for failed tickers
@@ -814,7 +844,8 @@ class StockAnalysisService:
                 if ticker not in results:
                     results[ticker] = {
                         "fundamentals": self._empty_fundamentals_response(ticker),
-                        "options": self._empty_options_response(ticker)
+                        "options": self._empty_options_response(ticker),
+                        "market_regime": None
                     }
         
         return results
@@ -1020,6 +1051,170 @@ class StockAnalysisService:
             self._get_sector_correlation_sync,
             ticker,
             days
+        )
+
+    # ============================================================================
+    # Market Regime Detection
+    # ============================================================================
+
+    def _get_market_regime_sync(self, ticker: str) -> Optional[str]:
+        """
+        Get the current market regime for a ticker.
+
+        Uses 6-state regime classification based on:
+        - Trend (SMA200 + SMA50 alignment)
+        - Volatility (Bollinger BandWidth percentile)
+
+        Returns one of: BULL_QUIET, BULL_VOLATILE, BEAR_QUIET,
+                        BEAR_VOLATILE, NEUTRAL_CHOP, NEUTRAL_VOLATILE
+        """
+        import pandas as pd
+
+        try:
+            price_service = get_price_history_service()
+
+            # Need 250+ days for SMA200 + rolling percentile calculations
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')
+
+            history = price_service.get_daily_history(ticker, start_date, end_date)
+
+            if not history or len(history) < 200:
+                logger.debug(f"Insufficient history for regime detection: {ticker} ({len(history) if history else 0} days)")
+                return None
+
+            # Convert to DataFrame
+            df = pd.DataFrame(history)
+            df['close'] = df['close'].astype(float)
+            df['high'] = df['high'].astype(float)
+            df['low'] = df['low'].astype(float)
+
+            # Calculate regime
+            regimes = calculate_market_regime(df)
+
+            if regimes is None or len(regimes) == 0:
+                return None
+
+            # Return the most recent regime
+            current_regime = regimes.iloc[-1]
+
+            # Handle NaN
+            if pd.isna(current_regime):
+                return None
+
+            return str(current_regime)
+
+        except Exception as e:
+            logger.warning(f"Error calculating market regime for {ticker}: {e}")
+            return None
+
+    async def get_market_regime(self, ticker: str) -> Optional[str]:
+        """Async wrapper for market regime detection."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self._get_market_regime_sync,
+            ticker
+        )
+
+    # ============================================================================
+    # IV History and IV Rank
+    # ============================================================================
+
+    def _store_iv_history(self, ticker: str, implied_volatility: float) -> None:
+        """
+        Store today's IV in history for IV rank calculation.
+
+        Args:
+            ticker: Stock ticker symbol
+            implied_volatility: Average IV as decimal (e.g., 0.35 = 35%)
+        """
+        if implied_volatility is None or implied_volatility <= 0:
+            return
+
+        ticker = ticker.upper()
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        try:
+            with Session(self._engine) as session:
+                # Check if already exists
+                existing = session.execute(
+                    select(IVHistory).where(
+                        IVHistory.ticker == ticker,
+                        IVHistory.date == today
+                    )
+                ).scalar_one_or_none()
+
+                if existing:
+                    # Update existing
+                    existing.implied_volatility = implied_volatility
+                else:
+                    # Insert new
+                    session.add(IVHistory(
+                        ticker=ticker,
+                        date=today,
+                        implied_volatility=implied_volatility
+                    ))
+
+                session.commit()
+                logger.debug(f"Stored IV history for {ticker}: {implied_volatility:.4f}")
+        except Exception as e:
+            logger.warning(f"Error storing IV history for {ticker}: {e}")
+
+    def _get_iv_rank_sync(self, ticker: str, current_iv: float) -> Optional[float]:
+        """
+        Calculate true 52-week IV rank.
+
+        IV Rank = (Current IV - 52-week Low IV) / (52-week High IV - 52-week Low IV)
+
+        Returns:
+            IV rank as percentage (0-100) or None if insufficient history
+        """
+        if current_iv is None or current_iv <= 0:
+            return None
+
+        ticker = ticker.upper()
+
+        try:
+            # Get 52 weeks (365 days) of IV history
+            cutoff_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+
+            with Session(self._engine) as session:
+                result = session.execute(
+                    select(IVHistory.implied_volatility)
+                    .where(IVHistory.ticker == ticker)
+                    .where(IVHistory.date >= cutoff_date)
+                    .order_by(IVHistory.date)
+                )
+                iv_values = [row[0] for row in result.fetchall()]
+
+            if len(iv_values) < 20:
+                # Need at least 20 data points for meaningful rank
+                logger.debug(f"Insufficient IV history for {ticker}: {len(iv_values)} days")
+                return None
+
+            min_iv = min(iv_values)
+            max_iv = max(iv_values)
+
+            if max_iv <= min_iv:
+                return 50.0  # No range, return middle
+
+            iv_rank = (current_iv - min_iv) / (max_iv - min_iv) * 100
+
+            return round(max(0, min(100, iv_rank)), 1)
+
+        except Exception as e:
+            logger.warning(f"Error calculating IV rank for {ticker}: {e}")
+            return None
+
+    async def get_iv_rank(self, ticker: str, current_iv: float) -> Optional[float]:
+        """Async wrapper for IV rank calculation."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self._get_iv_rank_sync,
+            ticker,
+            current_iv
         )
 
 

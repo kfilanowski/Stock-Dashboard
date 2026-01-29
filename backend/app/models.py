@@ -187,6 +187,12 @@ class CalibrationWeights(Base):
     sqn_score = Column(Float, nullable=True)  # SQN at this weight
     stability_passed = Column(Boolean, default=True)  # Neighbor validation passed
 
+    # Overfit detection
+    overfit_warning = Column(Boolean, default=False)  # True if test_sqn < 0.5 * train_sqn
+    avg_train_sqn = Column(Float, nullable=True)  # Average in-sample SQN across windows
+    avg_test_sqn = Column(Float, nullable=True)  # Average out-of-sample SQN across windows
+    avg_gross_sqn = Column(Float, nullable=True)  # Average gross SQN (before costs) - signal quality
+
     # Window tracking
     window_end_date = Column(String, nullable=True)  # YYYY-MM-DD of training window end
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -241,37 +247,104 @@ class CalibrationWindow(Base):
 class CalibrationTrade(Base):
     """
     Logs simulated trades from the WFO backtesting process.
-    
+
     Each trade is tagged with market regime to enable regime-specific
     performance analysis (e.g., "RSI in BEAR_VOLATILE" queries).
+
+    Uses next-day-open execution model:
+    - Signal triggers at close of signal_date
+    - Entry happens at open of entry_date (next day)
+    - Exit happens at close of exit_date (entry + horizon days)
     """
     __tablename__ = "calibration_trades"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     window_id = Column(Integer, ForeignKey("calibration_windows.id"), nullable=False)
     ticker = Column(String, nullable=False, index=True)
-    
+
     # Trade details
-    entry_date = Column(String, nullable=False)  # YYYY-MM-DD
+    signal_date = Column(String, nullable=True)  # When signal triggered (at close)
+    entry_date = Column(String, nullable=False)  # Actual entry (next-day open)
     exit_date = Column(String, nullable=False)
     horizon = Column(Integer, nullable=False)  # 3 or 15
     direction = Column(String, nullable=False)  # 'long' or 'short'
-    
+
     # Prices and P&L
-    entry_price = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)  # Next-day open price
     exit_price = Column(Float, nullable=False)
     pnl_pct = Column(Float, nullable=False)  # Profit/loss percentage
     transaction_cost = Column(Float, nullable=False, default=0.001)  # 0.1% default
-    
+
+    # Execution quality tracking (for realistic pricing analysis)
+    entry_gap_pct = Column(Float, nullable=True)  # Overnight gap %
+    slippage_applied = Column(Float, nullable=True)  # Adaptive slippage % used
+
     # 6-State Market Regime at entry
-    # Values: BULL_QUIET, BULL_VOLATILE, BEAR_QUIET, BEAR_VOLATILE, 
+    # Values: BULL_QUIET, BULL_VOLATILE, BEAR_QUIET, BEAR_VOLATILE,
     #         NEUTRAL_CHOP, NEUTRAL_VOLATILE
     market_regime = Column(String, nullable=True)
-    
+
     # Relationship back to window
     window = relationship("CalibrationWindow", back_populates="trades")
     
     __table_args__ = (
         Index('ix_trade_ticker_regime', 'ticker', 'market_regime'),
         Index('ix_trade_window', 'window_id'),
+    )
+
+
+class IVHistory(Base):
+    """
+    Historical implied volatility data for calculating true IV rank.
+
+    Stores daily average IV for each ticker to enable calculation of
+    52-week IV rank: (current IV - min) / (max - min)
+    """
+    __tablename__ = "iv_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String, nullable=False, index=True)
+    date = Column(String, nullable=False)  # YYYY-MM-DD format
+    implied_volatility = Column(Float, nullable=False)  # Average IV as decimal (e.g., 0.35 = 35%)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('ticker', 'date', name='uix_iv_history'),
+        Index('ix_iv_history_ticker_date', 'ticker', 'date'),
+    )
+
+
+class CalibrationParams(Base):
+    """
+    Stores optimized parameter configurations per-stock, per-horizon, per-strategy.
+
+    These parameters (context multipliers, trade thresholds, signal breakpoints)
+    are discovered through Differential Evolution optimization and complement
+    the indicator weights stored in CalibrationWeights.
+
+    The params_json field stores the full OptimizationParams serialization
+    from backend/app/services/optimization_params.py.
+    """
+    __tablename__ = "calibration_params"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String, nullable=False, index=True)
+    horizon = Column(Integer, nullable=False)  # 3 (swing), 15 (trend), or discovered horizon
+    strategy_class = Column(String, nullable=False, default='all')  # 'all', 'directional', 'premium_sell', 'premium_buy'
+
+    # Serialized OptimizationParams (JSON)
+    # Contains: context_multipliers, trade_thresholds, signal_breakpoints, regime_adjustments
+    params_json = Column(String, nullable=False)
+
+    # Performance metrics from optimization
+    train_sqn = Column(Float, nullable=True)  # In-sample SQN
+    test_sqn = Column(Float, nullable=True)   # Out-of-sample SQN (validation)
+
+    # Window tracking
+    window_end_date = Column(String, nullable=True)  # YYYY-MM-DD of training window end
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('ticker', 'horizon', 'strategy_class', name='uix_calibration_params_key'),
+        Index('ix_calibration_params_ticker_horizon', 'ticker', 'horizon'),
     )

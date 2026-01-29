@@ -1,8 +1,8 @@
 /**
  * Calibration API Service
- * 
+ *
  * Isolated API module for Walk-Forward Optimization endpoints.
- * Does NOT modify existing api.ts - keeps calibration code separate.
+ * Includes comprehensive error tracking with full context.
  */
 
 import type {
@@ -12,8 +12,10 @@ import type {
   WeightsResponse,
   BatchWeightsResponse,
   WeightMatrix,
-  WeightDrift
+  WeightDrift,
+  ResonanceResponse
 } from '../types/calibration';
+import { trackError, trackApiError, type ErrorContext } from './errorTracking';
 
 // ============================================================================
 // Configuration
@@ -22,12 +24,109 @@ import type {
 const API_BASE = '/api/v1/calibration';
 
 // ============================================================================
+// Error Handling Helpers
+// ============================================================================
+
+/**
+ * API error with full context
+ */
+export class CalibrationApiError extends Error {
+  public readonly context: ErrorContext;
+  public readonly httpStatus?: number;
+  public readonly responseBody?: unknown;
+  public readonly requestUrl: string;
+
+  constructor(
+    message: string,
+    context: ErrorContext,
+    httpStatus?: number,
+    responseBody?: unknown,
+    requestUrl?: string
+  ) {
+    super(message);
+    this.name = 'CalibrationApiError';
+    this.context = context;
+    this.httpStatus = httpStatus;
+    this.responseBody = responseBody;
+    this.requestUrl = requestUrl || '';
+  }
+}
+
+/**
+ * Handle API response, tracking errors with full context
+ */
+async function handleResponse<T>(
+  response: Response,
+  context: ErrorContext
+): Promise<T> {
+  if (!response.ok) {
+    const tracked = await trackApiError(response, context);
+    throw new CalibrationApiError(
+      tracked.message,
+      context,
+      response.status,
+      tracked.responseBody,
+      response.url
+    );
+  }
+
+  try {
+    return await response.json();
+  } catch (err) {
+    trackError(err, {
+      ...context,
+      operation: `${context.operation}:parseResponse`,
+      metadata: { ...context.metadata, responseStatus: response.status }
+    });
+    throw new CalibrationApiError(
+      'Failed to parse response JSON',
+      context,
+      response.status,
+      undefined,
+      response.url
+    );
+  }
+}
+
+/**
+ * Wrap fetch with error tracking
+ */
+async function trackedFetch(
+  url: string,
+  options: RequestInit,
+  context: ErrorContext
+): Promise<Response> {
+  try {
+    const response = await fetch(url, options);
+    return response;
+  } catch (err) {
+    // Network error, CORS, etc.
+    trackError(err, {
+      ...context,
+      metadata: {
+        ...context.metadata,
+        url,
+        method: options.method || 'GET',
+        errorType: 'network'
+      }
+    });
+    throw new CalibrationApiError(
+      err instanceof Error ? err.message : 'Network request failed',
+      context,
+      undefined,
+      undefined,
+      url
+    );
+  }
+}
+
+// ============================================================================
 // Core API Functions
 // ============================================================================
 
 /**
  * Start calibration for a ticker.
- * 
+ *
  * This runs the full WFO optimization pipeline:
  * 1. Loads price history from SQLite cache
  * 2. Runs two-pass coordinate descent
@@ -37,61 +136,80 @@ const API_BASE = '/api/v1/calibration';
 export async function startCalibration(
   request: CalibrationRequest
 ): Promise<CalibrationResponse> {
-  const response = await fetch(`${API_BASE}/start`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      ticker: request.ticker.toUpperCase(),
-      horizons: request.horizons ?? [3, 15]
-    })
-  });
-  
-  if (!response.ok) {
-    throw new Error(`Calibration failed: ${response.status}`);
-  }
-  
-  return response.json();
+  const ticker = request.ticker.toUpperCase();
+  const horizons = request.horizons ?? [3, 15];
+  const optimizer = request.optimizer ?? 'coordinate_descent';
+
+  const context: ErrorContext = {
+    operation: 'startCalibration',
+    source: 'calibrationApi',
+    ticker,
+    params: { horizons, optimizer }
+  };
+
+  const response = await trackedFetch(
+    `${API_BASE}/start`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticker, horizons, optimizer })
+    },
+    context
+  );
+
+  return handleResponse<CalibrationResponse>(response, context);
 }
 
 /**
- * Get calibrated weights for a ticker and horizon.
- * 
- * Returns default weights if no calibration exists (silent fallback).
+ * Get calibrated weights for a ticker, horizon, and strategy class.
  */
 export async function getCalibrationWeights(
   ticker: string,
-  horizon: number = 3
+  horizon: number = 3,
+  strategyClass: string = 'directional'
 ): Promise<WeightsResponse> {
-  const response = await fetch(
-    `${API_BASE}/weights/${ticker.toUpperCase()}?horizon=${horizon}`
+  const normalizedTicker = ticker.toUpperCase();
+
+  const context: ErrorContext = {
+    operation: 'getCalibrationWeights',
+    source: 'calibrationApi',
+    ticker: normalizedTicker,
+    params: { horizon, strategyClass }
+  };
+
+  const response = await trackedFetch(
+    `${API_BASE}/weights/${normalizedTicker}?horizon=${horizon}&strategy_class=${strategyClass}`,
+    {},
+    context
   );
-  
-  if (!response.ok) {
-    throw new Error(`Failed to get weights: ${response.status}`);
-  }
-  
-  return response.json();
+
+  return handleResponse<WeightsResponse>(response, context);
 }
 
 /**
  * Get calibrated weights for multiple tickers.
- * 
- * Useful for loading weights for entire portfolio at once.
  */
 export async function getBatchWeights(
   tickers: string[],
-  horizon: number = 3
+  horizon: number = 3,
+  strategyClass: string = 'all'
 ): Promise<BatchWeightsResponse> {
-  const tickerStr = tickers.map(t => t.toUpperCase()).join(',');
-  const response = await fetch(
-    `${API_BASE}/weights/batch?tickers=${tickerStr}&horizon=${horizon}`
+  const normalizedTickers = tickers.map(t => t.toUpperCase());
+  const tickerStr = normalizedTickers.join(',');
+
+  const context: ErrorContext = {
+    operation: 'getBatchWeights',
+    source: 'calibrationApi',
+    params: { tickers: normalizedTickers, horizon, strategyClass }
+  };
+
+  const response = await trackedFetch(
+    `${API_BASE}/weights/batch?tickers=${tickerStr}&horizon=${horizon}&strategy_class=${strategyClass}`,
+    {},
+    context
   );
-  
-  if (!response.ok) {
-    throw new Error(`Failed to get batch weights: ${response.status}`);
-  }
-  
-  return response.json();
+
+  return handleResponse<BatchWeightsResponse>(response, context);
 }
 
 /**
@@ -101,13 +219,13 @@ export async function getDefaultWeights(): Promise<{
   weights: WeightMatrix;
   description: string;
 }> {
-  const response = await fetch(`${API_BASE}/defaults`);
-  
-  if (!response.ok) {
-    throw new Error(`Failed to get default weights: ${response.status}`);
-  }
-  
-  return response.json();
+  const context: ErrorContext = {
+    operation: 'getDefaultWeights',
+    source: 'calibrationApi'
+  };
+
+  const response = await trackedFetch(`${API_BASE}/defaults`, {}, context);
+  return handleResponse<{ weights: WeightMatrix; description: string }>(response, context);
 }
 
 // ============================================================================
@@ -116,48 +234,87 @@ export async function getDefaultWeights(): Promise<{
 
 /**
  * Stream calibration progress via Server-Sent Events.
- * 
- * Usage:
- * ```ts
- * const cleanup = streamCalibrationProgress('AAPL', (progress) => {
- *   console.log(progress.stage, progress.progress);
- * });
- * 
- * // Later: cleanup();
- * ```
  */
 export function streamCalibrationProgress(
   ticker: string,
   onProgress: (progress: CalibrationProgress) => void,
   onError?: (error: Error) => void,
-  onComplete?: () => void
+  onComplete?: () => void,
+  horizons?: number[]
 ): () => void {
-  const eventSource = new EventSource(
-    `${API_BASE}/stream/${ticker.toUpperCase()}`
-  );
-  
+  const normalizedTicker = ticker.toUpperCase();
+
+  // Build URL with optional horizons query param
+  let url = `${API_BASE}/stream/${normalizedTicker}`;
+  if (horizons && horizons.length > 0) {
+    url += `?horizons=${horizons.join(',')}`;
+  }
+
+  const context: ErrorContext = {
+    operation: 'streamCalibrationProgress',
+    source: 'calibrationApi',
+    ticker: normalizedTicker,
+    params: { horizons, url }
+  };
+
+  const eventSource = new EventSource(url);
+  let messageCount = 0;
+
   eventSource.onmessage = (event) => {
+    messageCount++;
     try {
       const progress: CalibrationProgress = JSON.parse(event.data);
       onProgress(progress);
-      
-      // Close connection when complete or error
-      if (progress.stage === 'complete' || progress.stage === 'error') {
+
+      if (progress.stage === 'error') {
+        trackError(progress.message || 'SSE reported error stage', {
+          ...context,
+          operation: 'streamCalibrationProgress:serverError',
+          metadata: { messageCount, progress }
+        }, 'warning');
         eventSource.close();
         onComplete?.();
       }
     } catch (err) {
-      console.error('Failed to parse SSE data:', err);
+      // Track parse errors
+      trackError(err, {
+        ...context,
+        operation: 'streamCalibrationProgress:parseError',
+        metadata: { messageCount, rawData: event.data?.substring(0, 500) }
+      });
+
+      onProgress({
+        ticker: normalizedTicker,
+        horizon: 0,
+        stage: 'error',
+        progress: 0,
+        message: `SSE parse error (message #${messageCount}): ${err instanceof Error ? err.message : 'Invalid JSON'}`
+      });
     }
   };
-  
-  eventSource.onerror = (err) => {
-    console.error('SSE connection error:', err);
+
+  eventSource.onerror = (_event) => {
+    const readyState = eventSource.readyState;
+    const errorMsg = readyState === EventSource.CLOSED
+      ? 'SSE connection closed unexpectedly'
+      : readyState === EventSource.CONNECTING
+        ? 'SSE connection failed while reconnecting'
+        : 'SSE connection failed - server may be unavailable';
+
+    trackError(errorMsg, {
+      ...context,
+      operation: 'streamCalibrationProgress:connectionError',
+      metadata: {
+        messageCount,
+        readyState,
+        readyStateLabel: ['CONNECTING', 'OPEN', 'CLOSED'][readyState] || 'UNKNOWN'
+      }
+    });
+
     eventSource.close();
-    onError?.(new Error('SSE connection failed'));
+    onError?.(new CalibrationApiError(errorMsg, context, undefined, undefined, url));
   };
-  
-  // Return cleanup function
+
   return () => {
     eventSource.close();
   };
@@ -213,16 +370,20 @@ export function calculateWeightDrift(
 
 /**
  * Check if calibration exists for a ticker.
+ * Returns { exists: boolean, error?: string } to distinguish "no calibration" from "error occurred".
  */
 export async function hasCalibration(
   ticker: string,
   horizon: number = 3
-): Promise<boolean> {
+): Promise<{ exists: boolean; error?: string }> {
   try {
     const result = await getCalibrationWeights(ticker, horizon);
-    return !result.is_default;
-  } catch {
-    return false;
+    return { exists: !result.is_default };
+  } catch (err) {
+    return {
+      exists: false,
+      error: err instanceof Error ? err.message : 'Unknown error checking calibration'
+    };
   }
 }
 
@@ -253,35 +414,64 @@ export interface FetchDataResult {
  * Check how much historical data is available for WFO calibration.
  */
 export async function getDataStatus(ticker: string): Promise<DataStatus> {
-  const response = await fetch(
-    `${API_BASE}/data-status/${ticker.toUpperCase()}`
+  const normalizedTicker = ticker.toUpperCase();
+
+  const context: ErrorContext = {
+    operation: 'getDataStatus',
+    source: 'calibrationApi',
+    ticker: normalizedTicker
+  };
+
+  const response = await trackedFetch(
+    `${API_BASE}/data-status/${normalizedTicker}`,
+    {},
+    context
   );
-  
-  if (!response.ok) {
-    throw new Error(`Failed to get data status: ${response.status}`);
-  }
-  
-  return response.json();
+
+  return handleResponse<DataStatus>(response, context);
 }
 
 /**
- * Fetch and cache 2 years of daily price history for calibration.
- * 
- * This fetches from Yahoo Finance and stores in SQLite.
+ * Get resonant horizons for a ticker.
  */
-export async function fetchCalibrationData(
-  ticker: string
-): Promise<FetchDataResult> {
-  const response = await fetch(
-    `${API_BASE}/fetch-data/${ticker.toUpperCase()}`,
-    { method: 'POST' }
+export async function getResonance(ticker: string): Promise<ResonanceResponse> {
+  const normalizedTicker = ticker.toUpperCase();
+
+  const context: ErrorContext = {
+    operation: 'getResonance',
+    source: 'calibrationApi',
+    ticker: normalizedTicker
+  };
+
+  const response = await trackedFetch(
+    `${API_BASE}/resonance/${normalizedTicker}`,
+    {},
+    context
   );
-  
-  if (!response.ok) {
-    throw new Error(`Failed to fetch data: ${response.status}`);
-  }
-  
-  return response.json();
+
+  return handleResponse<ResonanceResponse>(response, context);
+}
+
+/**
+ * Fetch and cache price history for calibration.
+ */
+export async function fetchCalibrationData(ticker: string): Promise<FetchDataResult> {
+  const normalizedTicker = ticker.toUpperCase();
+
+  const context: ErrorContext = {
+    operation: 'fetchCalibrationData',
+    source: 'calibrationApi',
+    ticker: normalizedTicker,
+    metadata: { method: 'POST' }
+  };
+
+  const response = await trackedFetch(
+    `${API_BASE}/fetch-data/${normalizedTicker}`,
+    { method: 'POST' },
+    context
+  );
+
+  return handleResponse<FetchDataResult>(response, context);
 }
 
 /**
@@ -349,13 +539,13 @@ export function getSQNLabel(sqn: number): {
  * Get list of portfolio tickers for the calibration picker.
  */
 export async function getPortfolioTickers(): Promise<string[]> {
-  const response = await fetch(`${API_BASE}/tickers`);
-  
-  if (!response.ok) {
-    throw new Error(`Failed to get tickers: ${response.status}`);
-  }
-  
-  const data = await response.json();
+  const context: ErrorContext = {
+    operation: 'getPortfolioTickers',
+    source: 'calibrationApi'
+  };
+
+  const response = await trackedFetch(`${API_BASE}/tickers`, {}, context);
+  const data = await handleResponse<{ tickers: string[] }>(response, context);
   return data.tickers || [];
 }
 
@@ -372,6 +562,7 @@ export interface CalibrationVerification {
   weights: Array<{
     indicator: string;
     horizon: number;
+    strategy_class: string;
     weight: number;
     sqn_score: number | null;
     stability_passed: boolean;
@@ -382,20 +573,22 @@ export interface CalibrationVerification {
 
 /**
  * Verify calibration data exists in database.
- * 
- * This confirms that calibration actually saved, not just returned success.
  */
-export async function verifyCalibration(
-  ticker: string
-): Promise<CalibrationVerification> {
-  const response = await fetch(
-    `${API_BASE}/verify/${ticker.toUpperCase()}`
+export async function verifyCalibration(ticker: string): Promise<CalibrationVerification> {
+  const normalizedTicker = ticker.toUpperCase();
+
+  const context: ErrorContext = {
+    operation: 'verifyCalibration',
+    source: 'calibrationApi',
+    ticker: normalizedTicker
+  };
+
+  const response = await trackedFetch(
+    `${API_BASE}/verify/${normalizedTicker}`,
+    {},
+    context
   );
-  
-  if (!response.ok) {
-    throw new Error(`Failed to verify calibration: ${response.status}`);
-  }
-  
-  return response.json();
+
+  return handleResponse<CalibrationVerification>(response, context);
 }
 

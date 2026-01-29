@@ -4,13 +4,16 @@
  * Provides cache management and admin functions.
  */
 
-import { useState, useEffect } from 'react';
-import { X, Trash2, RefreshCw, Database, AlertTriangle, Check } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import { X, Trash2, RefreshCw, Database, AlertTriangle, Check, Download, Upload } from 'lucide-react';
 import {
   getCacheStats,
   clearAnalysisCache,
   clearCalibrationWeights,
   clearPriceHistory,
+  exportPortfolio,
+  importPortfolio,
   type CacheStats
 } from '../services/api';
 import { clearAnalysisCache as clearFrontendAnalysisCache } from '../hooks/useStockAnalysis';
@@ -28,6 +31,9 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [clearing, setClearing] = useState<ClearAction | null>(null);
   const [ticker, setTicker] = useState('');
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Load cache stats when modal opens
   useEffect(() => {
@@ -86,9 +92,67 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     }
   };
 
+  const handleExport = async () => {
+    setExporting(true);
+    setMessage(null);
+    try {
+      const data = await exportPortfolio();
+      // Create and download file
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `portfolio_backup_${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setMessage({
+        type: 'success',
+        text: `Exported ${data.holdings.length} holdings and ${data.option_holdings.length} options`
+      });
+    } catch (err) {
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Export failed' });
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleImportClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setImporting(true);
+    setMessage(null);
+
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      const result = await importPortfolio(data, true);
+      setMessage({
+        type: 'success',
+        text: `Imported ${result.holdings_imported} holdings and ${result.options_imported} options`
+      });
+      // Reload the page to reflect changes
+      setTimeout(() => window.location.reload(), 1500);
+    } catch (err) {
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Import failed' });
+    } finally {
+      setImporting(false);
+      // Reset file input
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
+  };
+
   if (!isOpen) return null;
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       {/* Backdrop */}
       <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
@@ -154,6 +218,47 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
             ) : (
               <p className="text-white/30 text-sm">Loading...</p>
             )}
+          </div>
+
+          {/* Portfolio Backup */}
+          <div className="glass-card p-4">
+            <h3 className="text-sm font-medium text-white/80 mb-3">Portfolio Backup</h3>
+            <p className="text-xs text-white/50 mb-3">
+              Export your holdings before database changes. Import to restore.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={handleExport}
+                disabled={exporting}
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-accent-cyan/20 hover:bg-accent-cyan/30 border border-accent-cyan/30 text-accent-cyan transition-colors disabled:opacity-50"
+              >
+                {exporting ? (
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Download className="w-4 h-4" />
+                )}
+                <span className="text-sm font-medium">Export</span>
+              </button>
+              <button
+                onClick={handleImportClick}
+                disabled={importing}
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-green-500/20 hover:bg-green-500/30 border border-green-500/30 text-green-400 transition-colors disabled:opacity-50"
+              >
+                {importing ? (
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Upload className="w-4 h-4" />
+                )}
+                <span className="text-sm font-medium">Import</span>
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".json"
+                onChange={handleFileSelect}
+                className="hidden"
+              />
+            </div>
           </div>
 
           {/* Ticker Filter */}
@@ -237,7 +342,8 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 

@@ -8,10 +8,13 @@
  * while analysis is being calculated, then displays the score.
  */
 
+import { useState, useEffect } from 'react';
 import { Calculator, Zap, AlertCircle, Clock, Shield, AlertTriangle, Minus } from 'lucide-react';
 import type { ActionType } from '../../types';
 import { useStockAnalysis, useDualHorizonAnalysis, type AnalysisState } from '../../hooks/useStockAnalysis';
 import { useViewContext } from '../../context/ViewContext'; // Import view context
+import { getRegimeDescription } from '../../services/regimeRules';
+import { verifyCalibration } from '../../services/calibrationApi';
 
 interface ActionScoreBadgeProps {
   ticker: string;
@@ -19,6 +22,17 @@ interface ActionScoreBadgeProps {
   high52w?: number | null;
   low52w?: number | null;
   onClick?: () => void;
+}
+
+// SQN Quality Color Coding
+function getSqnColor(sqn: number | null | undefined): { text: string; label: string } {
+  if (sqn === null || sqn === undefined) {
+    return { text: 'text-gray-400', label: 'Uncalibrated' };
+  }
+  if (sqn >= 2.5) return { text: 'text-green-400', label: 'Excellent' };
+  if (sqn >= 1.5) return { text: 'text-blue-400', label: 'Good' };
+  if (sqn >= 0.5) return { text: 'text-yellow-400', label: 'Fair' };
+  return { text: 'text-red-400', label: 'Poor' };
 }
 
 // Short labels for compact display
@@ -91,14 +105,32 @@ export function ActionScoreBadge({
             border bg-amber-500/10 text-amber-400/60 border-amber-500/20
             hover:bg-amber-500/15 transition-colors
             "
-            title={`Prediction unreliable (SQN < 3.0). The model is not confident in this ${predictionHorizon}d forecast.`}
+            title={`Prediction unreliable (SQN < 2.0). The model is not confident in this ${predictionHorizon}d forecast.`}
         >
             <Shield className="w-3 h-3 text-amber-500/50" />
             <span>Low Conf</span>
         </button>
        );
   }
-  
+
+  // Handle REGIME BLOCKED - matches backend WFO hard filter
+  if (analysis?.status === 'regime_blocked') {
+       return (
+        <button
+            onClick={onClick}
+            className="
+            inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium
+            border bg-orange-500/10 text-orange-400/60 border-orange-500/20
+            hover:bg-orange-500/15 transition-colors
+            "
+            title={`Regime Risk: ${analysis.marketRegime || 'Volatile market'}. Best action blocked to match backend safety filter.`}
+        >
+            <AlertTriangle className="w-3 h-3 text-orange-500/60" />
+            <span>Regime Risk</span>
+        </button>
+       );
+  }
+
   // Error state - show error icon
   if (error && !analysis) {
     // Legacy support: Check for low confidence in error string if cache was old
@@ -147,16 +179,27 @@ export function ActionScoreBadge({
   const shortLabel = SHORT_LABELS[bestAction.action];
   const isCalibrated = !!analysis.calibration;
   
-  // Build title with stale indicator
+  // Build title with enhanced information
+  const sqnInfo = getSqnColor(analysis.calibration?.sqn);
   let title = `${bestAction.label} (${predictionHorizon}d): ${bestAction.totalScore}/100 (${bestAction.confidence} confidence)`;
-  if (isCalibrated) {
-      title += ` • Calibrated (SQN ${analysis.calibration?.sqn?.toFixed(2)})`;
+
+  // Add calibration info with quality indicator
+  if (isCalibrated && analysis.calibration?.sqn !== null) {
+    title += `\nCalibration: ${sqnInfo.label} (SQN ${analysis.calibration.sqn?.toFixed(2)})`;
+  } else if (!isCalibrated) {
+    title += '\nUsing default weights (uncalibrated)';
   }
+
+  // Add market regime if available
+  if (analysis.marketRegime) {
+    title += `\nMarket Regime: ${getRegimeDescription(analysis.marketRegime as any)}`;
+  }
+
   if (isStale) {
-    title += ' • Refreshing...';
+    title += '\n[Refreshing...]';
   }
   if (analysis.dataQuality.missingMetrics.length > 0) {
-    title += ` • Missing: ${analysis.dataQuality.missingMetrics.slice(0, 3).join(', ')}`;
+    title += `\nMissing: ${analysis.dataQuality.missingMetrics.slice(0, 3).join(', ')}`;
     if (analysis.dataQuality.missingMetrics.length > 3) {
       title += ` +${analysis.dataQuality.missingMetrics.length - 3} more`;
     }
@@ -202,8 +245,8 @@ interface DualActionScoreBadgeProps {
   onClick?: () => void;
 }
 
-// Low SQN threshold
-const LOW_SQN_THRESHOLD = 2.8;
+// Low SQN threshold (lowered from 2.8 to 2.0 to avoid flagging decent strategies)
+const LOW_SQN_THRESHOLD = 2.0;
 
 // Helper to check if a horizon has low confidence
 // Returns true if: status is explicitly 'low_confidence' OR SQN exists and is below threshold
@@ -211,11 +254,16 @@ function isLowConfidence(state: AnalysisState): boolean {
   if (state.analysis?.status === 'low_confidence') return true;
   const sqn = state.analysis?.calibration?.sqn;
   // Only flag as low confidence if we HAVE a calibration with a low SQN
-  // If no calibration exists (sqn is null/undefined), that's not "low confidence" - it's "uncalibrated"
   if (sqn !== null && sqn !== undefined && sqn < LOW_SQN_THRESHOLD) {
     return true;
   }
   return false;
+}
+
+// Helper to check if the best action is blocked by market regime
+// This matches the backend's hard filter behavior during WFO simulation
+function isRegimeBlocked(state: AnalysisState): boolean {
+  return state.analysis?.status === 'regime_blocked';
 }
 
 // Helper to check if a horizon is calibrated (has WFO weights)
@@ -245,6 +293,7 @@ function HorizonRow({
 }) {
   const { analysis, isLoading, error } = state;
   const lowConf = isLowConfidence(state);
+  const regimeBlocked = isRegimeBlocked(state);
   const calibrated = isCalibrated(state);
 
   // Loading state
@@ -281,27 +330,47 @@ function HorizonRow({
   const shortLabel = SHORT_LABELS[bestAction.action];
   const scoreColor = getScoreColorClass(bestAction.totalScore);
 
+  // Determine warning state (regime blocked takes precedence)
+  const hasWarning = regimeBlocked || lowConf;
+
   return (
     <div className="flex items-center justify-between gap-2">
       <div className="flex items-center gap-1">
-        {/* Calibration indicator for this horizon */}
-        {calibrated ? (
+        {/* Status indicator for this horizon */}
+        {regimeBlocked ? (
+          <span title={`Regime Risk: ${analysis.marketRegime || 'Volatile market'}`}>
+            <AlertTriangle className="w-3 h-3 text-orange-400" />
+          </span>
+        ) : calibrated && !lowConf ? (
           <Shield className="w-3 h-3 text-purple-400" />
+        ) : calibrated && lowConf ? (
+          <span title="Low Confidence (SQN < 2.0)">
+            <AlertTriangle className="w-3 h-3 text-amber-400" />
+          </span>
         ) : (
           <Minus className="w-3 h-3 text-white/20" />
         )}
         <span className="text-white/50 font-medium">{label}</span>
       </div>
-      <div className={`flex items-center gap-1 ${lowConf ? 'opacity-60' : ''}`}>
-        {lowConf && (
-          <AlertTriangle className="w-3 h-3 text-amber-400" />
+      <div className={`flex items-center gap-1 ${hasWarning ? 'opacity-100' : ''}`}>
+        {regimeBlocked ? (
+           <span className="text-orange-400 text-[10px] font-medium tracking-wide">Risk</span>
+        ) : lowConf ? (
+           <span className="text-amber-400 text-[10px] font-medium tracking-wide">Low Conf</span>
+        ) : (
+           <>
+             <span className={scoreColor}>{shortLabel}</span>
+             <span className={`${scoreColor} opacity-70`}>{bestAction.totalScore}</span>
+           </>
         )}
-        <span className={scoreColor}>{shortLabel}</span>
-        <span className={`${scoreColor} opacity-70`}>{bestAction.totalScore}</span>
       </div>
     </div>
   );
 }
+
+// Cache for calibrated horizons to avoid repeated API calls
+const calibratedHorizonsCache = new Map<string, { horizons: Array<{horizon: number; sqn: number | null}>; fetchedAt: number }>();
+const HORIZON_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 export function DualActionScoreBadge({
   ticker,
@@ -310,7 +379,62 @@ export function DualActionScoreBadge({
   low52w,
   onClick
 }: DualActionScoreBadgeProps) {
-  const { swing, trend } = useDualHorizonAnalysis(ticker, currentPrice, high52w, low52w);
+  // State for calibrated horizons
+  const [calibratedHorizons, setCalibratedHorizons] = useState<Array<{horizon: number; sqn: number | null}>>([]);
+  const [horizonsLoaded, setHorizonsLoaded] = useState(false);
+
+  // Determine which horizons to display (top 2 by SQN, or defaults)
+  const horizonA = calibratedHorizons.length > 0 ? calibratedHorizons[0].horizon : 3;
+  const horizonB = calibratedHorizons.length > 1 ? calibratedHorizons[1].horizon : 15;
+
+  // Fetch calibrated horizons on mount
+  useEffect(() => {
+    if (!ticker) return;
+
+    // Check cache first
+    const cached = calibratedHorizonsCache.get(ticker);
+    if (cached && Date.now() - cached.fetchedAt < HORIZON_CACHE_TTL) {
+      setCalibratedHorizons(cached.horizons);
+      setHorizonsLoaded(true);
+      return;
+    }
+
+    verifyCalibration(ticker)
+      .then(res => {
+        if (res.verified && res.weights.length > 0) {
+          // Group by horizon and get max SQN for each
+          const horizonMap = new Map<number, number | null>();
+          for (const w of res.weights) {
+            const existing = horizonMap.get(w.horizon);
+            if (existing === undefined || (w.sqn_score !== null && (existing === null || w.sqn_score > existing))) {
+              horizonMap.set(w.horizon, w.sqn_score);
+            }
+          }
+          // Sort by SQN (highest first), then by horizon
+          const sorted = Array.from(horizonMap.entries())
+            .map(([horizon, sqn]) => ({ horizon, sqn }))
+            .sort((a, b) => {
+              // If both have SQN, sort by SQN descending
+              if (a.sqn !== null && b.sqn !== null) return b.sqn - a.sqn;
+              // Put calibrated (non-null SQN) first
+              if (a.sqn !== null) return -1;
+              if (b.sqn !== null) return 1;
+              // Otherwise sort by horizon
+              return a.horizon - b.horizon;
+            });
+
+          // Cache the result
+          calibratedHorizonsCache.set(ticker, { horizons: sorted, fetchedAt: Date.now() });
+          setCalibratedHorizons(sorted);
+        }
+        setHorizonsLoaded(true);
+      })
+      .catch(() => {
+        setHorizonsLoaded(true);
+      });
+  }, [ticker]);
+
+  const { swing, trend } = useDualHorizonAnalysis(ticker, currentPrice, high52w, low52w, horizonA, horizonB);
 
   const swingAnalysis = swing.analysis;
   const trendAnalysis = trend.analysis;
@@ -324,8 +448,13 @@ export function DualActionScoreBadge({
   const trendLowConf = isLowConfidence(trend);
   const bothLowConf = swingLowConf && trendLowConf;
 
+  // Check regime blocked per horizon
+  const swingRegimeBlocked = isRegimeBlocked(swing);
+  const trendRegimeBlocked = isRegimeBlocked(trend);
+  const bothRegimeBlocked = swingRegimeBlocked && trendRegimeBlocked;
+
   // Both loading
-  if (swing.isLoading && !swingAnalysis && trend.isLoading && !trendAnalysis) {
+  if ((swing.isLoading && !swingAnalysis && trend.isLoading && !trendAnalysis) || !horizonsLoaded) {
     return (
       <div
         className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium border bg-white/5 text-white/40 border-white/10"
@@ -337,13 +466,28 @@ export function DualActionScoreBadge({
     );
   }
 
+  // Both horizons regime blocked - show simplified Regime Risk badge
+  if (bothRegimeBlocked && swingAnalysis && trendAnalysis) {
+    const regime = swingAnalysis.marketRegime || trendAnalysis.marketRegime || 'Volatile';
+    return (
+      <button
+        onClick={onClick}
+        className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium border bg-orange-500/10 text-orange-400/60 border-orange-500/20 hover:bg-orange-500/15 transition-colors"
+        title={`Regime Risk: ${regime}. Best actions blocked by backend safety filter.`}
+      >
+        <AlertTriangle className="w-3 h-3 text-orange-400" />
+        <span>Regime Risk</span>
+      </button>
+    );
+  }
+
   // Both low confidence AND both calibrated - show simplified badge
   if (bothLowConf && swingAnalysis && trendAnalysis && swingCalibrated && trendCalibrated) {
     return (
       <button
         onClick={onClick}
         className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium border bg-amber-500/10 text-amber-400/60 border-amber-500/20 hover:bg-amber-500/15 transition-colors"
-        title="Both horizons have low confidence (SQN < 2.8). Predictions may be unreliable."
+        title="Both horizons have low confidence (SQN < 2.0). Predictions may be unreliable."
       >
         <AlertTriangle className="w-3 h-3 text-amber-400" />
         <span>Low Conf</span>
@@ -351,26 +495,37 @@ export function DualActionScoreBadge({
     );
   }
 
-  // Build title with SQN info
+  // Build title with SQN info and quality indicators
+  const swingSqnInfo = getSqnColor(swingAnalysis?.calibration?.sqn);
+  const trendSqnInfo = getSqnColor(trendAnalysis?.calibration?.sqn);
+
   let title = '';
   if (swingAnalysis) {
-    title += `3d: ${swingAnalysis.bestAction.label} (${swingAnalysis.bestAction.totalScore}/100)`;
+    title += `${horizonA}d: ${swingAnalysis.bestAction.label} (${swingAnalysis.bestAction.totalScore}/100)`;
     if (swingCalibrated && swingAnalysis.calibration?.sqn) {
-      title += ` • WFO SQN: ${swingAnalysis.calibration.sqn.toFixed(2)}`;
+      title += ` - ${swingSqnInfo.label} (SQN ${swingAnalysis.calibration.sqn.toFixed(2)})`;
     } else {
-      title += ' • Default weights';
+      title += ' - Default weights';
     }
-    if (swingLowConf) title += ' ⚠️';
+    if (swingRegimeBlocked) title += ' [REGIME RISK]';
+    else if (swingLowConf) title += ' [Low Conf]';
   }
   title += '\n';
   if (trendAnalysis) {
-    title += `15d: ${trendAnalysis.bestAction.label} (${trendAnalysis.bestAction.totalScore}/100)`;
+    title += `${horizonB}d: ${trendAnalysis.bestAction.label} (${trendAnalysis.bestAction.totalScore}/100)`;
     if (trendCalibrated && trendAnalysis.calibration?.sqn) {
-      title += ` • WFO SQN: ${trendAnalysis.calibration.sqn.toFixed(2)}`;
+      title += ` - ${trendSqnInfo.label} (SQN ${trendAnalysis.calibration.sqn.toFixed(2)})`;
     } else {
-      title += ' • Default weights';
+      title += ' - Default weights';
     }
-    if (trendLowConf) title += ' ⚠️';
+    if (trendRegimeBlocked) title += ' [REGIME RISK]';
+    else if (trendLowConf) title += ' [Low Conf]';
+  }
+
+  // Add market regime if available from either horizon
+  const regime = swingAnalysis?.marketRegime || trendAnalysis?.marketRegime;
+  if (regime) {
+    title += `\nMarket: ${getRegimeDescription(regime as any)}`;
   }
 
   return (
@@ -379,14 +534,14 @@ export function DualActionScoreBadge({
       className="flex flex-col gap-0.5 px-2 py-1 rounded-md text-xs font-medium border transition-all hover:scale-105 active:scale-95 bg-white/5 border-white/10 hover:border-white/20 min-w-[90px]"
       title={title}
     >
-      {/* Swing (3d) row */}
-      <HorizonRow label="3d" state={swing} />
+      {/* First horizon row */}
+      <HorizonRow label={`${horizonA}d`} state={swing} />
 
       {/* Divider */}
       <div className="border-t border-white/10 my-0.5" />
 
-      {/* Trend (15d) row */}
-      <HorizonRow label="15d" state={trend} />
+      {/* Second horizon row */}
+      <HorizonRow label={`${horizonB}d`} state={trend} />
     </button>
   );
 }

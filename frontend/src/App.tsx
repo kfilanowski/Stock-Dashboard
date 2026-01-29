@@ -404,7 +404,7 @@ function App() {
       <div className="min-h-screen p-6 md:p-8">
         <div className="animated-bg" />
         
-        <div className="max-w-7xl mx-auto">
+        <div className="max-w-[1900px] mx-auto">
           <Header 
             totalValue={portfolio?.total_market_value ?? 0}
             lastUpdated={lastFetched ?? undefined}
@@ -494,7 +494,7 @@ function App() {
                           <span className="text-sm font-medium text-white/70">Pinned</span>
                           <span className="text-white/30 text-xs">({pinnedHoldings.length})</span>
                         </div>
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        <div className="grid grid-cols-[repeat(auto-fill,minmax(405px,1fr))] gap-4">
                           {pinnedHoldings.map((holding, index) => {
                             const chartData = holdingChartData[holding.ticker];
                             return (
@@ -507,7 +507,8 @@ function App() {
                                   <HoldingCard
                                     holding={holding}
                                     history={chartData?.history ?? []}
-                                    referenceClose={chartData?.referenceClose ?? null}
+                                                                        referenceClose={chartData?.referenceClose ?? null}
+                                    chartPeriod={chartPeriod}
                                     isDataComplete={chartData?.isComplete ?? false}
                                     expectedStart={chartData?.expectedStart ?? null}
                                     actualStart={chartData?.actualStart ?? null}
@@ -541,12 +542,12 @@ function App() {
                             <span className="text-white/30 text-xs">({unpinnedHoldings.length})</span>
                           </div>
                         )}
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        <div className="grid grid-cols-[repeat(auto-fill,minmax(405px,1fr))] gap-4">
                           {unpinnedHoldings.map((holding, index) => {
                             const chartData = holdingChartData[holding.ticker];
                             return (
-                              <div 
-                                key={holding.id} 
+                              <div
+                                key={holding.id}
                                 className="fade-in"
                                 style={{ animationDelay: `${0.1 * (index + 1 + pinnedHoldings.length)}s` }}
                               >
@@ -554,7 +555,8 @@ function App() {
                                   <HoldingCard
                                     holding={holding}
                                     history={chartData?.history ?? []}
-                                    referenceClose={chartData?.referenceClose ?? null}
+                                                                        referenceClose={chartData?.referenceClose ?? null}
+                                    chartPeriod={chartPeriod}
                                     isDataComplete={chartData?.isComplete ?? false}
                                     expectedStart={chartData?.expectedStart ?? null}
                                     actualStart={chartData?.actualStart ?? null}

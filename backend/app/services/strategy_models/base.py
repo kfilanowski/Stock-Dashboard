@@ -37,8 +37,8 @@ class BaseStrategyModel(ABC):
     # Strategy identifier
     strategy_class: str = 'base'
 
-    # Minimum trades required for statistical validity
-    min_trades: int = 30
+    # Minimum trades required for statistical validity (lowered from 30 to allow stable stocks)
+    min_trades: int = 20
 
     # Indicators to prioritize in optimization (others get default weight)
     priority_indicators: List[str] = []

@@ -161,12 +161,14 @@ async function processQueue(): Promise<void> {
     const tickers = validRequests.map(r => r.ticker);
     
     try {
-      // Batch fetch data
+      // Batch fetch data - fetch weights for all 3 strategy classes
       console.debug(`[Analysis] Batch fetching for ${tickers.length} tickers (Horizon: ${targetHorizon})`);
-      const [batchHistories, batchAnalysisData, batchWeights] = await Promise.all([
+      const [batchHistories, batchAnalysisData, directionalWeights, premiumSellWeights, premiumBuyWeights] = await Promise.all([
         getBatchHistory(tickers, '1y'),
         getBatchAnalysis(tickers),
-        getBatchWeights(tickers, targetHorizon)
+        getBatchWeights(tickers, targetHorizon, 'directional'),
+        getBatchWeights(tickers, targetHorizon, 'premium_sell'),
+        getBatchWeights(tickers, targetHorizon, 'premium_buy')
       ]);
       
       // Process each ticker
@@ -177,24 +179,50 @@ async function processQueue(): Promise<void> {
           
           try {
             const tickerUpper = ticker.toUpperCase();
-            const calibrationData = batchWeights?.tickers?.[tickerUpper] || batchWeights?.tickers?.[ticker];
-            let weights = undefined;
+
+            // Build strategy-specific weights map
+            const strategyWeightsMap: Record<string, Record<string, number>> = {};
             let calibrationMetadata = undefined;
             let isLowConfidence = false;
+            let bestSqn: number | null = null;
 
-            if (calibrationData) {
-                if (!calibrationData.is_default) {
-                    if (calibrationData.sqn !== null && calibrationData.sqn < 2.8) {
-                        isLowConfidence = true;
-                    }
-                    weights = calibrationData.weights as unknown as Record<string, number>;
-                    calibrationMetadata = {
-                        lastCalibrated: calibrationData.updated_at || new Date().toISOString(),
-                        sqn: calibrationData.sqn,
-                        period: batchWeights.horizon
-                    };
+            // Process each strategy class's weights
+            const strategyResponses = [
+              { key: 'directional', response: directionalWeights },
+              { key: 'premium_sell', response: premiumSellWeights },
+              { key: 'premium_buy', response: premiumBuyWeights }
+            ];
+
+            for (const { key, response } of strategyResponses) {
+              const calibrationData = response?.tickers?.[tickerUpper] || response?.tickers?.[ticker];
+              if (calibrationData && !calibrationData.is_default) {
+                strategyWeightsMap[key] = calibrationData.weights as unknown as Record<string, number>;
+
+                // Track the best SQN across strategies for confidence assessment
+                if (calibrationData.sqn !== null) {
+                  if (bestSqn === null || calibrationData.sqn > bestSqn) {
+                    bestSqn = calibrationData.sqn;
+                  }
                 }
+
+                // Use directional calibration for metadata (primary strategy)
+                if (key === 'directional') {
+                  calibrationMetadata = {
+                    lastCalibrated: calibrationData.updated_at || new Date().toISOString(),
+                    sqn: calibrationData.sqn,
+                    period: response.horizon
+                  };
+                }
+              }
             }
+
+            // Determine confidence based on best SQN
+            if (bestSqn !== null && bestSqn < 2.0) {
+              isLowConfidence = true;
+            }
+
+            // For backward compatibility, use directional weights as the primary weights
+            const weights = strategyWeightsMap['directional'];
 
             const historyData = batchHistories[ticker];
             let history = historyData?.history || [];
@@ -245,7 +273,8 @@ async function processQueue(): Promise<void> {
                 optionsSentiment: analysisData.options?.options_sentiment,
                 avgImpliedVolatility: analysisData.options?.avg_implied_volatility,
                 ivPercentile: analysisData.options?.iv_percentile,
-                hasOptions: analysisData.options?.has_options ?? false
+                hasOptions: analysisData.options?.has_options ?? false,
+                marketRegime: (analysisData as Record<string, unknown>).market_regime as string | null | undefined
               };
             }
             
@@ -255,10 +284,11 @@ async function processQueue(): Promise<void> {
               finalPrice,
               finalHigh52w,
               finalLow52w,
-              weights, 
+              weights,
               additionalData,
               calibrationMetadata,
-              horizon // Pass horizon explicitly
+              horizon,
+              strategyWeightsMap // Pass strategy-specific weights
             );
 
             if (isLowConfidence) {
@@ -352,7 +382,8 @@ async function analyzeStockFallback(request: AnalysisRequest): Promise<StockAnal
             optionsSentiment: ad.options?.options_sentiment,
             avgImpliedVolatility: ad.options?.avg_implied_volatility,
             ivPercentile: ad.options?.iv_percentile,
-            hasOptions: ad.options?.has_options ?? false
+            hasOptions: ad.options?.has_options ?? false,
+            marketRegime: (ad as Record<string, unknown>).market_regime as string | null | undefined
         };
     } catch {}
 
@@ -605,17 +636,20 @@ export interface DualAnalysisState {
 // ============================================================================
 
 /**
- * Hook that fetches analysis for both swing (3d) and trend (15d) horizons.
+ * Hook that fetches analysis for two horizons.
+ * By default uses swing (3d) and trend (15d), but can be configured.
  * Returns analysis state for both horizons simultaneously.
  */
 export function useDualHorizonAnalysis(
   ticker: string | null,
   currentPrice?: number,
   high52w?: number | null,
-  low52w?: number | null
+  low52w?: number | null,
+  horizonA: number = 3,
+  horizonB: number = 15
 ): DualAnalysisState {
-  const swing = useStockAnalysis(ticker, currentPrice, high52w, low52w, 3);
-  const trend = useStockAnalysis(ticker, currentPrice, high52w, low52w, 15);
+  const swing = useStockAnalysis(ticker, currentPrice, high52w, low52w, horizonA);
+  const trend = useStockAnalysis(ticker, currentPrice, high52w, low52w, horizonB);
 
   return { swing, trend };
 }

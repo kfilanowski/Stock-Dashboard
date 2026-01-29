@@ -2,13 +2,13 @@
  * Stock Analysis Modal
  * 
  * Displays trading action scores with a radar chart visualization
- * and detailed metric breakdown.
+ * and detailed metric breakdown. 
  * 
  * Uses the shared analysis cache from useStockAnalysis to ensure
  * consistency between the badge and the detailed modal view.
  */
 
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect } from 'react';
 import { X, TrendingUp, TrendingDown, Minus, ChevronDown, ChevronUp, AlertCircle, RefreshCw, HelpCircle, Shield } from 'lucide-react';
 import {
   RadarChart,
@@ -21,7 +21,7 @@ import {
 } from 'recharts';
 import type { ActionScore, ActionType } from '../types';
 import { useStockAnalysis, refreshAnalysis } from '../hooks/useStockAnalysis';
-import { useViewContext } from '../context/ViewContext';
+import { verifyCalibration } from '../services/calibrationApi';
 
 interface StockAnalysisModalProps {
   ticker: string | null;
@@ -106,12 +106,27 @@ const indicatorDescriptions: Record<string, { name: string; description: string;
   ivPercentile: {
     name: 'IV Percentile',
     description: 'Where current implied volatility ranks vs. its historical range.',
-    interpretation: 'High IV = expensive options (sell premium). Low IV = cheap options (buy calls/puts).'
+    interpretation: 'High IV = expensive options (sell premium). Low IV = cheap options (buy calls/puts).' 
   },
   sectorBeta: {
     name: 'Sector Beta',
     description: 'Stock\'s correlation and volatility relative to its sector.',
     interpretation: 'Beta > 1 = more volatile than sector. Beta < 1 = defensive. Helps gauge relative risk.'
+  },
+  avwap: {
+    name: 'AVWAP (Anchored VWAP)',
+    description: 'Volume-weighted average price anchored to a significant swing point. Shows if recent holders are profitable.',
+    interpretation: 'Price above AVWAP = holders profitable (support). Below = holders underwater (resistance). Key level for entries/exits.'
+  },
+  obv: {
+    name: 'OBV (On-Balance Volume)',
+    description: 'Cumulative volume indicator that adds volume on up days and subtracts on down days.',
+    interpretation: 'Rising OBV = accumulation (institutions buying). Falling = distribution. Divergences from price signal reversals.'
+  },
+  chandelier: {
+    name: 'Chandelier Exit (Trend Stop)',
+    description: 'ATR-based trailing stop that adapts to volatility. Measures trend health.',
+    interpretation: 'Intact = trend is healthy, stay in position. Broken = trend violated, consider exiting or hedging.'
   }
 };
 
@@ -238,9 +253,9 @@ function ConfidenceBadge({ confidence }: { confidence: 'high' | 'medium' | 'low'
 }
 
 // Action score card component
-function ActionScoreCard({ 
-  score, 
-  isExpanded, 
+function ActionScoreCard({
+  score,
+  isExpanded,
   onToggle,
   isBest
 }: { 
@@ -251,7 +266,7 @@ function ActionScoreCard({
 }) {
   return (
     <div 
-      className={`rounded-lg border transition-all ${
+      className={`rounded-lg border transition-all ${ 
         isBest 
           ? 'border-accent-cyan/50 bg-accent-cyan/5' 
           : 'border-white/10 bg-white/5'
@@ -296,14 +311,14 @@ function ActionScoreCard({
                   <SignalIndicator signal={signal.signal} />
                   <span className="text-white/70">{signal.metricLabel}</span>
                   {signal.weight !== 1.0 && (
-                    <span className="text-[10px] text-purple-400/70 bg-purple-500/10 px-1 rounded" title={`Custom Weight: ${signal.weight}`}>
+                    <span className="text-[10px] text-purple-400/70 bg-purple-500/10 px-1 rounded" title={`Custom Weight: ${signal.weight}`}> 
                       x{signal.weight.toFixed(1)}
                     </span>
                   )}
                 </div>
                 <div className="flex items-center gap-3">
                   <span className="text-white/50 text-xs">{signal.rawValue}</span>
-                  <span className={`font-mono text-xs ${
+                  <span className={`font-mono text-xs ${ 
                     signal.contribution > 0 ? 'text-green-400' : 
                     signal.contribution < 0 ? 'text-red-400' : 'text-white/50'
                   }`}>
@@ -329,15 +344,65 @@ export function StockAnalysisModal({
   high52w,
   low52w
 }: StockAnalysisModalProps) {
-  const { predictionHorizon } = useViewContext();
+  // Track horizons with their SQN scores for proper sorting
+  const [calibratedHorizons, setCalibratedHorizons] = useState<Array<{horizon: number; sqn: number | null}>>([]);
+  const [selectedHorizon, setSelectedHorizon] = useState<number | null>(null);
+
+  // Fetch calibrated horizons on mount - sorted by SQN (best first)
+  useEffect(() => {
+    if (ticker) {
+      verifyCalibration(ticker).then(res => {
+        if (res.verified && res.weights.length > 0) {
+          // Group by horizon and get max SQN for each
+          const horizonMap = new Map<number, number | null>();
+          for (const w of res.weights) {
+            const existing = horizonMap.get(w.horizon);
+            if (existing === undefined || (w.sqn_score !== null && (existing === null || w.sqn_score > existing))) {
+              horizonMap.set(w.horizon, w.sqn_score);
+            }
+          }
+          // Sort by SQN (highest first) - show best calibrated horizons
+          const sorted = Array.from(horizonMap.entries())
+            .map(([horizon, sqn]) => ({ horizon, sqn }))
+            .sort((a, b) => {
+              if (a.sqn !== null && b.sqn !== null) return b.sqn - a.sqn;
+              if (a.sqn !== null) return -1;
+              if (b.sqn !== null) return 1;
+              return a.horizon - b.horizon;
+            })
+            .slice(0, 4); // Show up to 4 best horizons in modal
+
+          setCalibratedHorizons(sorted);
+          // Auto-select the best horizon (highest SQN)
+          if (sorted.length > 0 && selectedHorizon === null) {
+            setSelectedHorizon(sorted[0].horizon);
+          }
+        } else {
+          // No calibration - use defaults
+          setCalibratedHorizons([{ horizon: 3, sqn: null }, { horizon: 15, sqn: null }]);
+          if (selectedHorizon === null) {
+            setSelectedHorizon(3);
+          }
+        }
+      }).catch(() => {
+        // Error - use defaults
+        setCalibratedHorizons([{ horizon: 3, sqn: null }, { horizon: 15, sqn: null }]);
+        if (selectedHorizon === null) {
+          setSelectedHorizon(3);
+        }
+      });
+    }
+  }, [ticker, selectedHorizon]);
 
   // Use the shared analysis cache - same data as ActionScoreBadge
+  // Pass selectedHorizon or a default while loading
+  const effectiveHorizon = selectedHorizon ?? 3;
   const { analysis, isLoading, isStale, error, lastUpdated } = useStockAnalysis(
     ticker,
     currentPrice,
     high52w,
     low52w,
-    predictionHorizon
+    effectiveHorizon
   );
   
   const [expandedAction, setExpandedAction] = useState<ActionType | null>(null);
@@ -353,9 +418,9 @@ export function StockAnalysisModal({
   // Force refresh handler
   const handleRefresh = useCallback(() => {
     if (ticker && currentPrice) {
-      refreshAnalysis(ticker, currentPrice, high52w ?? null, low52w ?? null, predictionHorizon);
+      refreshAnalysis(ticker, currentPrice, high52w ?? null, low52w ?? null, effectiveHorizon);
     }
-  }, [ticker, currentPrice, high52w, low52w, predictionHorizon]);
+  }, [ticker, currentPrice, high52w, low52w, effectiveHorizon]);
   
   // Options-related actions to filter when stock has no options
   const optionsActions = useMemo<ActionType[]>(
@@ -398,10 +463,33 @@ export function StockAnalysisModal({
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-white/10">
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-3">
               <h2 className="text-xl font-bold text-white">
                 {ticker} Analysis
               </h2>
+              
+              {/* Horizon Selector - sorted by SQN (best first) */}
+              <div className="flex items-center gap-1 bg-white/5 rounded-lg p-0.5 border border-white/10">
+                {calibratedHorizons.map((h, idx) => (
+                  <button
+                    key={h.horizon}
+                    onClick={() => setSelectedHorizon(h.horizon)}
+                    className={`
+                      px-2 py-0.5 text-xs font-medium rounded-md transition-all flex items-center gap-1
+                      ${selectedHorizon === h.horizon
+                        ? 'bg-accent-cyan/20 text-accent-cyan shadow-sm'
+                        : 'text-white/40 hover:text-white/60 hover:bg-white/5'}
+                    `}
+                    title={h.sqn !== null ? `SQN: ${h.sqn.toFixed(2)}` : 'Default (uncalibrated)'}
+                  >
+                    {h.horizon}d
+                    {h.sqn !== null && idx === 0 && (
+                      <span className="text-[9px] text-purple-400/70">★</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+
               {isLoading && analysis && (
                 <div className="flex items-center gap-1.5 text-xs text-accent-cyan/70">
                   <div className="animate-spin rounded-full h-3 w-3 border border-accent-cyan/50 border-t-accent-cyan" />
@@ -421,8 +509,8 @@ export function StockAnalysisModal({
                  </div>
               )}
             </div>
-            <p className="text-sm text-white/50">
-              Trading action recommendations based on technical indicators
+            <p className="text-sm text-white/50 mt-1">
+              Trading action recommendations based on technical indicators ({effectiveHorizon}-day horizon)
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -486,7 +574,7 @@ export function StockAnalysisModal({
                   <div>
                     <h4 className="text-sm font-medium text-amber-400">Low Calibration Confidence</h4>
                     <p className="text-xs text-amber-400/70">
-                      The predictive model (SQN {analysis.calibration?.sqn?.toFixed(2)}) is not confident in this {predictionHorizon}d forecast. 
+                      The predictive model (SQN {analysis.calibration?.sqn?.toFixed(2)}) is not confident in this {selectedHorizon}d forecast. 
                       Signals may be unreliable.
                     </p>
                   </div>
@@ -564,7 +652,7 @@ export function StockAnalysisModal({
                       {analysis.dataQuality.missingMetrics.length > 0 && (
                         <span className="ml-1 text-yellow-400/70">
                           (missing: {analysis.dataQuality.missingMetrics.slice(0, 3).join(', ')}
-                          {analysis.dataQuality.missingMetrics.length > 3 && '...'})
+                          {analysis.dataQuality.missingMetrics.length > 3 && '...'}) 
                         </span>
                       )}
                     </span>

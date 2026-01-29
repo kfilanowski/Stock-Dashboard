@@ -53,15 +53,18 @@ export function AddOptionModal({ isOpen, onClose, onAdd }: AddOptionModalProps) 
   }, []);
 
   // Fetch strikes when expiration changes
+  // Note: Don't filter by optionType - show ALL strikes for the expiration
+  // Some strikes may only have calls or only puts, but user should see all options
   const fetchStrikes = useCallback(async (tickerSymbol: string, exp: string) => {
     if (!tickerSymbol || !exp) {
       setStrikes([]);
       return;
     }
-    
+
     setLoadingStrikes(true);
     try {
-      const response = await getOptionStrikes(tickerSymbol, exp, optionType);
+      // Don't pass optionType - fetch all strikes for this expiration
+      const response = await getOptionStrikes(tickerSymbol, exp);
       setStrikes(response.strikes);
       setStrike(''); // Reset selection
     } catch (err) {
@@ -70,7 +73,7 @@ export function AddOptionModal({ isOpen, onClose, onAdd }: AddOptionModalProps) 
     } finally {
       setLoadingStrikes(false);
     }
-  }, [optionType]);
+  }, []);
 
   // Debounce ticker input to avoid too many API calls
   useEffect(() => {

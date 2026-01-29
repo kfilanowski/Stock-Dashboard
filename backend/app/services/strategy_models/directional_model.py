@@ -33,7 +33,7 @@ class DirectionalModel(BaseStrategyModel):
     """
 
     strategy_class = 'directional'
-    min_trades = 30
+    min_trades = 20  # Lowered from 30 to allow stable stocks
 
     # Indicators most relevant for directional trading
     priority_indicators: List[str] = [
@@ -46,6 +46,8 @@ class DirectionalModel(BaseStrategyModel):
         'position',  # Price position in range
         'volume',    # Volume confirmation
         'bollinger', # Volatility bands
+        'rel_momentum',  # Relative strength vs sector
+        'rs_ratio',      # RRG-style relative strength
     ]
 
     # Weights tuned for directional trading
@@ -61,6 +63,8 @@ class DirectionalModel(BaseStrategyModel):
         'sma': 1.3,       # SMA alignment important for direction
         'position': 0.9,
         'squeeze': 0.5,   # Less relevant for directional
+        'rel_momentum': 1.0,  # Relative strength vs sector
+        'rs_ratio': 1.0,      # RRG-style relative strength
     }
 
     def objective(self, result: SimulationResult) -> StrategyObjective:

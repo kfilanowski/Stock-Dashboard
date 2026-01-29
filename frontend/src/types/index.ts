@@ -124,7 +124,12 @@ export type MetricType =
   | 'ivPercentile'      // Implied Volatility percentile
   | 'sectorBeta'        // Beta to sector
   | 'earningsProximity' // Days until next earnings
-  | 'optionsSentiment'; // Options market sentiment (bullish/bearish/neutral)
+  | 'optionsSentiment'  // Options market sentiment (bullish/bearish/neutral)
+  | 'relMomentum'       // Relative momentum vs sector
+  | 'rsRatio'           // RS Ratio (RRG-style)
+  | 'avwap'             // Anchored VWAP (holder profitability)
+  | 'obv'               // On-Balance Volume (accumulation/distribution)
+  | 'chandelier';       // Chandelier Exit (trailing stop status)
 
 /**
  * A signal from a single metric for a specific action.
@@ -161,12 +166,13 @@ export interface StockAnalysis {
   scores: ActionScore[];
   bestAction: ActionScore;
   hasOptions: boolean;          // Whether options are available for this stock
-  calibration?: {               // NEW: Calibration metadata
+  calibration?: {               // Calibration metadata
     lastCalibrated: string;     // ISO Date
     sqn: number | null;         // System Quality Number
     period: number;             // Horizon (e.g. 3 or 15)
   };
-  status?: 'ok' | 'low_confidence' | 'error'; // NEW: Status flag
+  marketRegime?: string | null; // Current market regime (e.g., BULL_QUIET, BEAR_VOLATILE)
+  status?: 'ok' | 'low_confidence' | 'regime_blocked' | 'error'; // Status flag
   dataQuality: {
     availableMetrics: number;
     totalMetrics: number;
@@ -291,3 +297,53 @@ export const POSITION_TYPE_LABELS: Record<PositionType, string> = {
   short: 'Short'
 };
 
+// ============================================================================
+// Volatility Guidance Indicator Types
+// ============================================================================
+
+/**
+ * Anchored VWAP result - shows if holders are profitable.
+ */
+export interface AVWAPResult {
+  value: number;                    // AVWAP price level
+  anchorDate: string;               // Date of the anchor point
+  anchorType: 'swing_low' | 'swing_high';  // Type of anchor
+  priceVsAvwap: number;             // Percentage above/below AVWAP
+  status: 'support' | 'resistance'; // Simple guidance
+  isAbove: boolean;                 // Price is above AVWAP
+}
+
+/**
+ * Money Flow Index result with divergence detection.
+ */
+export interface MFIResult {
+  value: number;                    // 0-100 scale
+  status: 'bullish_reversal' | 'bearish_reversal' | 'neutral';
+  hasDivergence: boolean;           // MFI diverging from price
+  divergenceType: 'bullish' | 'bearish' | 'none';
+  isOversold: boolean;              // MFI < 20
+  isOverbought: boolean;            // MFI > 80
+}
+
+/**
+ * On-Balance Volume (OBV) result - detects accumulation/distribution.
+ */
+export interface OBVResult {
+  trend: 'accumulation' | 'distribution' | 'neutral';
+  trendStrength: number;            // 0-100 scale of how strong the signal is
+  obvChange: number;                // Percentage change in OBV over period
+  priceChange: number;              // Percentage change in price over period
+  hasDivergence: boolean;           // OBV diverging from price (key signal)
+  divergenceType: 'bullish' | 'bearish' | 'none';
+}
+
+/**
+ * Chandelier Exit (ATR trailing stop) result.
+ */
+export interface ChandelierResult {
+  stopPrice: number;                // Trailing stop price level
+  atr: number;                      // Current ATR value
+  highestHigh: number;              // Highest high in period
+  status: 'intact' | 'broken';      // Trend status
+  distanceToStop: number;           // Percentage from current price to stop
+}

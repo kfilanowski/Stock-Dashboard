@@ -13,10 +13,13 @@ import type {
   ActionScore, 
   StockAnalysis
 } from '../types';
-import { 
-  calculateAllIndicators, 
+import {
+  calculateAllIndicators,
   type TechnicalIndicators
 } from './technicalIndicators';
+import { getRegimeScore, isActionBlockedByRegime } from './regimeRules';
+import { calculateConsensusScore } from './consensusScoring';
+import type { MarketRegime } from '../types/calibration';
 
 // ============================================================================
 // Types
@@ -39,6 +42,11 @@ export interface AdditionalAnalysisData {
   callPutRatioVolume?: number | null;
   optionsSentiment?: string | null;
   avgImpliedVolatility?: number | null;
+  marketRegime?: MarketRegime | null;
+  // Relative strength indicators (vs sector)
+  relMomentum?: number | null;
+  rsRatio?: number | null;
+  rsMomentum?: number | null;
 }
 
 // ============================================================================
@@ -54,7 +62,8 @@ export const ALL_METRICS: MetricType[] = [
   'volume', 'pricePosition', 'smaAlignment', 'rvol', 'adx', 'crossPattern',
   'cmf', 'divergence', 'alpha',
   'roic', 'callPutRatio', 'ivPercentile', 'sectorBeta', 'earningsProximity',
-  'optionsSentiment'
+  'optionsSentiment', 'relMomentum', 'rsRatio',
+  'avwap', 'obv', 'chandelier'
 ];
 
 // ============================================================================
@@ -124,7 +133,14 @@ const BASE_WEIGHTS: WeightMatrix = {
   divergence: { buyShares: 1.5, sellShares: 1.5, openCSP: 1.0, openCC: 1.0, buyCall: 2.2, buyPut: 2.2 },
   alpha: { buyShares: 1.5, sellShares: 1.2, openCSP: 0.8, openCC: 0.8, buyCall: 1.8, buyPut: 1.8 },
   earningsProximity: { buyShares: 0.8, sellShares: 0.5, openCSP: 1.5, openCC: 1.5, buyCall: 2.0, buyPut: 2.0 },
-  optionsSentiment: { buyShares: 0.8, sellShares: 0.8, openCSP: 1.2, openCC: 1.2, buyCall: 1.5, buyPut: 1.5 }
+  optionsSentiment: { buyShares: 0.8, sellShares: 0.8, openCSP: 1.2, openCC: 1.2, buyCall: 1.5, buyPut: 1.5 },
+  // Relative strength indicators (vs sector)
+  relMomentum: { buyShares: 1.2, sellShares: 1.0, openCSP: 0.8, openCC: 0.8, buyCall: 1.5, buyPut: 1.5 },
+  rsRatio: { buyShares: 1.0, sellShares: 0.8, openCSP: 0.6, openCC: 0.6, buyCall: 1.2, buyPut: 1.2 },
+  // Volume/trend health indicators (from VolatilityGuidance)
+  avwap: { buyShares: 1.2, sellShares: 1.0, openCSP: 1.4, openCC: 1.2, buyCall: 0.8, buyPut: 0.8 },
+  obv: { buyShares: 1.5, sellShares: 1.5, openCSP: 1.2, openCC: 1.0, buyCall: 1.8, buyPut: 1.8 },
+  chandelier: { buyShares: 1.0, sellShares: 1.8, openCSP: 0.8, openCC: 1.5, buyCall: 0.6, buyPut: 1.2 }
 };
 
 /**
@@ -186,7 +202,12 @@ const metricLabels: Record<MetricType, string> = {
   ivPercentile: 'IV Percentile',
   sectorBeta: 'Sector Beta',
   earningsProximity: 'Earnings',
-  optionsSentiment: 'Options Flow'
+  optionsSentiment: 'Options Flow',
+  relMomentum: 'Rel. Momentum',
+  rsRatio: 'RS Ratio',
+  avwap: 'AVWAP',
+  obv: 'OBV',
+  chandelier: 'Trend Stop'
 };
 
 // ============================================================================
@@ -200,141 +221,61 @@ interface SignalResult {
 }
 
 /**
- * Interpret RSI for different actions.
+ * Interpret RSI using backend-consistent generic signal.
+ *
+ * SIMPLIFIED: Removed action-specific logic to match backend WFO optimization.
+ * The backend uses a generic RSI signal for all actions, so the frontend must too.
+ * Signal flipping for bearish actions is preserved (this is correct behavior).
  */
 function interpretRSI(
-  indicators: TechnicalIndicators, 
+  indicators: TechnicalIndicators,
   action: ActionType
 ): SignalResult | null {
   const rsi = indicators.rsi;
-  if (!rsi) return null;
-  
+  if (!rsi || rsi.value === undefined || rsi.value === null) return null;
+
   const value = rsi.value;
-  const prevValue = rsi.prevValue;
   const adx = indicators.adx;
   const isTrending = adx?.isTrending ?? false;
-  const isStrongTrend = adx?.isStrongTrend ?? false;
   const trendDirection = adx?.direction ?? 'neutral';
-  
+
   let signal = 0;
   let reasoning = '';
-  
-  // HOOK LOGIC
-  const bullishActions: ActionType[] = ['buyShares', 'openCSP', 'buyCall'];
-  if (bullishActions.includes(action) && value <= 35 && prevValue !== null) {
-    if (value > prevValue) {
-      const hookStrength = Math.min((prevValue <= 30 ? 0.3 : 0.15), 1);
-      signal = 0.7 + hookStrength;
-      reasoning = `Oversold + Hooking Up (${prevValue.toFixed(0)}→${value.toFixed(0)})`;
-      return { signal: Math.max(-1, Math.min(1, signal)), rawValue: `RSI: ${value.toFixed(1)}`, reasoning };
-    } else if (value < prevValue) {
-      signal = value <= 20 ? 0.1 : 0.2;
-      reasoning = `Oversold but FALLING (${prevValue.toFixed(0)}→${value.toFixed(0)}) - Knife risk`;
-      return { signal, rawValue: `RSI: ${value.toFixed(1)}`, reasoning };
-    }
-  }
-  
-  const bearishActions: ActionType[] = ['sellShares', 'buyPut'];
-  if (bearishActions.includes(action) && value >= 65 && prevValue !== null) {
-    if (value < prevValue) {
-      const hookStrength = Math.min((prevValue >= 70 ? 0.3 : 0.15), 1);
-      signal = 0.7 + hookStrength;
-      reasoning = `Overbought + Hooking Down (${prevValue.toFixed(0)}→${value.toFixed(0)})`;
-      return { signal: Math.max(-1, Math.min(1, signal)), rawValue: `RSI: ${value.toFixed(1)}`, reasoning };
-    } else if (value > prevValue) {
-      signal = value >= 80 ? 0.2 : 0.1;
-      reasoning = `Overbought but RISING (${prevValue.toFixed(0)}→${value.toFixed(0)}) - Wait for turn`;
-      return { signal, rawValue: `RSI: ${value.toFixed(1)}`, reasoning };
-    }
-  }
-  
-  // PREMIUM SELLING LOGIC (openCSP, openCC)
-  // CSP: Sell put → want stock to NOT fall → oversold with reversal = ideal
-  // CC: Sell call → want stock to NOT rise → overbought with reversal = ideal
-  if (action === 'openCSP') {
-    if (value <= 35) {
-      if (prevValue !== null && value > prevValue) {
-        // Oversold and hooking up - ideal for selling puts
-        return { signal: 0.9, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Oversold reversal (${value.toFixed(0)}) - ideal CSP entry` };
-      } else if (value <= 25) {
-        // Very oversold but not reversing yet - still decent for CSP premium
-        return { signal: 0.5, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Deep oversold (${value.toFixed(0)}) - rich premium but wait for turn` };
-      } else {
-        return { signal: 0.3, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Oversold (${value.toFixed(0)}) - good CSP setup` };
-      }
-    } else if (value >= 70) {
-      // Overbought - not ideal for selling puts
-      return { signal: -0.3, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Overbought (${value.toFixed(0)}) - wait for pullback to sell puts` };
-    }
-    // Neutral RSI - slight positive for CSP (stock not extended)
-    return { signal: 0.1, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Neutral RSI (${value.toFixed(0)})` };
-  }
 
-  if (action === 'openCC') {
-    if (value >= 65) {
-      if (prevValue !== null && value < prevValue) {
-        // Overbought and hooking down - ideal for selling calls
-        return { signal: 0.9, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Overbought reversal (${value.toFixed(0)}) - ideal CC entry` };
-      } else if (value >= 75) {
-        // Very overbought but still rising - decent CC premium but risky
-        return { signal: 0.4, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Extended (${value.toFixed(0)}) - rich premium, watch for assignment` };
-      } else {
-        return { signal: 0.3, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Overbought (${value.toFixed(0)}) - good CC setup` };
-      }
-    } else if (value <= 30) {
-      // Oversold - not ideal for selling calls (missing upside)
-      return { signal: -0.4, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Oversold (${value.toFixed(0)}) - wait for rally to sell calls` };
-    }
-    // Neutral RSI - slight positive for CC
-    return { signal: 0.1, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Neutral RSI (${value.toFixed(0)})` };
-  }
+  // Generic RSI signal matching backend's calculate_indicator_signals()
+  // Backend: base_rsi scaled from +1 (RSI=0) to -1 (RSI=100) with breakpoints at 30 and 70
+  const rsi_oversold = 30;
+  const rsi_overbought = 70;
+  const rsi_mid = 50;
 
-  // REGIME-AWARE MOMENTUM OVERRIDE
-  if (action === 'buyCall') {
-    if (value >= 65 && value < 85) {
-      if (isTrending && trendDirection !== 'bearish') {
-        const strengthBonus = isStrongTrend ? 0.15 : 0;
-        return { signal: 0.8 + strengthBonus, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Bull Regime (${value.toFixed(0)}) + ADX ${adx?.adx.toFixed(0)} trending` };
-      } else {
-        return { signal: -0.2, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `RSI ${value.toFixed(0)} near ceiling (ADX ${adx?.adx?.toFixed(0) ?? '?'} = sideways)` };
-      }
-    } else if (value >= 85) {
-      return { signal: 0.1, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Extreme RSI (${value.toFixed(0)}) - Exhaustion risk` };
-    }
-  }
-
-  if (action === 'buyPut') {
-    if (value <= 35 && value > 15) {
-      if (isTrending && trendDirection !== 'bullish') {
-        const strengthBonus = isStrongTrend ? 0.15 : 0;
-        return { signal: 0.8 + strengthBonus, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Bear Regime (${value.toFixed(0)}) + ADX ${adx?.adx.toFixed(0)} trending` };
-      } else {
-        return { signal: -0.3, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `RSI ${value.toFixed(0)} near floor (ADX ${adx?.adx?.toFixed(0) ?? '?'} = bounce likely)` };
-      }
-    } else if (value <= 15) {
-      return { signal: 0.1, rawValue: `RSI: ${value.toFixed(1)}`, reasoning: `Extreme oversold (${value.toFixed(0)}) - Bounce imminent` };
-    }
-  }
-  
-  // STANDARD
-  if (value <= 30) {
-    signal = 1 - (value / 30) * 0.5;
+  if (value <= rsi_oversold) {
+    // RSI 0-30: signal 1.0 to 0.5
+    signal = 1.0 - (value / rsi_oversold) * 0.5;
     reasoning = `Oversold (${value.toFixed(0)})`;
-    if (isTrending && trendDirection === 'bearish') { signal *= 0.6; reasoning += ' [bear trend caution]'; }
-  } else if (value <= 50) {
-    signal = 0.5 - ((value - 30) / 20) * 0.5;
+  } else if (value <= rsi_mid) {
+    // RSI 30-50: signal 0.5 to 0
+    signal = 0.5 - ((value - rsi_oversold) / (rsi_mid - rsi_oversold)) * 0.5;
     reasoning = `Neutral-bullish (${value.toFixed(0)})`;
-  } else if (value <= 70) {
-    signal = -((value - 50) / 20) * 0.5;
+  } else if (value <= rsi_overbought) {
+    // RSI 50-70: signal 0 to -0.5
+    signal = -((value - rsi_mid) / (rsi_overbought - rsi_mid)) * 0.5;
     reasoning = `Neutral-bearish (${value.toFixed(0)})`;
   } else {
-    signal = -0.5 - ((value - 70) / 30) * 0.5;
+    // RSI 70-100: signal -0.5 to -1.0
+    signal = -0.5 - ((value - rsi_overbought) / (100 - rsi_overbought)) * 0.5;
     reasoning = `Overbought (${value.toFixed(0)})`;
-    if (isTrending && trendDirection === 'bullish') { signal *= 0.6; reasoning += ' [bull trend support]'; }
   }
-  
+
+  // Regime override: trending bullish market (matches backend line 824-825)
+  if (value >= 65 && value < 85 && isTrending && trendDirection === 'bullish') {
+    signal = 0.8;
+    reasoning = `Trending bullish (${value.toFixed(0)}, ADX ${adx?.adx?.toFixed(0) ?? '?'})`;
+  }
+
+  // Flip signal for bearish actions (sellShares, buyPut)
+  const bearishActions: ActionType[] = ['sellShares', 'buyPut'];
   if (bearishActions.includes(action)) signal = -signal;
-  
+
   return { signal: Math.max(-1, Math.min(1, signal)), rawValue: `RSI: ${value.toFixed(1)}`, reasoning };
 }
 
@@ -561,98 +502,83 @@ function interpretCrossPattern(indicators: TechnicalIndicators, action: ActionTy
   return { signal: Math.max(-1, Math.min(1, signal)), rawValue: cross.pattern !== 'none' ? cross.pattern.replace('_', ' ') : cross.trendAlignment, reasoning };
 }
 
+/**
+ * Interpret ADX using backend-consistent generic signal.
+ *
+ * SIMPLIFIED: Removed action-specific logic to match backend WFO optimization.
+ * Backend uses: trend strength + direction adjustment (bearish = negative signal).
+ */
 function interpretADX(indicators: TechnicalIndicators, action: ActionType): SignalResult | null {
   const adx = indicators.adx;
-  if (!adx) return null;
-  
+  if (!adx || adx.adx === undefined || adx.adx === null) return null;
+
+  const adxValue = adx.adx;
+  const direction = adx.direction;
+
+  // Generic ADX signal matching backend's calculate_indicator_signals()
+  // Backend thresholds: no_trend=20, trending=25, strong_trend=40
   let signal = 0;
   let reasoning = '';
-  const { adx: adxValue, direction, isTrending, isStrongTrend } = adx;
-  
-  if (action === 'buyCall' || action === 'buyPut') {
-    if (isStrongTrend) {
-      const directionMatch = (action === 'buyCall' && direction === 'bullish') || (action === 'buyPut' && direction === 'bearish');
-      signal = directionMatch ? 1.0 : 0.3;
-      reasoning = `Strong ${direction} trend (ADX ${adxValue.toFixed(0)})`;
-    } else if (isTrending) {
-      const directionMatch = (action === 'buyCall' && direction === 'bullish') || (action === 'buyPut' && direction === 'bearish');
-      signal = directionMatch ? 0.7 : 0.1;
-      reasoning = `${direction} trend (ADX ${adxValue.toFixed(0)})`;
-    } else {
-      signal = -0.6;
-      reasoning = `Sideways market (ADX ${adxValue.toFixed(0)}) - avoid long options`;
-    }
-  } else if (action === 'openCSP' || action === 'openCC') {
-    if (!isTrending) {
-      signal = 0.7;
-      reasoning = `Range-bound (ADX ${adxValue.toFixed(0)}) - ideal for premium selling`;
-    } else if (isStrongTrend) {
-      signal = -0.5;
-      reasoning = `Strong trend (ADX ${adxValue.toFixed(0)}) - assignment risk`;
-    } else {
-      signal = 0.1;
-      reasoning = `Weak trend (ADX ${adxValue.toFixed(0)})`;
-    }
+
+  if (adxValue < 20) {
+    signal = 0.0;
+    reasoning = `No trend (ADX ${adxValue.toFixed(0)})`;
+  } else if (adxValue < 25) {
+    signal = 0.3;
+    reasoning = `Weak trend (ADX ${adxValue.toFixed(0)})`;
+  } else if (adxValue < 40) {
+    signal = 0.6;
+    reasoning = `Trending (ADX ${adxValue.toFixed(0)})`;
   } else {
-    if (direction === 'bullish' && isTrending) {
-      signal = action === 'buyShares' ? 0.5 : -0.3;
-      reasoning = `Bullish trend (ADX ${adxValue.toFixed(0)})`;
-    } else if (direction === 'bearish' && isTrending) {
-      signal = action === 'sellShares' ? 0.5 : -0.3;
-      reasoning = `Bearish trend (ADX ${adxValue.toFixed(0)})`;
-    } else {
-      signal = 0;
-      reasoning = `No clear trend (ADX ${adxValue.toFixed(0)})`;
-    }
+    signal = 0.9;
+    reasoning = `Strong trend (ADX ${adxValue.toFixed(0)})`;
   }
-  
+
+  // Direction adjustment (matches backend line 857)
+  if (direction === 'bearish') {
+    signal = -signal;
+    reasoning += ` ${direction}`;
+  } else if (direction === 'bullish') {
+    reasoning += ` ${direction}`;
+  }
+
+  // Flip signal for bearish actions
+  const bearishActions: ActionType[] = ['sellShares', 'buyPut'];
+  if (bearishActions.includes(action)) signal = -signal;
+
   return { signal: Math.max(-1, Math.min(1, signal)), rawValue: `ADX: ${adxValue.toFixed(0)}`, reasoning };
 }
 
-function interpretBollingerSqueeze(indicators: TechnicalIndicators, action: ActionType): SignalResult | null {
+/**
+ * Interpret Bollinger Squeeze using backend-consistent generic signal.
+ *
+ * SIMPLIFIED: Removed action-specific logic to match backend WFO optimization.
+ * Backend uses: squeeze=0.8 (cheap options), expansion=-0.5 (expensive options), else 0.
+ */
+function interpretBollingerSqueeze(indicators: TechnicalIndicators, _action: ActionType): SignalResult | null {
   const squeeze = indicators.bollingerSqueeze;
-  if (!squeeze) return null;
-  
+  if (!squeeze || squeeze.bandwidthPercentile === undefined) return null;
+
+  const { bandwidthPercentile, isSqueeze, isExpansion, squeezeIntensity } = squeeze;
+
+  // Generic squeeze signal matching backend's calculate_indicator_signals()
   let signal = 0;
   let reasoning = '';
-  const { bandwidthPercentile, isSqueeze, isExpansion, squeezeIntensity } = squeeze;
-  
-  if (action === 'buyCall' || action === 'buyPut') {
-    if (isSqueeze) {
-      const intensityBonus = squeezeIntensity === 'extreme' ? 0.3 : squeezeIntensity === 'moderate' ? 0.15 : 0;
-      signal = 0.7 + intensityBonus;
-      reasoning = `${squeezeIntensity} squeeze (${bandwidthPercentile}%ile) - cheap premiums`;
-    } else if (isExpansion) {
-      signal = -0.4;
-      reasoning = `High volatility (${bandwidthPercentile}%ile) - expensive premiums`;
-    } else {
-      signal = 0;
-      reasoning = `Normal volatility (${bandwidthPercentile}%ile)`;
-    }
-  } else if (action === 'openCSP' || action === 'openCC') {
-    if (isExpansion) {
-      signal = 0.6;
-      reasoning = `High volatility (${bandwidthPercentile}%ile) - rich premiums`;
-    } else if (isSqueeze) {
-      signal = -0.3;
-      reasoning = `${squeezeIntensity} squeeze (${bandwidthPercentile}%ile) - low premiums`;
-    } else {
-      signal = 0.1;
-      reasoning = `Normal volatility (${bandwidthPercentile}%ile)`;
-    }
+
+  if (isSqueeze) {
+    signal = 0.8;
+    reasoning = `${squeezeIntensity} squeeze (${bandwidthPercentile}%ile) - low volatility`;
+  } else if (isExpansion) {
+    signal = -0.5;
+    reasoning = `Expansion (${bandwidthPercentile}%ile) - high volatility`;
   } else {
-    if (isSqueeze) {
-      signal = 0.2;
-      reasoning = `Low volatility - stable entry`;
-    } else if (isExpansion) {
-      signal = action === 'buyShares' ? 0.3 : 0.1;
-      reasoning = `High volatility - watch for entry`;
-    } else {
-      signal = 0;
-      reasoning = `Normal volatility`;
-    }
+    signal = 0;
+    reasoning = `Normal volatility (${bandwidthPercentile}%ile)`;
   }
-  
+
+  // Note: Backend squeeze signal is NOT direction-aware, so no flipping needed
+  // The signal represents volatility state, not directional bias
+
   return { signal: Math.max(-1, Math.min(1, signal)), rawValue: `BWP: ${bandwidthPercentile}%`, reasoning };
 }
 
@@ -841,7 +767,10 @@ const BACKEND_TO_FRONTEND_METRICS: Record<string, MetricType> = {
   'volume': 'volume',
   'rvol': 'rvol',
   'sma': 'smaAlignment',
-  'position': 'pricePosition'
+  'position': 'pricePosition',
+  'vwap': 'vwap',  // Volume-weighted average price
+  'rel_momentum': 'relMomentum',
+  'rs_ratio': 'rsRatio'
 };
 
 /**
@@ -1015,6 +944,193 @@ function interpretOptionsSentiment(additionalData: AdditionalAnalysisData | unde
 }
 
 /**
+ * Interpret Relative Momentum (stock vs sector performance).
+ * Positive = outperforming sector, Negative = underperforming sector.
+ */
+function interpretRelMomentum(additionalData: AdditionalAnalysisData | undefined, action: ActionType): SignalResult | null {
+  if (additionalData?.relMomentum === undefined || additionalData?.relMomentum === null) return null;
+  const relMom = additionalData.relMomentum;
+  let signal = 0;
+  let reasoning = '';
+
+  if (relMom > 10) { signal = 1.0; reasoning = `Strong outperformance (+${relMom.toFixed(1)}% vs sector)`; }
+  else if (relMom > 5) { signal = 0.6; reasoning = `Outperforming sector (+${relMom.toFixed(1)}%)`; }
+  else if (relMom > 0) { signal = 0.3; reasoning = `Slightly outperforming (+${relMom.toFixed(1)}%)`; }
+  else if (relMom > -5) { signal = -0.3; reasoning = `Slightly underperforming (${relMom.toFixed(1)}%)`; }
+  else if (relMom > -10) { signal = -0.6; reasoning = `Underperforming sector (${relMom.toFixed(1)}%)`; }
+  else { signal = -1.0; reasoning = `Strong underperformance (${relMom.toFixed(1)}% vs sector)`; }
+
+  // For sell actions, flip the signal
+  if (action === 'sellShares' || action === 'buyPut') {
+    signal = -signal;
+  }
+
+  return { signal: Math.max(-1, Math.min(1, signal)), rawValue: `Rel Mom: ${relMom.toFixed(1)}%`, reasoning };
+}
+
+/**
+ * Interpret RS Ratio (RRG-style relative strength).
+ * > 100 = outperforming, < 100 = underperforming.
+ */
+function interpretRsRatio(additionalData: AdditionalAnalysisData | undefined, action: ActionType): SignalResult | null {
+  if (additionalData?.rsRatio === undefined || additionalData?.rsRatio === null) return null;
+  const rsRatio = additionalData.rsRatio;
+  const rsMomentum = additionalData.rsMomentum ?? 0;
+  let signal = 0;
+  let reasoning = '';
+
+  const rsAbove100 = rsRatio >= 100;
+  const momPositive = rsMomentum >= 0;
+
+  // RRG Quadrant logic
+  if (rsAbove100 && momPositive) {
+    // Leading quadrant
+    signal = 0.8;
+    reasoning = `Leading (RS ${rsRatio.toFixed(0)}, Mom+)`;
+  } else if (rsAbove100 && !momPositive) {
+    // Weakening quadrant
+    signal = 0.2;
+    reasoning = `Weakening (RS ${rsRatio.toFixed(0)}, Mom-)`;
+  } else if (!rsAbove100 && !momPositive) {
+    // Lagging quadrant
+    signal = -0.8;
+    reasoning = `Lagging (RS ${rsRatio.toFixed(0)}, Mom-)`;
+  } else {
+    // Improving quadrant
+    signal = 0.4;
+    reasoning = `Improving (RS ${rsRatio.toFixed(0)}, Mom+)`;
+  }
+
+  // For sell actions, flip the signal
+  if (action === 'sellShares' || action === 'buyPut') {
+    signal = -signal;
+  }
+
+  return { signal: Math.max(-1, Math.min(1, signal)), rawValue: `RS: ${rsRatio.toFixed(0)}`, reasoning };
+}
+
+/**
+ * Interpret Anchored VWAP signal.
+ * AVWAP shows if recent holders are profitable (support) or underwater (resistance).
+ */
+function interpretAVWAP(indicators: TechnicalIndicators, action: ActionType): SignalResult | null {
+  const avwap = indicators.avwap;
+  if (!avwap) return null;
+
+  let signal = 0;
+  let reasoning = '';
+
+  // Price above AVWAP = holders profitable = support level (bullish)
+  // Price below AVWAP = holders underwater = resistance level (bearish)
+  if (avwap.status === 'support') {
+    signal = Math.min(1, avwap.priceVsAvwap / 10); // Scale: 10% above = +1
+    reasoning = `${avwap.priceVsAvwap.toFixed(1)}% above AVWAP - holders profitable`;
+  } else {
+    signal = Math.max(-1, avwap.priceVsAvwap / 10); // Negative priceVsAvwap
+    reasoning = `${Math.abs(avwap.priceVsAvwap).toFixed(1)}% below AVWAP - holders underwater`;
+  }
+
+  // For sell/bearish actions, flip the signal
+  if (action === 'sellShares' || action === 'buyPut') {
+    signal = -signal;
+  }
+
+  return {
+    signal: Math.max(-1, Math.min(1, signal)),
+    rawValue: `$${avwap.value.toFixed(2)}`,
+    reasoning
+  };
+}
+
+/**
+ * Interpret On-Balance Volume signal.
+ * OBV reveals institutional accumulation or distribution.
+ */
+function interpretOBV(indicators: TechnicalIndicators, action: ActionType): SignalResult | null {
+  const obv = indicators.obv;
+  if (!obv) return null;
+
+  let signal = 0;
+  let reasoning = '';
+
+  // Divergence is the strongest signal
+  if (obv.hasDivergence) {
+    if (obv.divergenceType === 'bullish') {
+      signal = 0.9;
+      reasoning = `Bullish divergence: institutions accumulating despite price weakness`;
+    } else if (obv.divergenceType === 'bearish') {
+      signal = -0.9;
+      reasoning = `Bearish divergence: institutions distributing despite price strength`;
+    }
+  } else {
+    // Normal trend
+    if (obv.trend === 'accumulation') {
+      signal = Math.min(0.7, obv.trendStrength / 100);
+      reasoning = `Accumulation: +${obv.obvChange.toFixed(0)}% OBV`;
+    } else if (obv.trend === 'distribution') {
+      signal = -Math.min(0.7, obv.trendStrength / 100);
+      reasoning = `Distribution: ${obv.obvChange.toFixed(0)}% OBV`;
+    } else {
+      signal = 0;
+      reasoning = `Neutral volume flow`;
+    }
+  }
+
+  // For sell/bearish actions, flip the signal
+  if (action === 'sellShares' || action === 'buyPut') {
+    signal = -signal;
+  }
+
+  return {
+    signal: Math.max(-1, Math.min(1, signal)),
+    rawValue: obv.trend,
+    reasoning
+  };
+}
+
+/**
+ * Interpret Chandelier Exit signal.
+ * Trailing stop that shows if trend is intact or broken.
+ */
+function interpretChandelier(indicators: TechnicalIndicators, action: ActionType): SignalResult | null {
+  const chandelier = indicators.chandelier;
+  if (!chandelier) return null;
+
+  let signal = 0;
+  let reasoning = '';
+
+  if (chandelier.status === 'intact') {
+    // Trend intact - more buffer to stop = stronger
+    const bufferStrength = Math.min(1, chandelier.distanceToStop / 10); // 10% buffer = max
+    signal = 0.3 + bufferStrength * 0.5; // Range: 0.3 to 0.8
+    reasoning = `Trend intact - stop at $${chandelier.stopPrice.toFixed(2)} (${chandelier.distanceToStop.toFixed(1)}% buffer)`;
+  } else {
+    // Trend broken - strong bearish signal
+    signal = -0.8;
+    reasoning = `Trend BROKEN - price below stop at $${chandelier.stopPrice.toFixed(2)}`;
+  }
+
+  // Chandelier is particularly important for sell decisions
+  if (action === 'sellShares') {
+    // Broken trend is a strong sell signal (keep negative)
+    // Intact trend is a hold signal (flip to negative = don't sell)
+    signal = -signal;
+  } else if (action === 'buyPut') {
+    // Broken trend supports buying puts (keep as is, broken = positive for puts)
+    signal = -signal;
+  } else if (action === 'openCC') {
+    // Intact trend makes covered calls safer
+    // No change needed
+  }
+
+  return {
+    signal: Math.max(-1, Math.min(1, signal)),
+    rawValue: chandelier.status,
+    reasoning
+  };
+}
+
+/**
  * Calculate score for a single action based on all indicators.
  */
 function calculateActionScore(
@@ -1057,6 +1173,11 @@ function calculateActionScore(
       case 'callPutRatio': result = interpretCallPutRatio(additionalData, action); break;
       case 'ivPercentile': result = interpretIVPercentile(additionalData, action); break;
       case 'optionsSentiment': result = interpretOptionsSentiment(additionalData, action); break;
+      case 'relMomentum': result = interpretRelMomentum(additionalData, action); break;
+      case 'rsRatio': result = interpretRsRatio(additionalData, action); break;
+      case 'avwap': result = interpretAVWAP(indicators, action); break;
+      case 'obv': result = interpretOBV(indicators, action); break;
+      case 'chandelier': result = interpretChandelier(indicators, action); break;
     }
 
     if (result) {
@@ -1102,11 +1223,94 @@ function calculateActionScore(
 }
 
 // ============================================================================
+// Ensemble Scoring
+// ============================================================================
+
+/**
+ * Get ensemble weights based on calibration quality (SQN).
+ * Higher SQN = trust WFO more; lower SQN = rely more on rules.
+ */
+function getEnsembleWeights(sqn: number | null): { wfo: number; regime: number; consensus: number } {
+  if (!sqn || sqn < 0.5) {
+    // Poor calibration - don't trust WFO much
+    return { wfo: 0.2, regime: 0.5, consensus: 0.3 };
+  }
+  if (sqn < 1.5) {
+    // Fair calibration - balanced approach
+    return { wfo: 0.35, regime: 0.35, consensus: 0.3 };
+  }
+  if (sqn < 2.5) {
+    // Good calibration - trust WFO
+    return { wfo: 0.5, regime: 0.25, consensus: 0.25 };
+  }
+  // Excellent calibration - trust WFO heavily
+  return { wfo: 0.6, regime: 0.2, consensus: 0.2 };
+}
+
+/**
+ * Apply ensemble scoring to a base score.
+ * Combines WFO-calibrated score with regime rules and consensus signals.
+ *
+ * @param baseScore - The WFO-weighted score (0-100)
+ * @param action - The action being scored
+ * @param regime - Current market regime
+ * @param indicators - Technical indicators for consensus
+ * @param sqn - Calibration quality score
+ * @param wfoWeights - Optional WFO calibration weights (passed to consensus for weight-aware filtering)
+ * @returns Adjusted ensemble score (0-100)
+ */
+function applyEnsembleScoring(
+  baseScore: number,
+  action: ActionType,
+  regime: MarketRegime | null | undefined,
+  indicators: TechnicalIndicators,
+  sqn: number | null,
+  wfoWeights?: Record<string, number>
+): number {
+  // If no regime data, return base score
+  if (!regime) {
+    return baseScore;
+  }
+
+  // Get ensemble weights
+  const weights = getEnsembleWeights(sqn);
+
+  // Normalize baseScore to -1 to +1 range
+  const normalizedBase = (baseScore - 50) / 50;
+
+  // Get regime score (-1 to +1)
+  const regimeScore = getRegimeScore(regime, action);
+
+  // Get consensus score (-1 to +1) - now weight-aware
+  const consensusScore = calculateConsensusScore(indicators, action, wfoWeights);
+
+  // Weighted combination
+  const ensembleScore =
+    weights.wfo * normalizedBase +
+    weights.regime * regimeScore +
+    weights.consensus * consensusScore;
+
+  // Convert back to 0-100
+  const finalScore = (ensembleScore + 1) * 50;
+
+  return Math.max(0, Math.min(100, Math.round(finalScore)));
+}
+
+// ============================================================================
 // Main Analysis Function
 // ============================================================================
 
 /**
+ * Strategy-specific weights map type.
+ * Maps strategy class names to their calibrated WFO multipliers.
+ */
+export type StrategyWeightsMap = Record<string, Record<string, number>>;
+
+/**
  * Calculate scores for all actions and produce complete analysis.
+ *
+ * @param strategyWeightsMap - Optional map of strategy class → WFO multipliers.
+ *   When provided, each action uses weights calibrated for its strategy class.
  */
 export function analyzeStock(
   ticker: string,
@@ -1117,29 +1321,122 @@ export function analyzeStock(
   wfoMultipliers?: Record<string, number>,
   additionalData?: AdditionalAnalysisData,
   calibrationMetadata?: { lastCalibrated: string; sqn: number | null; period: number },
-  horizon: number = 3
+  horizon: number = 3,
+  strategyWeightsMap?: StrategyWeightsMap
 ): StockAnalysis {
   const indicators = calculateAllIndicators(history, currentPrice, high52w, low52w);
-  
-  // 1. Determine weights
-  // Start with base weights
-  let weights = BASE_WEIGHTS;
-  
-  // If WFO multipliers provided, apply them
-  if (wfoMultipliers) {
-    weights = applyWfoMultipliers(weights, wfoMultipliers);
+
+  // 1. Determine weights per strategy class
+  // Build a map of strategy → weight matrix
+  const strategyToWeights: Record<StrategyClass, WeightMatrix> = {
+    directional: BASE_WEIGHTS,
+    premium_sell: BASE_WEIGHTS,
+    premium_buy: BASE_WEIGHTS,
+    all: BASE_WEIGHTS,
+  };
+
+  // Apply WFO multipliers per strategy class if available
+  if (strategyWeightsMap && Object.keys(strategyWeightsMap).length > 0) {
+    // We have strategy-specific weights
+    for (const strategyClass of ['directional', 'premium_sell', 'premium_buy'] as StrategyClass[]) {
+      const multipliers = strategyWeightsMap[strategyClass];
+      if (multipliers) {
+        strategyToWeights[strategyClass] = applyWfoMultipliers(BASE_WEIGHTS, multipliers);
+      } else {
+        // Fallback to horizon defaults if no calibration for this strategy
+        strategyToWeights[strategyClass] = applyHorizonDefaults(BASE_WEIGHTS, horizon);
+      }
+    }
+  } else if (wfoMultipliers) {
+    // Legacy: single wfoMultipliers applied to all strategies
+    const calibratedWeights = applyWfoMultipliers(BASE_WEIGHTS, wfoMultipliers);
+    strategyToWeights.directional = calibratedWeights;
+    strategyToWeights.premium_sell = calibratedWeights;
+    strategyToWeights.premium_buy = calibratedWeights;
+    strategyToWeights.all = calibratedWeights;
   } else {
-    // If no WFO, apply horizon defaults
-    weights = applyHorizonDefaults(weights, horizon);
+    // No WFO calibration - apply horizon defaults
+    const defaultWeights = applyHorizonDefaults(BASE_WEIGHTS, horizon);
+    strategyToWeights.directional = defaultWeights;
+    strategyToWeights.premium_sell = defaultWeights;
+    strategyToWeights.premium_buy = defaultWeights;
+    strategyToWeights.all = defaultWeights;
   }
-  
-  const scores: ActionScore[] = ALL_ACTIONS.map(action => 
-    calculateActionScore(action, indicators, currentPrice, weights, additionalData)
-  );
-  
-  const bestAction = scores.reduce((prev, current) => 
-    (current.totalScore > prev.totalScore) ? current : prev
-  );
+
+  // Calculate base scores for each action using the appropriate strategy weights
+  const baseScores: ActionScore[] = ALL_ACTIONS.map(action => {
+    const strategyClass = getStrategyForAction(action);
+    const weights = strategyToWeights[strategyClass];
+    return calculateActionScore(action, indicators, currentPrice, weights, additionalData);
+  });
+
+  // Apply ensemble scoring if regime data is available
+  const regime = additionalData?.marketRegime;
+  const sqn = calibrationMetadata?.sqn ?? null;
+
+  const scores: ActionScore[] = baseScores.map(score => {
+    // Check if this action is HARD BLOCKED by the current regime
+    // This matches the backend's WFO behavior where signals are zeroed out
+    const isBlocked = isActionBlockedByRegime(regime, score.action);
+
+    if (isBlocked) {
+      // Hard block: set score to 0 to match backend's zero-signal behavior
+      return {
+        ...score,
+        totalScore: 0,
+        confidence: 'low' as const,
+        // Add a signal explaining the block
+        signals: [
+          {
+            metric: 'pricePosition' as MetricType,
+            metricLabel: 'Regime Filter',
+            rawValue: `${regime} blocks ${score.action}`,
+            signal: -1,
+            weight: 1,
+            contribution: -100,
+            reasoning: `Action blocked by market regime (${regime}). Backend WFO simulation zeros out these signals.`
+          },
+          ...score.signals.slice(0, 5) // Keep some original signals for context
+        ]
+      };
+    }
+
+    if (regime) {
+      const ensembleScore = applyEnsembleScoring(
+        score.totalScore,
+        score.action,
+        regime,
+        indicators,
+        sqn,
+        wfoMultipliers // Pass WFO weights for weight-aware consensus
+      );
+      return {
+        ...score,
+        totalScore: ensembleScore,
+        // Keep rawScore as the pre-ensemble WFO score for reference
+      };
+    }
+    return score;
+  });
+
+  // Find the best non-blocked action
+  const nonBlockedScores = scores.filter(s => !isActionBlockedByRegime(regime, s.action));
+  const bestAction = nonBlockedScores.length > 0
+    ? nonBlockedScores.reduce((prev, current) =>
+        (current.totalScore > prev.totalScore) ? current : prev
+      )
+    : scores.reduce((prev, current) =>
+        (current.totalScore > prev.totalScore) ? current : prev
+      );
+
+  // Check if the highest scoring action overall was blocked
+  const highestOverallAction = scores.reduce((prev, current) => {
+    // Compare raw scores to see what WOULD have been recommended
+    const prevOriginal = baseScores.find(s => s.action === prev.action)?.totalScore ?? 0;
+    const currentOriginal = baseScores.find(s => s.action === current.action)?.totalScore ?? 0;
+    return currentOriginal > prevOriginal ? current : prev;
+  });
+  const wouldHaveBeenBlocked = isActionBlockedByRegime(regime, highestOverallAction.action);
   
   const totalMetrics = ALL_METRICS.length;
   const availableMetrics = scores[0].signals.length;
@@ -1147,6 +1444,10 @@ export function analyzeStock(
     !scores[0].signals.some(s => s.metric === m)
   );
   
+  // Determine status: regime_blocked takes precedence over other checks
+  // (low_confidence is set by the hook, not here)
+  const status: 'ok' | 'regime_blocked' = wouldHaveBeenBlocked ? 'regime_blocked' : 'ok';
+
   return {
     ticker,
     analyzedAt: new Date(),
@@ -1154,6 +1455,8 @@ export function analyzeStock(
     bestAction,
     hasOptions: additionalData?.hasOptions ?? false, // Default to false - only show options if explicitly available
     calibration: calibrationMetadata,
+    marketRegime: regime ?? null, // Include regime for UI display
+    status,
     dataQuality: {
       availableMetrics,
       totalMetrics,

@@ -135,14 +135,38 @@ async def migrate_db(conn):
         )
     """))
     await conn.execute(text("""
-        CREATE INDEX IF NOT EXISTS ix_calibration_weights_ticker 
+        CREATE INDEX IF NOT EXISTS ix_calibration_weights_ticker
         ON calibration_weights(ticker)
     """))
     await conn.execute(text("""
-        CREATE INDEX IF NOT EXISTS ix_calibration_ticker_horizon 
+        CREATE INDEX IF NOT EXISTS ix_calibration_ticker_horizon
         ON calibration_weights(ticker, horizon)
     """))
-    
+
+    # Migration: Add new columns to calibration_weights
+    result = await conn.execute(text("PRAGMA table_info(calibration_weights)"))
+    calibration_columns = [row[1] for row in result.fetchall()]
+
+    if 'strategy_class' not in calibration_columns:
+        await conn.execute(text("ALTER TABLE calibration_weights ADD COLUMN strategy_class VARCHAR DEFAULT 'all'"))
+        print("Added strategy_class column to calibration_weights table")
+
+    if 'overfit_warning' not in calibration_columns:
+        await conn.execute(text("ALTER TABLE calibration_weights ADD COLUMN overfit_warning BOOLEAN DEFAULT 0"))
+        print("Added overfit_warning column to calibration_weights table")
+
+    if 'avg_train_sqn' not in calibration_columns:
+        await conn.execute(text("ALTER TABLE calibration_weights ADD COLUMN avg_train_sqn FLOAT"))
+        print("Added avg_train_sqn column to calibration_weights table")
+
+    if 'avg_test_sqn' not in calibration_columns:
+        await conn.execute(text("ALTER TABLE calibration_weights ADD COLUMN avg_test_sqn FLOAT"))
+        print("Added avg_test_sqn column to calibration_weights table")
+
+    if 'avg_gross_sqn' not in calibration_columns:
+        await conn.execute(text("ALTER TABLE calibration_weights ADD COLUMN avg_gross_sqn FLOAT"))
+        print("Added avg_gross_sqn column to calibration_weights table")
+
     # Create calibration_windows table
     await conn.execute(text("""
         CREATE TABLE IF NOT EXISTS calibration_windows (

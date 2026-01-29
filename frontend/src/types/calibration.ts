@@ -11,6 +11,11 @@
 /**
  * Indicator weight configuration.
  * Maps indicator names to their weight values (0.0 to 2.5).
+ *
+ * Direction parameters (_dir suffix) control signal interpretation:
+ * - +1.0 = mean reversion (oversold = bullish)
+ * - -1.0 = momentum (oversold = bearish continuation)
+ * - 0.0 = neutral/disabled
  */
 export interface WeightMatrix {
   rsi: number;
@@ -25,6 +30,16 @@ export interface WeightMatrix {
   position: number;
   squeeze: number;
   cross?: number;
+  vwap?: number;
+  // Relative strength indicators (vs sector)
+  rel_momentum?: number;
+  rs_ratio?: number;
+  // Signal direction parameters (-1 to +1)
+  // Allows optimizer to flip mean-reversion signals to momentum signals
+  rsi_dir?: number;        // RSI signal direction
+  bollinger_dir?: number;  // Bollinger signal direction
+  position_dir?: number;   // Price position signal direction
+  vwap_dir?: number;       // VWAP signal direction
 }
 
 /**
@@ -38,6 +53,10 @@ export interface CalibrationWeight {
   weight: number;
   sqn_score: number | null;
   stability_passed: boolean;
+  // Overfit detection (added for train/test SQN comparison)
+  overfit_warning?: boolean;  // True if avg_test_sqn < 0.5 * avg_train_sqn
+  avg_train_sqn?: number | null;  // Average in-sample SQN across windows
+  avg_test_sqn?: number | null;   // Average out-of-sample SQN across windows
   calibrated_at: string;
 }
 
@@ -101,6 +120,7 @@ export interface CalibrationProgress {
   weights?: Partial<WeightMatrix>;
   train_sqn?: number;
   test_sqn?: number;
+  gross_sqn?: number;  // Gross SQN (before costs) - shows signal quality
 }
 
 export type CalibrationStage = 
@@ -144,20 +164,29 @@ export interface OptimizationResult {
  * Calibration API response for a single horizon.
  */
 export interface HorizonResult {
-  sqn: number | null;
+  sqn: number | null;            // Net SQN (after transaction costs and slippage)
+  gross_sqn?: number | null;     // Gross SQN (before costs) - shows signal quality
   trades: number;
   weights: Partial<WeightMatrix> | null;
   error: string | null;
+  reduced_confidence?: boolean;  // True if trades < 30 (calibrated but with lower statistical confidence)
+  overfit_warning?: boolean;     // True if test SQN < 50% of train SQN (may be overfitting)
+  avg_train_sqn?: number | null; // Average in-sample SQN across rolling windows
+  avg_test_sqn?: number | null;  // Average out-of-sample SQN across rolling windows
 }
 
 /**
  * Full calibration API response.
+ *
+ * Results are nested by strategy class, then by horizon:
+ * { "directional": { "5": HorizonResult, "21": HorizonResult }, ... }
  */
 export interface CalibrationResponse {
   status: 'complete' | 'error';
   ticker: string;
   horizons?: number[];
-  results?: Record<number, HorizonResult>;
+  strategy_classes?: string[];
+  results?: Record<string, Record<string, HorizonResult>>;
   error?: string;
   error_code?: 'INSUFFICIENT_VOLATILITY' | 'INSUFFICIENT_DATA';
 }
@@ -220,11 +249,20 @@ export const REGIME_STRATEGIES: Record<MarketRegime, string> = {
 // ============================================================================
 
 /**
+ * Available optimizer types for calibration.
+ */
+export type OptimizerType =
+  | 'coordinate_descent'      // Fast, greedy two-pass optimization (default)
+  | 'differential_evolution'  // Global optimizer using scipy
+  | 'hybrid';                 // DE + coordinate descent refinement
+
+/**
  * Request to start calibration.
  */
 export interface CalibrationRequest {
   ticker: string;
   horizons?: number[];  // Default: [3, 15]
+  optimizer?: OptimizerType; // Default: 'coordinate_descent'
 }
 
 /**
@@ -243,11 +281,38 @@ export interface WeightsResponse {
  */
 export interface BatchWeightsResponse {
   horizon: number;
+  strategy_class?: string; // 'all', 'directional', 'premium_sell', 'premium_buy'
   tickers: Record<string, {
     weights: WeightMatrix;
     is_default: boolean;
     sqn: number | null;
     updated_at: string | null;
   }>;
+}
+
+// ============================================================================
+// Resonance Types
+// ============================================================================
+
+export interface HorizonResonanceResult {
+  horizon: number;
+  ic: number;
+  ic_t_stat: number;
+  avg_return: number;
+  hit_rate: number;
+  signal_coverage: number;
+  is_significant: boolean;
+}
+
+export interface ResonanceResponse {
+  ticker: string;
+  horizons_tested: number;
+  heatmap: Record<number, HorizonResonanceResult>;
+  top_horizons: number[];
+  recommended: {
+    short: number | null;
+    medium: number | null;
+    long: number | null;
+  };
 }
 

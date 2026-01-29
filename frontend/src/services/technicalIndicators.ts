@@ -1082,6 +1082,336 @@ export function detectDivergence(history: HistoryPoint[], lookback: number = 20)
 }
 
 // ============================================================================
+// Anchored VWAP (Auto-Anchored)
+// ============================================================================
+
+import type { AVWAPResult, MFIResult, ChandelierResult, OBVResult } from '../types';
+
+/**
+ * Find swing points (local highs/lows) in the history data.
+ */
+function findSwingPoints(history: HistoryPoint[], lookback: number = 5): {
+  swingHighs: { index: number; price: number; date: string }[];
+  swingLows: { index: number; price: number; date: string }[];
+} {
+  const swingHighs: { index: number; price: number; date: string }[] = [];
+  const swingLows: { index: number; price: number; date: string }[] = [];
+
+  for (let i = lookback; i < history.length - lookback; i++) {
+    const current = history[i];
+    let isSwingHigh = true;
+    let isSwingLow = true;
+
+    for (let j = 1; j <= lookback; j++) {
+      if (history[i - j].high >= current.high || history[i + j].high >= current.high) {
+        isSwingHigh = false;
+      }
+      if (history[i - j].low <= current.low || history[i + j].low <= current.low) {
+        isSwingLow = false;
+      }
+    }
+
+    if (isSwingHigh) {
+      swingHighs.push({ index: i, price: current.high, date: current.date });
+    }
+    if (isSwingLow) {
+      swingLows.push({ index: i, price: current.low, date: current.date });
+    }
+  }
+
+  return { swingHighs, swingLows };
+}
+
+/**
+ * Calculate Anchored VWAP with auto-detection of anchor point.
+ *
+ * For uptrends: Anchors from most recent significant swing low
+ * For downtrends: Anchors from most recent significant swing high
+ *
+ * AVWAP shows the average price paid by all holders since the anchor.
+ * - Price > AVWAP: Recent buyers are profitable (support level)
+ * - Price < AVWAP: Recent buyers are underwater (resistance level)
+ */
+export function calculateAVWAP(history: HistoryPoint[]): AVWAPResult | null {
+  if (history.length < 10) return null;
+
+  const currentPrice = history[history.length - 1].close;
+  const { swingHighs, swingLows } = findSwingPoints(history, 3);
+
+  // Determine current trend direction using recent price action
+  const recentPrices = history.slice(-10).map(h => h.close);
+  const startPrice = recentPrices[0];
+  const endPrice = recentPrices[recentPrices.length - 1];
+  const isUptrend = endPrice > startPrice;
+
+  // Select anchor point based on trend
+  let anchorIndex: number;
+  let anchorType: 'swing_low' | 'swing_high';
+  let anchorDate: string;
+
+  if (isUptrend && swingLows.length > 0) {
+    // Uptrend: anchor from most recent swing low
+    const recentSwingLow = swingLows[swingLows.length - 1];
+    anchorIndex = recentSwingLow.index;
+    anchorType = 'swing_low';
+    anchorDate = recentSwingLow.date;
+  } else if (!isUptrend && swingHighs.length > 0) {
+    // Downtrend: anchor from most recent swing high
+    const recentSwingHigh = swingHighs[swingHighs.length - 1];
+    anchorIndex = recentSwingHigh.index;
+    anchorType = 'swing_high';
+    anchorDate = recentSwingHigh.date;
+  } else {
+    // Fallback: use the start of the period
+    anchorIndex = 0;
+    anchorType = isUptrend ? 'swing_low' : 'swing_high';
+    anchorDate = history[0].date;
+  }
+
+  // Calculate VWAP from anchor point
+  let cumulativeTPV = 0;
+  let cumulativeVolume = 0;
+
+  for (let i = anchorIndex; i < history.length; i++) {
+    const h = history[i];
+    if (h.volume === 0) continue;
+
+    const typicalPrice = (h.high + h.low + h.close) / 3;
+    cumulativeTPV += typicalPrice * h.volume;
+    cumulativeVolume += h.volume;
+  }
+
+  if (cumulativeVolume === 0) return null;
+
+  const avwap = cumulativeTPV / cumulativeVolume;
+  const priceVsAvwap = ((currentPrice - avwap) / avwap) * 100;
+  const isAbove = currentPrice > avwap;
+
+  return {
+    value: Math.round(avwap * 100) / 100,
+    anchorDate,
+    anchorType,
+    priceVsAvwap: Math.round(priceVsAvwap * 100) / 100,
+    status: isAbove ? 'support' : 'resistance',
+    isAbove
+  };
+}
+
+// ============================================================================
+// Money Flow Index (MFI) with Divergence Detection
+// ============================================================================
+
+/**
+ * Calculate Money Flow Index (MFI).
+ *
+ * MFI is like RSI but incorporates volume. It measures buying/selling pressure.
+ *
+ * - MFI < 20: Oversold (potential buying opportunity)
+ * - MFI > 80: Overbought (potential selling opportunity)
+ */
+export function calculateMFI(history: HistoryPoint[], period: number = 14): MFIResult | null {
+  if (history.length < period + 1) return null;
+
+  // Use only the most recent `period + 1` candles for a focused calculation
+  const recentHistory = history.slice(-(period + 1));
+
+  let positiveFlow = 0;
+  let negativeFlow = 0;
+
+  for (let i = 1; i < recentHistory.length; i++) {
+    const current = recentHistory[i];
+    const previous = recentHistory[i - 1];
+
+    const currentTP = (current.high + current.low + current.close) / 3;
+    const previousTP = (previous.high + previous.low + previous.close) / 3;
+    const rawMoneyFlow = currentTP * current.volume;
+
+    if (currentTP > previousTP) {
+      positiveFlow += rawMoneyFlow;
+    } else if (currentTP < previousTP) {
+      negativeFlow += rawMoneyFlow;
+    }
+    // If equal, money flow is neutral and not counted
+  }
+
+  // Calculate MFI
+  let mfi: number;
+  if (negativeFlow === 0 && positiveFlow === 0) {
+    mfi = 50; // Neutral if no flow
+  } else if (negativeFlow === 0) {
+    mfi = 100; // All positive flow
+  } else if (positiveFlow === 0) {
+    mfi = 0; // All negative flow
+  } else {
+    const moneyRatio = positiveFlow / negativeFlow;
+    mfi = 100 - (100 / (1 + moneyRatio));
+  }
+
+  const isOversold = mfi < 20;
+  const isOverbought = mfi > 80;
+
+  // Simple status determination based on MFI value only
+  let status: MFIResult['status'] = 'neutral';
+  if (isOversold) {
+    status = 'bullish_reversal';
+  } else if (isOverbought) {
+    status = 'bearish_reversal';
+  }
+
+  return {
+    value: Math.round(mfi * 100) / 100,
+    status,
+    hasDivergence: false,  // Simplified - no divergence detection
+    divergenceType: 'none',
+    isOversold,
+    isOverbought
+  };
+}
+
+// ============================================================================
+// On-Balance Volume (OBV) - Accumulation/Distribution Detection
+// ============================================================================
+
+/**
+ * Calculate On-Balance Volume (OBV) with divergence detection.
+ *
+ * OBV is a cumulative indicator that adds volume on up days and subtracts on down days.
+ * It reveals whether volume is flowing into or out of a stock.
+ *
+ * Key signals:
+ * - Price flat/down but OBV rising = Accumulation (institutions buying)
+ * - Price flat/up but OBV falling = Distribution (institutions selling)
+ * - OBV confirms price trend = Trend is healthy
+ */
+export function calculateOBV(history: HistoryPoint[], lookbackPeriod: number = 14): OBVResult | null {
+  if (history.length < lookbackPeriod + 1) return null;
+
+  // Calculate cumulative OBV for the entire history
+  const obvValues: number[] = [0];
+  for (let i = 1; i < history.length; i++) {
+    const current = history[i];
+    const previous = history[i - 1];
+    let obv = obvValues[i - 1];
+
+    if (current.close > previous.close) {
+      obv += current.volume;
+    } else if (current.close < previous.close) {
+      obv -= current.volume;
+    }
+    // If close equals previous close, OBV stays the same
+    obvValues.push(obv);
+  }
+
+  // Analyze the lookback period
+  const startIdx = history.length - lookbackPeriod - 1;
+  const endIdx = history.length - 1;
+
+  const startOBV = obvValues[startIdx];
+  const endOBV = obvValues[endIdx];
+  const startPrice = history[startIdx].close;
+  const endPrice = history[endIdx].close;
+
+  // Calculate percentage changes
+  const obvChange = startOBV !== 0 ? ((endOBV - startOBV) / Math.abs(startOBV)) * 100 : (endOBV > 0 ? 100 : -100);
+  const priceChange = ((endPrice - startPrice) / startPrice) * 100;
+
+  // Detect divergence
+  let hasDivergence = false;
+  let divergenceType: 'bullish' | 'bearish' | 'none' = 'none';
+
+  // Bullish divergence: Price down/flat but OBV up (accumulation despite price weakness)
+  if (priceChange < 2 && obvChange > 10) {
+    hasDivergence = true;
+    divergenceType = 'bullish';
+  }
+
+  // Bearish divergence: Price up/flat but OBV down (distribution despite price strength)
+  if (priceChange > -2 && obvChange < -10) {
+    hasDivergence = true;
+    divergenceType = 'bearish';
+  }
+
+  // Determine trend
+  let trend: OBVResult['trend'] = 'neutral';
+  if (obvChange > 5) {
+    trend = 'accumulation';
+  } else if (obvChange < -5) {
+    trend = 'distribution';
+  }
+
+  // Calculate trend strength (0-100)
+  const trendStrength = Math.min(100, Math.abs(obvChange));
+
+  return {
+    trend,
+    trendStrength: Math.round(trendStrength),
+    obvChange: Math.round(obvChange * 100) / 100,
+    priceChange: Math.round(priceChange * 100) / 100,
+    hasDivergence,
+    divergenceType
+  };
+}
+
+// ============================================================================
+// Chandelier Exit (ATR Trailing Stop)
+// ============================================================================
+
+/**
+ * Calculate Chandelier Exit trailing stop.
+ *
+ * The Chandelier Exit uses ATR to set a trailing stop that adapts to volatility.
+ * - Stop = Highest High (22 periods) - ATR * 3
+ * - If price is above stop, trend is "intact"
+ * - If price falls below stop, trend is "broken"
+ *
+ * This helps beginners know when to hold vs when to consider exiting.
+ */
+export function calculateChandelierExit(
+  history: HistoryPoint[],
+  period: number = 22,
+  multiplier: number = 3
+): ChandelierResult | null {
+  if (history.length < period) return null;
+
+  const currentPrice = history[history.length - 1].close;
+  const recentHistory = history.slice(-period);
+
+  // Find highest high in period
+  const highestHigh = Math.max(...recentHistory.map(h => h.high));
+
+  // Calculate ATR (Average True Range)
+  const trueRanges: number[] = [];
+  for (let i = 1; i < recentHistory.length; i++) {
+    const current = recentHistory[i];
+    const previous = recentHistory[i - 1];
+
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(current.high - previous.close),
+      Math.abs(current.low - previous.close)
+    );
+    trueRanges.push(tr);
+  }
+
+  if (trueRanges.length === 0) return null;
+
+  const atr = trueRanges.reduce((sum, tr) => sum + tr, 0) / trueRanges.length;
+
+  // Calculate Chandelier Exit (trailing stop)
+  const stopPrice = highestHigh - (atr * multiplier);
+  const distanceToStop = ((currentPrice - stopPrice) / currentPrice) * 100;
+  const status = currentPrice > stopPrice ? 'intact' : 'broken';
+
+  return {
+    stopPrice: Math.round(stopPrice * 100) / 100,
+    atr: Math.round(atr * 100) / 100,
+    highestHigh: Math.round(highestHigh * 100) / 100,
+    status,
+    distanceToStop: Math.round(distanceToStop * 100) / 100
+  };
+}
+
+// ============================================================================
 // Aggregate Technical Indicators
 // ============================================================================
 
@@ -1099,6 +1429,10 @@ export interface TechnicalIndicators {
   crossPattern: CrossPatternResult | null;
   cmf: CMFResult | null;              // Chaikin Money Flow (accumulation/distribution)
   divergence: DivergenceResult | null; // Price-volume divergence detection
+  avwap: AVWAPResult | null;          // Anchored VWAP
+  mfi: MFIResult | null;              // Money Flow Index with divergence
+  obv: OBVResult | null;              // On-Balance Volume (accumulation/distribution)
+  chandelier: ChandelierResult | null; // Chandelier Exit trailing stop
   sma20: number | null;
   sma50: number | null;
   sma200: number | null;
@@ -1116,7 +1450,7 @@ export function calculateAllIndicators(
   low52w: number | null
 ): TechnicalIndicators {
   const prices = getClosePrices(history);
-  
+
   return {
     rsi: calculateRSI(history),
     macd: calculateMACD(history),
@@ -1131,6 +1465,10 @@ export function calculateAllIndicators(
     crossPattern: detectCrossPatterns(history),
     cmf: calculateCMF(history),
     divergence: detectDivergence(history),
+    avwap: calculateAVWAP(history),
+    mfi: calculateMFI(history),
+    obv: calculateOBV(history),
+    chandelier: calculateChandelierExit(history),
     sma20: calculateSMA(prices, 20),
     sma50: calculateSMA(prices, 50),
     sma200: calculateSMA(prices, 200),

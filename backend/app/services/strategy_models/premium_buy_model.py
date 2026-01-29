@@ -51,6 +51,8 @@ class PremiumBuyModel(BaseStrategyModel):
         'adx',        # Trend strength for continuation
         'macd',       # Momentum divergence
         'cmf',        # Money flow for direction
+        'rel_momentum',  # Relative strength vs sector
+        'rs_ratio',      # RRG-style relative strength
     ]
 
     # Weights tuned for premium buying (breakout trading)
@@ -66,6 +68,8 @@ class PremiumBuyModel(BaseStrategyModel):
         'sma': 0.8,
         'position': 0.6,  # Less important for breakouts
         'squeeze': 2.0,   # Squeeze is the primary setup
+        'rel_momentum': 1.2,  # Sector outperformance = breakout confirmation
+        'rs_ratio': 1.2,      # RRG relative strength
     }
 
     # Minimum win/loss ratio for profitable options buying

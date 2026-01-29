@@ -526,3 +526,70 @@ export async function clearPriceHistory(
   const response = await fetch(url, { method: 'DELETE' });
   return handleResponse<ClearResult>(response);
 }
+
+// ============================================================================
+// Portfolio Export/Import
+// ============================================================================
+
+export interface PortfolioExport {
+  exported_at: string;
+  version: string;
+  portfolio: {
+    name: string;
+    total_value: number;
+    chart_period: string;
+    sort_field: string;
+    sort_direction: string;
+  };
+  holdings: Array<{
+    ticker: string;
+    shares: number;
+    avg_cost: number | null;
+    is_pinned: boolean;
+  }>;
+  option_holdings: Array<{
+    underlying_ticker: string;
+    option_type: string;
+    position_type: string;
+    strike_price: number;
+    expiration_date: string | null;
+    contracts: number;
+    premium_per_contract: number | null;
+    notes: string | null;
+  }>;
+}
+
+export interface ImportResult {
+  status: string;
+  holdings_imported: number;
+  options_imported: number;
+  cleared_existing: boolean;
+}
+
+/**
+ * Export portfolio holdings to JSON for backup.
+ */
+export async function exportPortfolio(): Promise<PortfolioExport> {
+  const response = await fetch(`${API_BASE}/portfolio/export`);
+  return handleResponse<PortfolioExport>(response);
+}
+
+/**
+ * Import portfolio holdings from a backup JSON.
+ * @param data - The exported portfolio data
+ * @param clearExisting - If true, clears existing holdings before import
+ */
+export async function importPortfolio(
+  data: PortfolioExport,
+  clearExisting = true
+): Promise<ImportResult> {
+  const response = await fetch(
+    `${API_BASE}/portfolio/import?clear_existing=${clearExisting}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }
+  );
+  return handleResponse<ImportResult>(response);
+}

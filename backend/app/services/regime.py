@@ -17,8 +17,11 @@ Regime States:
 
 import numpy as np
 import pandas as pd
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from enum import Enum
+
+if TYPE_CHECKING:
+    from .optimization_params import OptimizationParams
 
 
 class MarketRegime(str, Enum):
@@ -238,19 +241,27 @@ def is_mean_reversion_safe(regime: str) -> bool:
         return False
 
 
-def get_regime_weight_adjustments(regime: str) -> dict:
+def get_regime_weight_adjustments(regime: str, params: 'OptimizationParams' = None) -> dict:
     """
     Get weight adjustments for a specific regime.
-    
+
     In un-tradeable regimes (BEAR_VOLATILE), force cash for mean reversion
     strategies by zeroing out their weights.
-    
+
     Args:
         regime: MarketRegime value
-        
+        params: Optional OptimizationParams with custom regime adjustments
+
     Returns:
         Dict of indicator weight multipliers (0.0 = disable, 1.0 = normal)
     """
+    # If params provided and has custom regime adjustments, use them
+    if params is not None:
+        adjustments = params.regime_adjustments.get_adjustments(regime)
+        if adjustments:
+            return adjustments
+
+    # Default hardcoded adjustments (backward compatibility)
     if regime == MarketRegime.BEAR_VOLATILE.value:
         # Crash mode: Zero out mean reversion indicators
         return {
@@ -263,8 +274,11 @@ def get_regime_weight_adjustments(regime: str) -> dict:
             'adx': 1.0,
             'momentum': 1.0,
             'sma': 1.0,
+            'volume': 1.0,
+            'rvol': 1.0,
+            'squeeze': 1.0,
         }
-    
+
     elif regime == MarketRegime.BEAR_QUIET.value:
         # Slow bleed: Reduce mean reversion, favor trend
         return {
@@ -273,8 +287,14 @@ def get_regime_weight_adjustments(regime: str) -> dict:
             'macd': 1.2,
             'adx': 1.0,
             'momentum': 1.0,
+            'cmf': 1.0,
+            'position': 0.5,
+            'sma': 1.0,
+            'volume': 1.0,
+            'rvol': 1.0,
+            'squeeze': 1.0,
         }
-    
+
     elif regime == MarketRegime.NEUTRAL_CHOP.value:
         # Range trading: Boost mean reversion
         return {
@@ -284,18 +304,61 @@ def get_regime_weight_adjustments(regime: str) -> dict:
             'macd': 0.5,  # MACD whipsaws in chop
             'adx': 0.5,
             'momentum': 0.5,
+            'position': 1.2,
+            'sma': 0.5,
+            'volume': 1.0,
+            'rvol': 1.0,
+            'squeeze': 1.0,
         }
-    
-    elif regime in (MarketRegime.BULL_QUIET.value, MarketRegime.BULL_VOLATILE.value):
-        # Bull markets: Standard weights, slight trend bias
+
+    elif regime == MarketRegime.NEUTRAL_VOLATILE.value:
+        # Breakout imminent - standard weights
         return {
-            'rsi': 0.8 if regime == MarketRegime.BULL_QUIET.value else 1.2,
-            'bollinger': 0.8 if regime == MarketRegime.BULL_QUIET.value else 1.2,
+            'rsi': 1.0,
+            'bollinger': 1.0,
+            'cmf': 1.0,
+            'macd': 1.0,
+            'adx': 1.0,
+            'momentum': 1.0,
+            'position': 1.0,
+            'sma': 1.0,
+            'volume': 1.0,
+            'rvol': 1.0,
+            'squeeze': 1.0,
+        }
+
+    elif regime == MarketRegime.BULL_QUIET.value:
+        # Steady uptrend - reduce MR, favor trend
+        return {
+            'rsi': 0.8,
+            'bollinger': 0.8,
             'macd': 1.2,
             'adx': 1.0,
             'momentum': 1.0,
+            'cmf': 1.0,
+            'position': 0.8,
+            'sma': 1.0,
+            'volume': 1.0,
+            'rvol': 1.0,
+            'squeeze': 1.0,
         }
-    
+
+    elif regime == MarketRegime.BULL_VOLATILE.value:
+        # Uptrend with shakeouts - MR works on dips
+        return {
+            'rsi': 1.2,
+            'bollinger': 1.2,
+            'macd': 1.2,
+            'adx': 1.0,
+            'momentum': 1.0,
+            'cmf': 1.0,
+            'position': 1.0,
+            'sma': 1.0,
+            'volume': 1.0,
+            'rvol': 1.0,
+            'squeeze': 1.0,
+        }
+
     # Default: no adjustment
     return {}
 

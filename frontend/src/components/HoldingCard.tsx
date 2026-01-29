@@ -1,12 +1,14 @@
 import { useMemo, useState } from 'react';
 import { Trash2, BarChart3, RefreshCw, TrendingUp, TrendingDown, Activity, RotateCcw, Pin } from 'lucide-react';
 import type { Holding, HistoryPoint } from '../types';
-import { PositionEditor, MiniStockChart, DualActionScoreBadge } from './holding';
+import { PositionEditor, MiniStockChart, DualActionScoreBadge, PeriodHighLow } from './holding';
+import type { ChartPeriod } from './ChartPeriodSelector';
 
 interface HoldingCardProps {
   holding: Holding;
   history: HistoryPoint[];
   referenceClose: number | null;
+  chartPeriod: ChartPeriod;
   isDataComplete?: boolean;
   expectedStart?: string | null;
   actualStart?: string | null;
@@ -23,14 +25,15 @@ interface HoldingCardProps {
   low52w?: number | null;
 }
 
-export function HoldingCard({ 
-  holding, 
-  history, 
+export function HoldingCard({
+  holding,
+  history,
   referenceClose,
+  chartPeriod,
   isDataComplete = true,
   expectedStart,
   actualStart,
-  onDelete, 
+  onDelete,
   onSelect,
   onAnalyze,
   onUpdatePosition,
@@ -184,6 +187,13 @@ export function HoldingCard({
         gainLossPct={holding.gain_loss_pct}
         onSave={onUpdatePosition}
       />
+
+      {/* Period High/Low */}
+      {history.length > 0 && (
+        <div className="flex justify-center mb-2">
+          <PeriodHighLow history={history} currentPrice={holding.current_price} period={chartPeriod} />
+        </div>
+      )}
 
       {/* Mini chart */}
       <MiniStockChart

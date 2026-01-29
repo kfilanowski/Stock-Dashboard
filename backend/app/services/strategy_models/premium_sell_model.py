@@ -47,6 +47,8 @@ class PremiumSellModel(BaseStrategyModel):
         'position',  # Price position in range
         'squeeze',   # Volatility expansion = rich premiums
         'volume',    # Volume confirmation
+        'rel_momentum',  # Relative strength vs sector
+        'rs_ratio',      # RRG-style relative strength
     ]
 
     # Weights tuned for premium selling
@@ -62,6 +64,8 @@ class PremiumSellModel(BaseStrategyModel):
         'sma': 0.6,       # Trend less important
         'position': 1.5,  # Position in range very important
         'squeeze': 1.6,   # Volatility expansion = rich premiums
+        'rel_momentum': 0.8,  # Relative strength (less important for premium)
+        'rs_ratio': 0.8,      # RRG relative strength
     }
 
     # Target win rate for premium selling
