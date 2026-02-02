@@ -514,12 +514,6 @@ MIT License - See LICENSE file for details.
 - **Market Regime Classification** inspired by [Keller & Putten's "Generalized Momentum and Timing"](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2606884)
 - **Technical Analysis** fundamentals from [Murphy's "Technical Analysis of the Financial Markets"](https://www.amazon.com/Technical-Analysis-Financial-Markets-Comprehensive/dp/0735200661)
 
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/yourusername/stock-dashboard/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/stock-dashboard/discussions)
-- **Documentation**: See [CLAUDE.md](CLAUDE.md) for detailed development guidelines
-
 ---
 
 **Disclaimer**: This software is for educational and research purposes only. Not financial advice. Past performance does not guarantee future results. Trade at your own risk.
