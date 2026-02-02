@@ -277,16 +277,29 @@ export interface WeightsResponse {
 }
 
 /**
+ * Strategy-specific weights data.
+ */
+export interface StrategyWeightsData {
+  weights: WeightMatrix;
+  is_default: boolean;
+  sqn: number | null;
+  updated_at: string | null;
+}
+
+/**
  * Batch weights response.
+ * When multiple strategy classes are requested, each ticker includes a 'strategies' object.
  */
 export interface BatchWeightsResponse {
   horizon: number;
-  strategy_class?: string; // 'all', 'directional', 'premium_sell', 'premium_buy'
+  strategy_class?: string; // 'all', 'directional', 'premium_sell', 'premium_buy', or comma-separated list
   tickers: Record<string, {
     weights: WeightMatrix;
     is_default: boolean;
     sqn: number | null;
     updated_at: string | null;
+    // Present when multiple strategy classes requested
+    strategies?: Record<string, StrategyWeightsData>;
   }>;
 }
 

@@ -1301,7 +1301,7 @@ async def stream_calibration(
 async def get_calibration_weights_batch(
     tickers: str,  # Comma-separated list
     horizon: int = 3,
-    strategy_class: str = 'all',  # 'all', 'directional', 'premium_sell', 'premium_buy'
+    strategy_class: str = 'all',  # 'all', 'directional', 'premium_sell', 'premium_buy', or comma-separated list
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -1312,42 +1312,94 @@ async def get_calibration_weights_batch(
     Args:
         tickers: Comma-separated list of ticker symbols
         horizon: Trading horizon (3 or 15)
-        strategy_class: Strategy class to load weights for ('all', 'directional', 'premium_sell', 'premium_buy')
+        strategy_class: Strategy class(es) to load weights for. Can be:
+            - Single: 'all', 'directional', 'premium_sell', 'premium_buy'
+            - Multiple: 'directional,premium_sell,premium_buy' (comma-separated)
+
+    When multiple strategy classes are requested, returns a nested structure with
+    weights for each strategy class per ticker.
 
     NOTE: This endpoint must be defined BEFORE /{ticker} to avoid path matching issues.
     """
     ticker_list = [t.strip().upper() for t in tickers.split(",")]
 
+    # Check if multiple strategy classes requested
+    strategy_classes = [s.strip() for s in strategy_class.split(",")]
+    multiple_strategies = len(strategy_classes) > 1
+
     results = {}
     for ticker in ticker_list:
-        weights = await load_calibrated_weights(db, ticker, horizon, strategy_class)
+        if multiple_strategies:
+            # Return weights for all requested strategy classes
+            ticker_result = {"strategies": {}}
+            best_sqn = None
 
-        # Get metadata directly from CalibrationWeights (not CalibrationWindow which may be empty)
-        weights_meta = await db.execute(
-            select(
-                func.avg(CalibrationWeights.sqn_score),
-                func.max(CalibrationWeights.updated_at)
+            for strat in strategy_classes:
+                weights = await load_calibrated_weights(db, ticker, horizon, strat)
+
+                # Get metadata for this strategy
+                weights_meta = await db.execute(
+                    select(
+                        func.avg(CalibrationWeights.sqn_score),
+                        func.max(CalibrationWeights.updated_at)
+                    )
+                    .where(CalibrationWeights.ticker == ticker)
+                    .where(CalibrationWeights.horizon == horizon)
+                    .where(CalibrationWeights.strategy_class == strat)
+                )
+                meta = weights_meta.one()
+                avg_sqn, last_updated = meta
+
+                sqn_value = None
+                if avg_sqn is not None and weights:
+                    if math.isfinite(avg_sqn):
+                        sqn_value = float(avg_sqn)
+                        if best_sqn is None or sqn_value > best_sqn:
+                            best_sqn = sqn_value
+
+                ticker_result["strategies"][strat] = {
+                    "weights": weights or DEFAULT_WEIGHTS,
+                    "is_default": weights is None,
+                    "sqn": sqn_value,
+                    "updated_at": last_updated.isoformat() if last_updated and weights else None
+                }
+
+            # Also include the directional weights at top level for backward compatibility
+            directional_data = ticker_result["strategies"].get("directional", {})
+            ticker_result["weights"] = directional_data.get("weights", DEFAULT_WEIGHTS)
+            ticker_result["is_default"] = directional_data.get("is_default", True)
+            ticker_result["sqn"] = best_sqn  # Best SQN across all strategies
+            ticker_result["updated_at"] = directional_data.get("updated_at")
+
+            results[ticker] = ticker_result
+        else:
+            # Single strategy class (original behavior)
+            strat = strategy_classes[0]
+            weights = await load_calibrated_weights(db, ticker, horizon, strat)
+
+            weights_meta = await db.execute(
+                select(
+                    func.avg(CalibrationWeights.sqn_score),
+                    func.max(CalibrationWeights.updated_at)
+                )
+                .where(CalibrationWeights.ticker == ticker)
+                .where(CalibrationWeights.horizon == horizon)
+                .where(CalibrationWeights.strategy_class == strat)
             )
-            .where(CalibrationWeights.ticker == ticker)
-            .where(CalibrationWeights.horizon == horizon)
-            .where(CalibrationWeights.strategy_class == strategy_class)
-        )
-        meta = weights_meta.one()
-        avg_sqn, last_updated = meta
+            meta = weights_meta.one()
+            avg_sqn, last_updated = meta
 
-        # Handle -inf/inf/nan values which are not JSON compliant
-        sqn_value = None
-        if avg_sqn is not None and weights:
-            if math.isfinite(avg_sqn):
-                sqn_value = float(avg_sqn)
-            # else: leave as None for -inf/inf/nan
+            sqn_value = None
+            if avg_sqn is not None and weights:
+                if math.isfinite(avg_sqn):
+                    sqn_value = float(avg_sqn)
 
-        results[ticker] = {
-            "weights": weights or DEFAULT_WEIGHTS,
-            "is_default": weights is None,
-            "sqn": sqn_value,
-            "updated_at": last_updated.isoformat() if last_updated and weights else None
-        }
+            results[ticker] = {
+                "weights": weights or DEFAULT_WEIGHTS,
+                "is_default": weights is None,
+                "sqn": sqn_value,
+                "updated_at": last_updated.isoformat() if last_updated and weights else None
+            }
 
     return {
         "horizon": horizon,

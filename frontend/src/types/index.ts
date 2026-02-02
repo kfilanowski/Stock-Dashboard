@@ -347,3 +347,27 @@ export interface ChandelierResult {
   status: 'intact' | 'broken';      // Trend status
   distanceToStop: number;           // Percentage from current price to stop
 }
+
+// ============================================================================
+// Support/Resistance Types
+// ============================================================================
+
+/**
+ * Support or Resistance level with multi-factor analysis.
+ *
+ * Strength Interpretation:
+ * - 0.8-1.0: Very reliable (multi-touch + volume + rejections)
+ * - 0.5-0.7: Moderately reliable
+ * - 0.3-0.5: Speculative
+ * - <0.3: Weak (single touch, no confirmation)
+ */
+export interface SupportResistanceLevel {
+  price: number;
+  type: 'support' | 'resistance';
+  strength: number;         // 0-1, multi-factor scoring
+  touches: number;          // Number of times price touched this level
+  avgVolumeRatio?: number;  // Average volume at touches vs baseline
+  rejectionCount?: number;  // Number of rejection patterns
+  hasRoleReversal?: boolean; // Previously broken level acting as new S/R
+  lastTouchDate?: string;   // Date of most recent touch
+}

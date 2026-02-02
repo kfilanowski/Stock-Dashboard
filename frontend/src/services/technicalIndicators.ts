@@ -1090,7 +1090,7 @@ import type { AVWAPResult, MFIResult, ChandelierResult, OBVResult } from '../typ
 /**
  * Find swing points (local highs/lows) in the history data.
  */
-function findSwingPoints(history: HistoryPoint[], lookback: number = 5): {
+export function findSwingPoints(history: HistoryPoint[], lookback: number = 5): {
   swingHighs: { index: number; price: number; date: string }[];
   swingLows: { index: number; price: number; date: string }[];
 } {
@@ -1120,6 +1120,700 @@ function findSwingPoints(history: HistoryPoint[], lookback: number = 5): {
   }
 
   return { swingHighs, swingLows };
+}
+
+// ============================================================================
+// Volume Profile Analysis
+// ============================================================================
+
+export interface VolumeProfileNode {
+  priceLevel: number;      // Center price of the bin
+  volume: number;          // Total volume at this level
+  percentOfTotal: number;  // Percentage of total volume
+  isHighVolume: boolean;   // Top 20% volume node
+}
+
+export interface VolumeProfileResult {
+  nodes: VolumeProfileNode[];
+  vpoc: number;            // Volume Point of Control (highest volume price)
+  valueAreaHigh: number;   // Upper bound of 70% volume area
+  valueAreaLow: number;    // Lower bound of 70% volume area
+}
+
+/**
+ * Calculate Volume Profile - distribution of volume across price levels.
+ *
+ * Volume profile shows WHERE trading activity occurred, not just WHEN.
+ * High-volume nodes (HVN) act as magnets - price tends to consolidate there.
+ * Low-volume nodes (LVN) act as barriers - price moves quickly through them.
+ *
+ * @param history - Price history with OHLCV data
+ * @param bins - Number of price bins (default 50)
+ * @returns Volume profile with nodes, VPOC, and value area
+ */
+export function calculateVolumeProfile(history: HistoryPoint[], bins: number = 50): VolumeProfileResult | null {
+  if (history.length < 10) return null;
+
+  // Find price range
+  let minPrice = Infinity;
+  let maxPrice = -Infinity;
+  for (const h of history) {
+    if (h.low < minPrice) minPrice = h.low;
+    if (h.high > maxPrice) maxPrice = h.high;
+  }
+
+  if (maxPrice <= minPrice) return null;
+
+  const binSize = (maxPrice - minPrice) / bins;
+  const volumeByBin: number[] = new Array(bins).fill(0);
+
+  // Distribute each bar's volume across the bins it spans
+  for (const h of history) {
+    if (h.volume <= 0) continue;
+
+    const lowBin = Math.max(0, Math.floor((h.low - minPrice) / binSize));
+    const highBin = Math.min(bins - 1, Math.floor((h.high - minPrice) / binSize));
+    const binsSpanned = highBin - lowBin + 1;
+    const volumePerBin = h.volume / binsSpanned;
+
+    for (let i = lowBin; i <= highBin; i++) {
+      volumeByBin[i] += volumePerBin;
+    }
+  }
+
+  // Calculate total volume
+  const totalVolume = volumeByBin.reduce((sum, v) => sum + v, 0);
+  if (totalVolume === 0) return null;
+
+  // Create nodes
+  const nodes: VolumeProfileNode[] = volumeByBin.map((vol, idx) => ({
+    priceLevel: minPrice + (idx + 0.5) * binSize,
+    volume: vol,
+    percentOfTotal: (vol / totalVolume) * 100,
+    isHighVolume: false // Will be set below
+  }));
+
+  // Mark top 20% as high-volume nodes
+  const sortedByVolume = [...nodes].sort((a, b) => b.volume - a.volume);
+  const topCount = Math.ceil(bins * 0.2);
+  const volumeThreshold = sortedByVolume[topCount - 1]?.volume ?? 0;
+
+  for (const node of nodes) {
+    node.isHighVolume = node.volume >= volumeThreshold && node.volume > 0;
+  }
+
+  // Find VPOC (Volume Point of Control) - highest volume bin
+  const vpocNode = sortedByVolume[0];
+  const vpoc = vpocNode?.priceLevel ?? (minPrice + maxPrice) / 2;
+
+  // Calculate Value Area (70% of volume centered on VPOC)
+  // Start at VPOC and expand outward until we have 70% of volume
+  const vpocIdx = nodes.findIndex(n => n.priceLevel === vpoc);
+  let includedVolume = nodes[vpocIdx]?.volume ?? 0;
+  let lowIdx = vpocIdx;
+  let highIdx = vpocIdx;
+
+  while (includedVolume < totalVolume * 0.7 && (lowIdx > 0 || highIdx < bins - 1)) {
+    const lowVol = lowIdx > 0 ? (nodes[lowIdx - 1]?.volume ?? 0) : 0;
+    const highVol = highIdx < bins - 1 ? (nodes[highIdx + 1]?.volume ?? 0) : 0;
+
+    if (lowVol >= highVol && lowIdx > 0) {
+      lowIdx--;
+      includedVolume += lowVol;
+    } else if (highIdx < bins - 1) {
+      highIdx++;
+      includedVolume += highVol;
+    } else if (lowIdx > 0) {
+      lowIdx--;
+      includedVolume += lowVol;
+    } else {
+      break;
+    }
+  }
+
+  const valueAreaLow = nodes[lowIdx]?.priceLevel ?? minPrice;
+  const valueAreaHigh = nodes[highIdx]?.priceLevel ?? maxPrice;
+
+  return {
+    nodes,
+    vpoc,
+    valueAreaHigh,
+    valueAreaLow
+  };
+}
+
+// ============================================================================
+// Rejection Pattern Detection
+// ============================================================================
+
+export interface RejectionEvent {
+  index: number;
+  date: string;
+  type: 'bullish' | 'bearish';
+  price: number;
+  wickRatio: number;    // Wick size relative to body
+  volumeRatio: number;  // Volume relative to average
+  score: number;        // Combined rejection score (0-1)
+}
+
+/**
+ * Detect rejection patterns (wicks) at a specific price level.
+ *
+ * A rejection occurs when price touches a level but closes away from it:
+ * - Bullish rejection at support: Long lower wick, close in upper half of range
+ * - Bearish rejection at resistance: Long upper wick, close in lower half of range
+ *
+ * @param history - Price history
+ * @param levelPrice - The S/R level price to check
+ * @param tolerance - How close price must be to level (default 1.5%)
+ * @returns Array of rejection events
+ */
+export function detectRejections(
+  history: HistoryPoint[],
+  levelPrice: number,
+  tolerance: number = 0.015
+): RejectionEvent[] {
+  const rejections: RejectionEvent[] = [];
+  if (history.length < 5) return rejections;
+
+  // Calculate average volume for volume ratio
+  const volumes = history.map(h => h.volume).filter(v => v > 0);
+  const avgVolume = volumes.length > 0
+    ? volumes.reduce((sum, v) => sum + v, 0) / volumes.length
+    : 1;
+
+  for (let i = 0; i < history.length; i++) {
+    const h = history[i];
+    const range = h.high - h.low;
+    if (range <= 0) continue;
+
+    const body = Math.abs(h.close - h.open);
+    const upperWick = h.high - Math.max(h.open, h.close);
+    const lowerWick = Math.min(h.open, h.close) - h.low;
+
+    // Check if bar touches the level
+    const distanceToLevel = Math.min(
+      Math.abs(h.high - levelPrice),
+      Math.abs(h.low - levelPrice)
+    );
+
+    if (distanceToLevel / levelPrice > tolerance) continue;
+
+    // Check for rejection patterns
+    const closeInRange = (h.close - h.low) / range; // 0 = closed at low, 1 = closed at high
+    const volumeRatio = avgVolume > 0 ? h.volume / avgVolume : 1;
+
+    let type: 'bullish' | 'bearish' | null = null;
+    let wickRatio = 0;
+
+    // Bullish rejection: touched near the level from below, long lower wick
+    if (h.low <= levelPrice * (1 + tolerance) && h.low >= levelPrice * (1 - tolerance)) {
+      if (lowerWick > body * 1.5 && closeInRange > 0.5) {
+        type = 'bullish';
+        wickRatio = body > 0 ? lowerWick / body : lowerWick / range;
+      }
+    }
+
+    // Bearish rejection: touched near the level from above, long upper wick
+    if (h.high >= levelPrice * (1 - tolerance) && h.high <= levelPrice * (1 + tolerance)) {
+      if (upperWick > body * 1.5 && closeInRange < 0.5) {
+        type = 'bearish';
+        wickRatio = body > 0 ? upperWick / body : upperWick / range;
+      }
+    }
+
+    if (type) {
+      // Score components: wick ratio (50%), volume (30%), body size inverse (20%)
+      const wickScore = Math.min(1, wickRatio / 3) * 0.5;
+      const volScore = Math.min(1, volumeRatio / 2) * 0.3;
+      const bodyScore = body > 0 ? (1 - Math.min(1, body / range)) * 0.2 : 0.2;
+
+      rejections.push({
+        index: i,
+        date: h.date,
+        type,
+        price: type === 'bullish' ? h.low : h.high,
+        wickRatio,
+        volumeRatio,
+        score: wickScore + volScore + bodyScore
+      });
+    }
+  }
+
+  return rejections;
+}
+
+// ============================================================================
+// Role Reversal Detection
+// ============================================================================
+
+export interface RoleReversalLevel {
+  price: number;
+  originalType: 'support' | 'resistance';
+  breakDate: string;
+  retestCount: number;
+  confirmed: boolean;   // At least one successful retest from opposite side
+}
+
+/**
+ * Detect role reversals - when broken support becomes resistance or vice versa.
+ *
+ * This is one of the most reliable S/R patterns:
+ * - Broken support → New resistance (price fails to reclaim)
+ * - Broken resistance → New support (price holds above)
+ *
+ * @param history - Price history
+ * @param levels - Existing S/R levels to check for breaks
+ * @param currentPrice - Current price for reference
+ * @returns Array of role reversal levels
+ */
+export function detectRoleReversals(
+  history: HistoryPoint[],
+  levels: { price: number; type: 'support' | 'resistance' }[],
+  _currentPrice: number
+): RoleReversalLevel[] {
+  const reversals: RoleReversalLevel[] = [];
+  if (history.length < 20) return reversals;
+
+  const tolerance = 0.015; // 1.5% tolerance for level proximity
+
+  for (const level of levels) {
+    let breakIndex: number | null = null;
+    let retestCount = 0;
+    let confirmed = false;
+
+    // Scan for break
+    for (let i = 1; i < history.length; i++) {
+      const prev = history[i - 1];
+      const curr = history[i];
+
+      // Support break: was above, now below
+      if (level.type === 'support') {
+        if (prev.close > level.price && curr.close < level.price * (1 - tolerance)) {
+          breakIndex = i;
+        }
+      }
+      // Resistance break: was below, now above
+      else {
+        if (prev.close < level.price && curr.close > level.price * (1 + tolerance)) {
+          breakIndex = i;
+        }
+      }
+
+      // If broken, look for retests
+      if (breakIndex !== null && i > breakIndex) {
+        const distanceToLevel = Math.abs(curr.close - level.price) / level.price;
+
+        // Check for retest (price returns to level)
+        if (distanceToLevel < tolerance) {
+          retestCount++;
+
+          // Check if retest held (role reversal confirmed)
+          // Support became resistance: price came up to it and fell back
+          if (level.type === 'support' && curr.close < level.price) {
+            confirmed = true;
+          }
+          // Resistance became support: price came down to it and bounced
+          if (level.type === 'resistance' && curr.close > level.price) {
+            confirmed = true;
+          }
+        }
+      }
+    }
+
+    if (breakIndex !== null && retestCount > 0) {
+      reversals.push({
+        price: level.price,
+        originalType: level.type,
+        breakDate: history[breakIndex].date,
+        retestCount,
+        confirmed
+      });
+    }
+  }
+
+  return reversals;
+}
+
+// ============================================================================
+// Enhanced Swing Points (with volume)
+// ============================================================================
+
+export interface EnhancedSwingPoint {
+  index: number;
+  price: number;
+  date: string;
+  type: 'high' | 'low';
+  volume: number;
+  volumeRatio: number;     // Volume vs 20-bar average
+  hasRejection: boolean;   // Whether a rejection pattern exists
+  rejectionScore: number;  // Strength of rejection (0-1)
+}
+
+/**
+ * Find swing points with volume analysis.
+ * Enhanced version that also captures volume significance and rejection patterns.
+ */
+export function findEnhancedSwingPoints(
+  history: HistoryPoint[],
+  lookback: number = 5
+): EnhancedSwingPoint[] {
+  const swings: EnhancedSwingPoint[] = [];
+  if (history.length < lookback * 2 + 1) return swings;
+
+  // Calculate rolling 20-bar average volume
+  const calcAvgVolume = (endIdx: number): number => {
+    const start = Math.max(0, endIdx - 19);
+    let sum = 0;
+    let count = 0;
+    for (let i = start; i <= endIdx; i++) {
+      if (history[i].volume > 0) {
+        sum += history[i].volume;
+        count++;
+      }
+    }
+    return count > 0 ? sum / count : 1;
+  };
+
+  for (let i = lookback; i < history.length - lookback; i++) {
+    const current = history[i];
+    let isSwingHigh = true;
+    let isSwingLow = true;
+
+    for (let j = 1; j <= lookback; j++) {
+      if (history[i - j].high >= current.high || history[i + j].high >= current.high) {
+        isSwingHigh = false;
+      }
+      if (history[i - j].low <= current.low || history[i + j].low <= current.low) {
+        isSwingLow = false;
+      }
+    }
+
+    if (!isSwingHigh && !isSwingLow) continue;
+
+    const avgVolume = calcAvgVolume(i);
+    const volumeRatio = avgVolume > 0 ? current.volume / avgVolume : 1;
+
+    // Check for rejection pattern at this swing
+    const range = current.high - current.low;
+    const body = Math.abs(current.close - current.open);
+    const upperWick = current.high - Math.max(current.open, current.close);
+    const lowerWick = Math.min(current.open, current.close) - current.low;
+
+    let hasRejection = false;
+    let rejectionScore = 0;
+
+    if (range > 0) {
+      if (isSwingHigh && upperWick > body) {
+        // Bearish rejection at swing high
+        hasRejection = true;
+        rejectionScore = Math.min(1, (upperWick / range) * volumeRatio * 0.5);
+      }
+      if (isSwingLow && lowerWick > body) {
+        // Bullish rejection at swing low
+        hasRejection = true;
+        rejectionScore = Math.min(1, (lowerWick / range) * volumeRatio * 0.5);
+      }
+    }
+
+    if (isSwingHigh) {
+      swings.push({
+        index: i,
+        price: current.high,
+        date: current.date,
+        type: 'high',
+        volume: current.volume,
+        volumeRatio,
+        hasRejection,
+        rejectionScore
+      });
+    }
+
+    if (isSwingLow) {
+      swings.push({
+        index: i,
+        price: current.low,
+        date: current.date,
+        type: 'low',
+        volume: current.volume,
+        volumeRatio,
+        hasRejection,
+        rejectionScore
+      });
+    }
+  }
+
+  return swings;
+}
+
+// ============================================================================
+// Support/Resistance Level Detection (Enhanced Multi-Factor)
+// ============================================================================
+
+export interface SupportResistanceLevel {
+  price: number;
+  type: 'support' | 'resistance';
+  strength: number;         // 0-1, multi-factor scoring
+  touches: number;          // Number of times price touched this level
+  avgVolumeRatio?: number;  // Average volume at touches vs baseline
+  rejectionCount?: number;  // Number of rejection patterns
+  hasRoleReversal?: boolean; // Previously broken level acting as new S/R
+  lastTouchDate?: string;   // Date of most recent touch
+}
+
+/**
+ * Calculate Average True Range (ATR) for volatility-based clustering.
+ */
+function calculateATR(history: HistoryPoint[], period: number = 14): number {
+  if (history.length < period + 1) return 0;
+
+  let atr = 0;
+  for (let i = 1; i <= period; i++) {
+    const h = history[history.length - i];
+    const prev = history[history.length - i - 1];
+    const tr = Math.max(
+      h.high - h.low,
+      Math.abs(h.high - prev.close),
+      Math.abs(h.low - prev.close)
+    );
+    atr += tr;
+  }
+  return atr / period;
+}
+
+/**
+ * Calculate support and resistance levels using multi-factor analysis.
+ *
+ * Enhanced detection combining:
+ * 1. Volume Profile - High-volume price nodes
+ * 2. Rejection Patterns - Wick analysis at levels
+ * 3. Volume-Weighted Touches - More weight to high-volume touches
+ * 4. Role Reversal - Track broken levels becoming new S/R
+ * 5. Comprehensive Scoring - Combine all factors (0-1 strength)
+ *
+ * Strength Interpretation:
+ * - 0.8-1.0: Very reliable (multi-touch + volume + rejections)
+ * - 0.5-0.7: Moderately reliable
+ * - 0.3-0.5: Speculative
+ * - <0.3: Weak (single touch, no confirmation)
+ *
+ * @param history - Price history data (minimum 30 days, 60+ recommended)
+ * @param currentPrice - Current price to determine what's above/below
+ * @param maxLevels - Maximum levels per side (default 2)
+ * @param maxDistancePct - Filter out levels beyond this % from current price (default 20)
+ * @param lookback - Swing point lookback parameter (default 5 for daily data)
+ * @param debugTicker - Pass ticker name for debug logging
+ * @returns Object with resistance and support arrays, or null if insufficient data
+ */
+export function calculateSupportResistance(
+  history: HistoryPoint[],
+  currentPrice: number,
+  maxLevels: number = 2,
+  maxDistancePct: number = 20,
+  lookback: number = 5,
+  debugTicker: string | null = null
+): { resistance: SupportResistanceLevel[]; support: SupportResistanceLevel[] } | null {
+  const log = (msg: string) => {
+    if (debugTicker) console.log(`[S/R ${debugTicker}] ${msg}`);
+  };
+
+  // Require at least 30 data points for meaningful S/R detection
+  if (history.length < 30 || currentPrice <= 0) {
+    log(`Insufficient data: ${history.length} points, price=${currentPrice}`);
+    return null;
+  }
+
+  // Step 1: Get enhanced swing points with volume data
+  const swings = findEnhancedSwingPoints(history, lookback);
+
+  log(`Found ${swings.length} swing points from ${history.length} bars`);
+
+  if (swings.length < 2) return null;
+
+  // Step 2: Calculate volume profile for volume-weighted analysis
+  const volumeProfile = calculateVolumeProfile(history, 50);
+  const highVolumeNodes = volumeProfile?.nodes.filter(n => n.isHighVolume) ?? [];
+
+  log(`Volume profile: VPOC=$${volumeProfile?.vpoc.toFixed(2)}, ${highVolumeNodes.length} high-volume nodes`);
+
+  // Step 3: Calculate ATR for volatility-based clustering
+  const atr = calculateATR(history);
+  const avgPrice = history.slice(-20).reduce((sum, h) => sum + h.close, 0) / Math.min(20, history.length);
+
+  // Use ATR-based clustering threshold: ATR * 0.5, bounded between 1% and 4%
+  const atrBasedThreshold = atr > 0 ? (atr * 0.5) / avgPrice : 0.02;
+  const clusterThreshold = Math.max(0.01, Math.min(0.04, atrBasedThreshold));
+
+  log(`ATR=${atr.toFixed(2)}, clustering threshold=${(clusterThreshold * 100).toFixed(1)}%`);
+
+  // Step 4: Cluster swing points into levels
+  interface Cluster {
+    price: number;
+    touches: number;
+    swingPoints: EnhancedSwingPoint[];
+    volumeSum: number;
+    rejectionSum: number;
+    lastTouchIndex: number;
+  }
+
+  const clusters: Cluster[] = [];
+  const totalPoints = history.length;
+
+  for (const swing of swings) {
+    const existingCluster = clusters.find(
+      c => Math.abs(c.price - swing.price) / c.price < clusterThreshold
+    );
+
+    if (existingCluster) {
+      const totalWeight = existingCluster.touches + 1;
+      existingCluster.price = (existingCluster.price * existingCluster.touches + swing.price) / totalWeight;
+      existingCluster.touches++;
+      existingCluster.swingPoints.push(swing);
+      existingCluster.volumeSum += swing.volumeRatio;
+      existingCluster.rejectionSum += swing.rejectionScore;
+      existingCluster.lastTouchIndex = Math.max(existingCluster.lastTouchIndex, swing.index);
+    } else {
+      clusters.push({
+        price: swing.price,
+        touches: 1,
+        swingPoints: [swing],
+        volumeSum: swing.volumeRatio,
+        rejectionSum: swing.rejectionScore,
+        lastTouchIndex: swing.index
+      });
+    }
+  }
+
+  log(`Formed ${clusters.length} clusters from swing points`);
+
+  // Step 5: Add high-volume nodes as potential levels (if not already clustered)
+  for (const hvn of highVolumeNodes) {
+    const nearbyCluster = clusters.find(
+      c => Math.abs(c.price - hvn.priceLevel) / hvn.priceLevel < clusterThreshold
+    );
+
+    if (!nearbyCluster && hvn.percentOfTotal > 3) {
+      // Add as a volume-based level (no swing touch, but high volume)
+      clusters.push({
+        price: hvn.priceLevel,
+        touches: 0, // No swing touches, but volume-significant
+        swingPoints: [],
+        volumeSum: hvn.percentOfTotal / 10, // Normalize to ~0-2 range
+        rejectionSum: 0,
+        lastTouchIndex: totalPoints - 1 // Assume recent relevance
+      });
+      log(`Added HVN level: $${hvn.priceLevel.toFixed(2)} (${hvn.percentOfTotal.toFixed(1)}% volume)`);
+    }
+  }
+
+  // Step 6: Detect role reversals
+  const preliminaryLevels = clusters.map(c => ({
+    price: c.price,
+    type: (c.price > currentPrice ? 'resistance' : 'support') as 'support' | 'resistance'
+  }));
+  const roleReversals = detectRoleReversals(history, preliminaryLevels, currentPrice);
+
+  log(`Found ${roleReversals.length} role reversals, ${roleReversals.filter(r => r.confirmed).length} confirmed`);
+
+  // Step 7: Calculate multi-factor strength for each cluster
+  const resistance: SupportResistanceLevel[] = [];
+  const support: SupportResistanceLevel[] = [];
+
+  for (const cluster of clusters) {
+    const distancePct = Math.abs((cluster.price - currentPrice) / currentPrice) * 100;
+
+    // Skip levels too far from current price
+    if (distancePct > maxDistancePct) continue;
+
+    // Count rejections at this level
+    const rejections = detectRejections(history, cluster.price, clusterThreshold);
+    const rejectionCount = rejections.length;
+
+    // Calculate average volume ratio
+    const avgVolumeRatio = cluster.touches > 0
+      ? cluster.volumeSum / cluster.touches
+      : (volumeProfile?.nodes.find(n => Math.abs(n.priceLevel - cluster.price) / cluster.price < clusterThreshold)?.percentOfTotal ?? 0) / 5;
+
+    // Check for role reversal bonus
+    const roleReversal = roleReversals.find(
+      r => Math.abs(r.price - cluster.price) / cluster.price < clusterThreshold
+    );
+    const hasRoleReversal = roleReversal?.confirmed ?? false;
+
+    // Get last touch date
+    const lastTouchDate = cluster.swingPoints.length > 0
+      ? cluster.swingPoints.reduce((latest, sp) => sp.index > latest.index ? sp : latest, cluster.swingPoints[0]).date
+      : undefined;
+
+    /**
+     * Multi-Factor Strength Scoring:
+     * - touchScore:       min(0.30, touches * 0.10)           // 3+ touches = max
+     * - volumeScore:      min(0.25, avgVolumeRatio * 0.125)   // 2x avg = max
+     * - rejectionScore:   min(0.25, rejectionCount * 0.125)   // 2+ rejections = max
+     * - recencyScore:     0.10 * (lastTouchIndex / totalBars) // Recent = higher
+     * - roleReversalBonus: 0.10 (if confirmed)
+     */
+    const touchScore = Math.min(0.30, cluster.touches * 0.10);
+    const volumeScore = Math.min(0.25, avgVolumeRatio * 0.125);
+    const rejectionScore = Math.min(0.25, rejectionCount * 0.125);
+    const recencyScore = 0.10 * (cluster.lastTouchIndex / totalPoints);
+    const roleReversalBonus = hasRoleReversal ? 0.10 : 0;
+
+    const strength = Math.min(1, touchScore + volumeScore + rejectionScore + recencyScore + roleReversalBonus);
+
+    // Volume-only levels (no touches) need minimum volume significance
+    if (cluster.touches === 0 && avgVolumeRatio < 0.5) continue;
+
+    const level: SupportResistanceLevel = {
+      price: Math.round(cluster.price * 100) / 100,
+      type: cluster.price > currentPrice ? 'resistance' : 'support',
+      strength: Math.round(strength * 100) / 100,
+      touches: cluster.touches,
+      avgVolumeRatio: Math.round(avgVolumeRatio * 100) / 100,
+      rejectionCount,
+      hasRoleReversal,
+      lastTouchDate
+    };
+
+    if (level.type === 'resistance') {
+      resistance.push(level);
+    } else {
+      support.push(level);
+    }
+  }
+
+  // Sort by strength (strongest first), then by proximity as tiebreaker
+  resistance.sort((a, b) => {
+    const strengthDiff = b.strength - a.strength;
+    if (Math.abs(strengthDiff) > 0.05) return strengthDiff;
+    return a.price - b.price; // Closer resistance first
+  });
+
+  support.sort((a, b) => {
+    const strengthDiff = b.strength - a.strength;
+    if (Math.abs(strengthDiff) > 0.05) return strengthDiff;
+    return b.price - a.price; // Closer support first
+  });
+
+  log(`Final: ${resistance.length} resistance, ${support.length} support candidates`);
+
+  const result = {
+    resistance: resistance.slice(0, maxLevels),
+    support: support.slice(0, maxLevels)
+  };
+
+  if (result.resistance.length) {
+    log(`Resistance: ${result.resistance.map(r =>
+      `$${r.price}(${r.touches}x, str=${r.strength}, vol=${r.avgVolumeRatio}, rej=${r.rejectionCount}${r.hasRoleReversal ? ', RR' : ''})`
+    ).join(', ')}`);
+  }
+  if (result.support.length) {
+    log(`Support: ${result.support.map(s =>
+      `$${s.price}(${s.touches}x, str=${s.strength}, vol=${s.avgVolumeRatio}, rej=${s.rejectionCount}${s.hasRoleReversal ? ', RR' : ''})`
+    ).join(', ')}`);
+  }
+
+  return result;
 }
 
 /**

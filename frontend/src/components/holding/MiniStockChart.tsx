@@ -2,6 +2,8 @@ import { useMemo, useEffect, useRef, useState } from 'react';
 import { RefreshCw, Sun, Moon, Sunrise } from 'lucide-react';
 import { LineChart, Line, ResponsiveContainer, Tooltip, ReferenceLine, YAxis, XAxis, ReferenceArea } from 'recharts';
 import type { HistoryPoint } from '../../types';
+import { calculateSupportResistance } from '../../services/technicalIndicators';
+import { useDataCacheContext } from '../../context/DataCacheContext';
 
 
 // Extended hours trading window (4 AM to 8 PM Eastern)
@@ -60,6 +62,7 @@ function getTradingDay(dateStr: string): string {
 
 interface MiniStockChartProps {
   holdingId: number;
+  ticker: string;
   history: HistoryPoint[];
   referenceClose: number | null;
   isDataComplete?: boolean;
@@ -108,6 +111,7 @@ function formatTooltipDate(dateStr: string): string {
 
 export function MiniStockChart({
   holdingId,
+  ticker,
   history,
   referenceClose,
   isDataComplete = true,
@@ -116,6 +120,11 @@ export function MiniStockChart({
   isLoading = false,
   lastPricesFetched
 }: MiniStockChartProps) {
+  // Get extended history for S/R calculations (6-month daily data)
+  // Only use extended history for accuracy - don't fall back to chart history
+  const { extendedHistoryData } = useDataCacheContext();
+  const tickerUpper = ticker.toUpperCase();
+  const extendedHistory = extendedHistoryData.get(tickerUpper)?.history ?? [];
   // Ping animation state - triggers when prices API returns
   const [pingKey, setPingKey] = useState(0);
   const [showPing, setShowPing] = useState(false);
@@ -220,22 +229,46 @@ export function MiniStockChart({
   const isAboveReference = periodGain !== null ? periodGain >= 0 : true;
   const lineColor = isAboveReference ? '#22c55e' : '#ef4444';
 
-  // Calculate Y-axis domain
+  // Calculate support/resistance levels using extended history (6-month daily data)
+  // Only calculate when we have sufficient historical data for accuracy
+  // Requires 60+ days of data for meaningful weekly prediction
+  const supportResistanceLevels = useMemo(() => {
+    if (!history.length) return null;
+    if (extendedHistory.length < 60) {
+      console.log(`[S/R ${tickerUpper}] Not enough extended history: ${extendedHistory.length} points (need 60+)`);
+      return null;
+    }
+
+    const currentPrice = history[history.length - 1].close;
+    console.log(`[S/R ${tickerUpper}] Calculating with ${extendedHistory.length} points, price=${currentPrice.toFixed(2)}`);
+    return calculateSupportResistance(extendedHistory, currentPrice, 2, 20, 5, tickerUpper);
+  }, [history, extendedHistory, tickerUpper]);
+
+  // Calculate support/resistance levels for tooltip (wider range, shows even if off-chart)
+  const supportResistanceLevelsForTooltip = useMemo(() => {
+    if (!history.length) return null;
+    if (extendedHistory.length < 60) return null;
+
+    const currentPrice = history[history.length - 1].close;
+    return calculateSupportResistance(extendedHistory, currentPrice, 1, 100, 5);
+  }, [history, extendedHistory]);
+
+  // Calculate Y-axis domain (don't include S/R levels to avoid squishing)
   const yAxisDomain = useMemo((): [number, number] | [string, string] => {
     if (!history.length) return ['auto', 'auto'];
-    
+
     const closes = history.map(h => h.close).filter(c => c > 0);
     if (!closes.length) return ['auto', 'auto'];
-    
+
     let min = Math.min(...closes);
     let max = Math.max(...closes);
-    
+
     if (referenceClose !== null && referenceClose > 0) {
       min = Math.min(min, referenceClose);
       max = Math.max(max, referenceClose);
     }
-    
-    const padding = (max - min) * 0.05;
+
+    const padding = (max - min) * 0.1;
     return [min - padding, max + padding] as [number, number];
   }, [history, referenceClose]);
 
@@ -319,13 +352,32 @@ export function MiniStockChart({
 
   const CustomTooltip = ({ active, payload }: any) => {
     if (!active || !payload || !payload.length) return null;
-    
+
     const price = payload[0]?.value;
     const gainStr = calculateGainFromRef(price);
     const dateStr = payload[0]?.payload?.date ?? '';
-    
+
+    // Find nearest support and resistance (use wider range for tooltip)
+    const nearestResistance = supportResistanceLevelsForTooltip?.resistance[0];
+    const nearestSupport = supportResistanceLevelsForTooltip?.support[0];
+
+    // Check if these levels are shown on chart (within 20% range)
+    const resistanceOnChart = supportResistanceLevels?.resistance.some(
+      r => r.price === nearestResistance?.price
+    );
+    const supportOnChart = supportResistanceLevels?.support.some(
+      s => s.price === nearestSupport?.price
+    );
+
+    const distToResistance = nearestResistance
+      ? ((nearestResistance.price - price) / price * 100).toFixed(1)
+      : null;
+    const distToSupport = nearestSupport
+      ? ((price - nearestSupport.price) / price * 100).toFixed(1)
+      : null;
+
     return (
-      <div className="bg-[rgba(10,10,15,0.95)] border border-white/10 rounded-lg px-3 py-2 text-xs">
+      <div className="bg-[rgba(10,10,15,0.95)] border border-white/10 rounded-lg px-3 py-2 text-xs z-50 relative">
         <p className="text-white/50">{formatTooltipDate(dateStr)}</p>
         <p className="text-white font-medium mt-1">${price?.toFixed(2)}</p>
         {gainStr && (
@@ -333,13 +385,85 @@ export function MiniStockChart({
             {gainStr} vs prev close
           </p>
         )}
+        {(nearestResistance || nearestSupport) && (
+          <div className="mt-1.5 pt-1.5 border-t border-white/10 space-y-1">
+            {nearestResistance && (
+              <div className="text-orange-400/80">
+                <div className="flex items-center gap-1">
+                  <span>R: ${nearestResistance.price.toFixed(2)}</span>
+                  <span className="text-white/50">(+{distToResistance}%)</span>
+                  {!resistanceOnChart && <span className="text-white/40">(off chart)</span>}
+                </div>
+                <div className="flex items-center gap-1.5 text-[10px] text-white/50 mt-0.5">
+                  <span className={`px-1 rounded ${
+                    nearestResistance.strength >= 0.7 ? 'bg-orange-500/30 text-orange-300' :
+                    nearestResistance.strength >= 0.5 ? 'bg-yellow-500/20 text-yellow-300/80' :
+                    'bg-white/10 text-white/50'
+                  }`}>
+                    {Math.round(nearestResistance.strength * 100)}%
+                  </span>
+                  <span>{nearestResistance.touches}x touch{nearestResistance.touches !== 1 ? 'es' : ''}</span>
+                  {nearestResistance.avgVolumeRatio !== undefined && nearestResistance.avgVolumeRatio > 0 && (
+                    <span className={nearestResistance.avgVolumeRatio >= 1.5 ? 'text-yellow-400/70' : ''}>
+                      {nearestResistance.avgVolumeRatio >= 1.5 ? '📊' : '•'} {nearestResistance.avgVolumeRatio.toFixed(1)}x vol
+                    </span>
+                  )}
+                  {nearestResistance.rejectionCount !== undefined && nearestResistance.rejectionCount > 0 && (
+                    <span className="text-orange-300/70">
+                      ⚡{nearestResistance.rejectionCount} rej
+                    </span>
+                  )}
+                  {nearestResistance.hasRoleReversal && (
+                    <span className="text-purple-400/80" title="Role reversal (broken support became resistance)">
+                      🔄 flip
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+            {nearestSupport && (
+              <div className="text-cyan-400/80">
+                <div className="flex items-center gap-1">
+                  <span>S: ${nearestSupport.price.toFixed(2)}</span>
+                  <span className="text-white/50">(-{distToSupport}%)</span>
+                  {!supportOnChart && <span className="text-white/40">(off chart)</span>}
+                </div>
+                <div className="flex items-center gap-1.5 text-[10px] text-white/50 mt-0.5">
+                  <span className={`px-1 rounded ${
+                    nearestSupport.strength >= 0.7 ? 'bg-cyan-500/30 text-cyan-300' :
+                    nearestSupport.strength >= 0.5 ? 'bg-yellow-500/20 text-yellow-300/80' :
+                    'bg-white/10 text-white/50'
+                  }`}>
+                    {Math.round(nearestSupport.strength * 100)}%
+                  </span>
+                  <span>{nearestSupport.touches}x touch{nearestSupport.touches !== 1 ? 'es' : ''}</span>
+                  {nearestSupport.avgVolumeRatio !== undefined && nearestSupport.avgVolumeRatio > 0 && (
+                    <span className={nearestSupport.avgVolumeRatio >= 1.5 ? 'text-yellow-400/70' : ''}>
+                      {nearestSupport.avgVolumeRatio >= 1.5 ? '📊' : '•'} {nearestSupport.avgVolumeRatio.toFixed(1)}x vol
+                    </span>
+                  )}
+                  {nearestSupport.rejectionCount !== undefined && nearestSupport.rejectionCount > 0 && (
+                    <span className="text-cyan-300/70">
+                      ⚡{nearestSupport.rejectionCount} rej
+                    </span>
+                  )}
+                  {nearestSupport.hasRoleReversal && (
+                    <span className="text-purple-400/80" title="Role reversal (broken resistance became support)">
+                      🔄 flip
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     );
   };
 
   return (
     <>
-      <div className="h-20 mt-2 relative">
+      <div className="h-28 mt-2 relative">
         {isLoading && (
           <div className="absolute top-0 right-0 z-10">
             <RefreshCw className="w-3 h-3 text-accent-cyan/60 animate-spin" />
@@ -375,7 +499,7 @@ export function MiniStockChart({
                 hide 
               />
               <YAxis domain={yAxisDomain} hide />
-              <Tooltip content={<CustomTooltip />} />
+              <Tooltip content={<CustomTooltip />} wrapperStyle={{ zIndex: 50 }} />
               
               {/* Extended hours shading */}
               {extendedHoursRanges.map((range, idx) => (
@@ -389,14 +513,64 @@ export function MiniStockChart({
               ))}
               
               {referenceClose !== null && (
-                <ReferenceLine 
-                  y={referenceClose} 
-                  stroke="rgba(255,255,255,0.35)" 
+                <ReferenceLine
+                  y={referenceClose}
+                  stroke="rgba(255,255,255,0.35)"
                   strokeDasharray="3 3"
                   strokeWidth={1}
                 />
               )}
-              
+
+              {/* Support/Resistance levels - strength affects visual weight */}
+              {supportResistanceLevels?.resistance.map((level, idx) => {
+                // Strength affects: line width (1-2), opacity (0.4-0.9), dash density
+                const width = 1 + level.strength * 1;
+                const opacity = 0.4 + level.strength * 0.5;
+                // Stronger = more dots (shorter gaps): "2 6" (weak) to "3 2" (strong)
+                const dashGap = Math.round(6 - level.strength * 4);
+                const dashLength = Math.round(2 + level.strength * 1);
+                return (
+                  <ReferenceLine
+                    key={`r-${idx}`}
+                    y={level.price}
+                    stroke="#f97316"
+                    strokeDasharray={`${dashLength} ${dashGap}`}
+                    strokeWidth={width}
+                    strokeOpacity={opacity}
+                    label={{
+                      value: `R $${level.price.toFixed(2)}`,
+                      position: 'right',
+                      fill: '#f97316',
+                      fontSize: 9,
+                      opacity: opacity
+                    }}
+                  />
+                );
+              })}
+              {supportResistanceLevels?.support.map((level, idx) => {
+                const width = 1 + level.strength * 1;
+                const opacity = 0.4 + level.strength * 0.5;
+                const dashGap = Math.round(6 - level.strength * 4);
+                const dashLength = Math.round(2 + level.strength * 1);
+                return (
+                  <ReferenceLine
+                    key={`s-${idx}`}
+                    y={level.price}
+                    stroke="#06b6d4"
+                    strokeDasharray={`${dashLength} ${dashGap}`}
+                    strokeWidth={width}
+                    strokeOpacity={opacity}
+                    label={{
+                      value: `S $${level.price.toFixed(2)}`,
+                      position: 'right',
+                      fill: '#06b6d4',
+                      fontSize: 9,
+                      opacity: opacity
+                    }}
+                  />
+                );
+              })}
+
               <Line
                 type="monotone"
                 dataKey="close"
@@ -447,7 +621,7 @@ export function MiniStockChart({
 
       {/* Session Changes Display */}
       {sessionChanges && (sessionChanges.preMarket || sessionChanges.regular || sessionChanges.afterHours) && (
-        <div className="mt-2 grid grid-cols-3 gap-1.5">
+        <div className="mt-2 grid grid-cols-3 gap-1.5 relative z-0">
           <SessionBadge 
             label="Pre" 
             icon={<Sunrise className="w-2.5 h-2.5" />}
@@ -468,7 +642,7 @@ export function MiniStockChart({
 
       {/* Legend */}
       {processedHistory.length > 0 && (
-        <div className="mt-1 flex items-center gap-3 text-[10px] text-white/40">
+        <div className="mt-1 flex items-center gap-3 text-[10px] text-white/40 relative z-0">
           {referenceClose !== null && (
             <span className="inline-flex items-center gap-1">
               <span className="w-3 h-0 border-t border-dashed border-white/35"></span>
@@ -481,6 +655,18 @@ export function MiniStockChart({
               Extended
             </span>
           )}
+          {supportResistanceLevels?.resistance.length ? (
+            <span className="inline-flex items-center gap-1">
+              <span className="w-3 h-0 border-t-2 border-dotted border-orange-500/80"></span>
+              Resist
+            </span>
+          ) : null}
+          {supportResistanceLevels?.support.length ? (
+            <span className="inline-flex items-center gap-1">
+              <span className="w-3 h-0 border-t-2 border-dotted border-cyan-500/80"></span>
+              Support
+            </span>
+          ) : null}
           {!isDataComplete && (
             <span className="inline-flex items-center gap-1 text-yellow-500/70">
               <span className="w-3 h-2 rounded-sm bg-gradient-to-r from-gray-500/30 to-transparent border-l border-dashed border-gray-500/50"></span>

@@ -40,6 +40,15 @@ export interface HistoryCacheEntry {
 }
 
 /**
+ * Extended history for support/resistance calculations.
+ * Always fetched as 3-month daily data regardless of chart period.
+ */
+export interface ExtendedHistoryEntry {
+  history: HistoryPoint[];
+  fetchedAt: Date;
+}
+
+/**
  * Price data with 52-week range for analysis.
  */
 export interface PriceData {
@@ -83,10 +92,12 @@ export class DataCacheService {
   // Cache stores
   private priceCache: Map<string, CacheEntry<PriceData>> = new Map();
   private historyCache: Map<string, HistoryCacheEntry> = new Map();
-  
+  private extendedHistoryCache: Map<string, ExtendedHistoryEntry> = new Map();
+
   // Current state
   private tickers: string[] = [];
   private chartPeriod: string = '1d';
+  private extendedHistoryFetched: boolean = false;
   
   // Refresh control
   private refreshConfig: RefreshConfig = {
@@ -100,6 +111,7 @@ export class DataCacheService {
   private priceListeners: Set<CacheListener<PriceData>> = new Set();
   private historyListeners: Set<CacheListener<HistoryCacheEntry>> = new Set();
   private batchHistoryListeners: Set<() => void> = new Set();
+  private extendedHistoryListeners: Set<CacheListener<ExtendedHistoryEntry>> = new Set();
   
   // Timestamps for staleness
   private lastPricesFetchedAt: Date | null = null;
@@ -173,12 +185,34 @@ export class DataCacheService {
   getTickers(): string[] {
     return [...this.tickers];
   }
-  
+
   /**
    * Check if refresh loop is running.
    */
   isRefreshing(): boolean {
     return this.refreshLoopRunning;
+  }
+
+  /**
+   * Get extended history for a ticker (used for support/resistance calculation).
+   * This is always 3-month daily data, regardless of chart period.
+   */
+  getExtendedHistory(ticker: string): ExtendedHistoryEntry | null {
+    return this.extendedHistoryCache.get(ticker) ?? null;
+  }
+
+  /**
+   * Get all extended history entries.
+   */
+  getAllExtendedHistory(): Map<string, ExtendedHistoryEntry> {
+    return new Map(this.extendedHistoryCache);
+  }
+
+  /**
+   * Check if extended history has been fetched.
+   */
+  hasExtendedHistory(): boolean {
+    return this.extendedHistoryFetched;
   }
   
   // ============================================================================
@@ -199,11 +233,14 @@ export class DataCacheService {
     for (const ticker of removedTickers) {
       this.priceCache.delete(ticker);
       this.historyCache.delete(ticker);
+      this.extendedHistoryCache.delete(ticker);
     }
-    
+
     // Fetch history for new tickers if we have any
     if (newTickers.length > 0 && this.refreshConfig.enabled) {
       this.fetchBatchHistory(newTickers).catch(console.error);
+      // Also fetch extended history for S/R calculations
+      this.fetchExtendedHistory(newTickers).catch(console.error);
     }
   }
   
@@ -254,6 +291,14 @@ export class DataCacheService {
   onBatchHistoryComplete(listener: () => void): () => void {
     this.batchHistoryListeners.add(listener);
     return () => this.batchHistoryListeners.delete(listener);
+  }
+
+  /**
+   * Subscribe to extended history updates (for support/resistance).
+   */
+  onExtendedHistoryUpdate(listener: CacheListener<ExtendedHistoryEntry>): () => void {
+    this.extendedHistoryListeners.add(listener);
+    return () => this.extendedHistoryListeners.delete(listener);
   }
   
   // ============================================================================
@@ -349,6 +394,46 @@ export class DataCacheService {
     }
   }
   
+  /**
+   * Fetch extended history (6 months) for support/resistance calculations.
+   * This is fetched once in the background after initial load.
+   */
+  async fetchExtendedHistory(tickers: string[]): Promise<void> {
+    if (tickers.length === 0) return;
+
+    console.log(`[DataCache] Fetching extended history (6mo) for ${tickers.length} tickers for S/R calculation`);
+    const startTime = Date.now();
+
+    try {
+      // Fetch 6-month daily data for accurate S/R calculations
+      const historyData = await api.getBatchHistory(tickers, '6mo');
+      const now = new Date();
+
+      const elapsed = Date.now() - startTime;
+      console.log(`[DataCache] Extended history fetch completed in ${elapsed}ms`);
+
+      for (const [ticker, data] of Object.entries(historyData)) {
+        if (!data?.history?.length) continue;
+
+        const entry: ExtendedHistoryEntry = {
+          history: data.history,
+          fetchedAt: now
+        };
+
+        this.extendedHistoryCache.set(ticker, entry);
+
+        // Notify extended history listeners
+        for (const listener of this.extendedHistoryListeners) {
+          listener(ticker, entry);
+        }
+      }
+
+      this.extendedHistoryFetched = true;
+    } catch (err) {
+      console.error('[DataCache] Failed to fetch extended history:', err);
+    }
+  }
+
   /**
    * Fetch single ticker history (for modals viewing different period).
    */
@@ -455,8 +540,18 @@ export class DataCacheService {
       if (this.tickers.length > 0) {
         await this.fetchBatchHistory(this.tickers);
         console.log('[DataCache] Initial history fetch complete, starting price loop');
+
+        // Fetch extended history in background for S/R calculations
+        // (only fetch for tickers we don't already have extended history for)
+        const tickersNeedingExtended = this.tickers.filter(
+          t => !this.extendedHistoryCache.has(t)
+        );
+        if (tickersNeedingExtended.length > 0) {
+          // Fire and forget - don't block the price loop
+          this.fetchExtendedHistory(tickersNeedingExtended).catch(console.error);
+        }
       }
-      
+
       // Price refresh loop
       while (this.refreshConfig.enabled && !this.abortController.signal.aborted) {
         const cycleStartTime = Date.now();
@@ -506,6 +601,8 @@ export class DataCacheService {
   clear(): void {
     this.priceCache.clear();
     this.historyCache.clear();
+    this.extendedHistoryCache.clear();
+    this.extendedHistoryFetched = false;
     this.lastPricesFetchedAt = null;
     this.lastHistoryFetchedAt = null;
   }

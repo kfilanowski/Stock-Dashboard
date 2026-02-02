@@ -565,8 +565,8 @@ class PriceHistoryService:
             weekday = dt.weekday()
             if weekday >= 5:
                 return False
-            # Market could be active 4am - 8pm
-            return 4 <= hour < 20
+            # Market could be active 4am - 8pm (inclusive, to catch final candle)
+            return 4 <= hour <= 20
         
         # KEY FIX: Check if we need today's data
         # If we're in trading hours and our latest data is from a previous day,

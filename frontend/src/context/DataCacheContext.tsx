@@ -6,11 +6,12 @@
  */
 
 import React, { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
-import { 
-  DataCacheService, 
-  getDataCache, 
-  type PriceData, 
-  type HistoryCacheEntry 
+import {
+  DataCacheService,
+  getDataCache,
+  type PriceData,
+  type HistoryCacheEntry,
+  type ExtendedHistoryEntry
 } from '../services/dataCache';
 
 // ============================================================================
@@ -20,25 +21,28 @@ import {
 interface DataCacheContextValue {
   // The cache service instance
   cache: DataCacheService;
-  
+
   // Price data (reactive state for components)
   prices: Map<string, PriceData>;
-  
+
   // History data (reactive state for components)
   historyData: Map<string, HistoryCacheEntry>;
-  
+
+  // Extended history for S/R calculations (always 3-month daily data)
+  extendedHistoryData: Map<string, ExtendedHistoryEntry>;
+
   // Timestamps for UI indicators
   lastPricesFetched: Date | null;
   lastHistoryFetched: Date | null;
-  
+
   // Current chart period
   chartPeriod: string;
-  
+
   // Actions
   setChartPeriod: (period: string) => Promise<void>;
   setTickers: (tickers: string[]) => void;
   refreshHistory: (ticker: string) => Promise<void>;
-  
+
   // Status
   isRefreshing: boolean;
 }
@@ -69,6 +73,7 @@ export function DataCacheProvider({
   // Reactive state for components
   const [prices, setPrices] = useState<Map<string, PriceData>>(new Map());
   const [historyData, setHistoryData] = useState<Map<string, HistoryCacheEntry>>(new Map());
+  const [extendedHistoryData, setExtendedHistoryData] = useState<Map<string, ExtendedHistoryEntry>>(new Map());
   const [lastPricesFetched, setLastPricesFetched] = useState<Date | null>(null);
   const [lastHistoryFetched, setLastHistoryFetched] = useState<Date | null>(null);
   const [chartPeriod, setChartPeriodState] = useState(initialChartPeriod);
@@ -115,7 +120,13 @@ export function DataCacheProvider({
       setHistoryData(new Map(cache.getAllHistory()));
       setLastHistoryFetched(cache.getLastHistoryFetchedAt());
     });
-    
+
+    // Subscribe to extended history updates (for S/R calculations)
+    const unsubExtended = cache.onExtendedHistoryUpdate((ticker, data) => {
+      if (!mountedRef.current) return;
+      setExtendedHistoryData(prev => new Map(prev).set(ticker, data));
+    });
+
     // Start the refresh loop (only once, handles StrictMode double-mount)
     // The cache is a singleton - we don't stop it on unmount because other
     // components may still be using it. The loop runs for the app's lifetime.
@@ -132,6 +143,7 @@ export function DataCacheProvider({
       unsubPrice();
       unsubHistory();
       unsubBatch();
+      unsubExtended();
       // NOTE: We intentionally do NOT stop the refresh loop on unmount.
       // The cache is a singleton shared across the app, and stopping it
       // would break other components. React StrictMode would also cause
@@ -152,10 +164,10 @@ export function DataCacheProvider({
   // Handle tickers change
   const handleSetTickers = useCallback((tickers: string[]) => {
     cache.setTickers(tickers);
-    
+
     // Clean up removed tickers from local state
     const tickerSet = new Set(tickers);
-    
+
     setPrices(prev => {
       const next = new Map<string, PriceData>();
       for (const [t, data] of prev) {
@@ -163,9 +175,17 @@ export function DataCacheProvider({
       }
       return next;
     });
-    
+
     setHistoryData(prev => {
       const next = new Map<string, HistoryCacheEntry>();
+      for (const [t, data] of prev) {
+        if (tickerSet.has(t)) next.set(t, data);
+      }
+      return next;
+    });
+
+    setExtendedHistoryData(prev => {
+      const next = new Map<string, ExtendedHistoryEntry>();
       for (const [t, data] of prev) {
         if (tickerSet.has(t)) next.set(t, data);
       }
@@ -200,6 +220,7 @@ export function DataCacheProvider({
     cache,
     prices,
     historyData,
+    extendedHistoryData,
     lastPricesFetched,
     lastHistoryFetched,
     chartPeriod,

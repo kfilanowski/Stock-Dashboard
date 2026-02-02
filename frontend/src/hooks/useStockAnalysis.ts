@@ -161,14 +161,12 @@ async function processQueue(): Promise<void> {
     const tickers = validRequests.map(r => r.ticker);
     
     try {
-      // Batch fetch data - fetch weights for all 3 strategy classes
+      // Batch fetch data - fetch weights for all 3 strategy classes in a single call
       console.debug(`[Analysis] Batch fetching for ${tickers.length} tickers (Horizon: ${targetHorizon})`);
-      const [batchHistories, batchAnalysisData, directionalWeights, premiumSellWeights, premiumBuyWeights] = await Promise.all([
+      const [batchHistories, batchAnalysisData, batchWeights] = await Promise.all([
         getBatchHistory(tickers, '1y'),
         getBatchAnalysis(tickers),
-        getBatchWeights(tickers, targetHorizon, 'directional'),
-        getBatchWeights(tickers, targetHorizon, 'premium_sell'),
-        getBatchWeights(tickers, targetHorizon, 'premium_buy')
+        getBatchWeights(tickers, targetHorizon, 'directional,premium_sell,premium_buy')
       ]);
       
       // Process each ticker
@@ -176,44 +174,54 @@ async function processQueue(): Promise<void> {
         validRequests.map(async (request) => {
           const { ticker, horizon, currentPrice, high52w, low52w } = request;
           const requestKey = getCacheKey(ticker, horizon);
-          
+
           try {
             const tickerUpper = ticker.toUpperCase();
 
-            // Build strategy-specific weights map
+            // Build strategy-specific weights map from the batched response
             const strategyWeightsMap: Record<string, Record<string, number>> = {};
             let calibrationMetadata = undefined;
             let isLowConfidence = false;
             let bestSqn: number | null = null;
 
-            // Process each strategy class's weights
-            const strategyResponses = [
-              { key: 'directional', response: directionalWeights },
-              { key: 'premium_sell', response: premiumSellWeights },
-              { key: 'premium_buy', response: premiumBuyWeights }
-            ];
+            // Get the ticker's data from the batched weights response
+            const tickerWeights = batchWeights?.tickers?.[tickerUpper] || batchWeights?.tickers?.[ticker];
 
-            for (const { key, response } of strategyResponses) {
-              const calibrationData = response?.tickers?.[tickerUpper] || response?.tickers?.[ticker];
-              if (calibrationData && !calibrationData.is_default) {
-                strategyWeightsMap[key] = calibrationData.weights as unknown as Record<string, number>;
+            if (tickerWeights?.strategies) {
+              // New multi-strategy response format
+              for (const [stratKey, stratData] of Object.entries(tickerWeights.strategies)) {
+                const data = stratData as unknown as { weights: Record<string, number>; is_default: boolean; sqn: number | null; updated_at: string | null };
+                if (data && !data.is_default) {
+                  strategyWeightsMap[stratKey] = data.weights;
 
-                // Track the best SQN across strategies for confidence assessment
-                if (calibrationData.sqn !== null) {
-                  if (bestSqn === null || calibrationData.sqn > bestSqn) {
-                    bestSqn = calibrationData.sqn;
+                  // Track the best SQN across strategies for confidence assessment
+                  if (data.sqn !== null) {
+                    if (bestSqn === null || data.sqn > bestSqn) {
+                      bestSqn = data.sqn;
+                    }
+                  }
+
+                  // Use directional calibration for metadata (primary strategy)
+                  if (stratKey === 'directional') {
+                    calibrationMetadata = {
+                      lastCalibrated: data.updated_at || new Date().toISOString(),
+                      sqn: data.sqn,
+                      period: batchWeights.horizon
+                    };
                   }
                 }
-
-                // Use directional calibration for metadata (primary strategy)
-                if (key === 'directional') {
-                  calibrationMetadata = {
-                    lastCalibrated: calibrationData.updated_at || new Date().toISOString(),
-                    sqn: calibrationData.sqn,
-                    period: response.horizon
-                  };
-                }
               }
+            } else if (tickerWeights && !tickerWeights.is_default) {
+              // Fallback to single-strategy format (backward compatibility)
+              strategyWeightsMap['directional'] = tickerWeights.weights as unknown as Record<string, number>;
+              if (tickerWeights.sqn !== null) {
+                bestSqn = tickerWeights.sqn;
+              }
+              calibrationMetadata = {
+                lastCalibrated: tickerWeights.updated_at || new Date().toISOString(),
+                sqn: tickerWeights.sqn,
+                period: batchWeights.horizon
+              };
             }
 
             // Determine confidence based on best SQN

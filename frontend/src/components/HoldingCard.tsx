@@ -198,6 +198,7 @@ export function HoldingCard({
       {/* Mini chart */}
       <MiniStockChart
         holdingId={holding.id}
+        ticker={holding.ticker}
         history={history}
         referenceClose={referenceClose}
         isDataComplete={isDataComplete}
