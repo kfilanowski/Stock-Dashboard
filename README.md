@@ -18,6 +18,48 @@ Rather than using static technical indicators, this system:
 4. **Optimizes for different strategies** - Directional trades, premium selling (CSP/CC), and premium buying (long options) each have custom objective functions
 5. **Uses ensemble scoring** - Combines WFO-calibrated weights with regime rules and consensus signals for robustness
 
+## Screenshots
+
+### Portfolio Dashboard
+The main dashboard displays your holdings with real-time prices, action scores, and YTD performance. Each holding shows calibrated recommendations for 6 different trading strategies.
+
+![Portfolio Dashboard](screenshots/dashboard.png)
+
+### Stock Analysis Modal
+Detailed analysis view with comprehensive technical indicators, volume analysis, and regime-aware action recommendations. Each metric shows its signal strength, weight, and contribution to the final score.
+
+![Stock Analysis Modal](screenshots/analysis_modal.png)
+
+### Interactive Price Charts
+Recharts-powered visualizations with technical overlays (SMAs, Bollinger Bands, volume). Supports swing (3-day) and trend (15-day) horizon switching.
+
+![Detailed Chart](screenshots/detailed_chart.png)
+
+### Technical Indicator Breakdown
+Deep dive into each indicator's calculation, current value, and interpretation. Shows how RSI, MACD, ADX, CMF, and other indicators contribute to the ensemble score.
+
+![Detailed Chart Indicators](screenshots/detailed_chart_indicators.png)
+
+### Walk-Forward Optimization Engine
+The calibration dashboard runs WFO across multiple stocks and horizons. Real-time progress via Server-Sent Events (SSE) shows optimization status, rolling window metrics, and out-of-sample validation results.
+
+![WFO Optimizer](screenshots/wfo_optimizer.png)
+
+### Portfolio Configuration
+Manage portfolio settings, allocations, and view aggregate performance. Supports percentage-based allocations with automatic rebalancing calculations.
+
+![Portfolio Settings](screenshots/settings.png)
+
+### Multi-Stock Comparison
+Compare action scores across holdings to identify the best opportunities. Color-coded badges show strength (green = strong signal, red = strong contra-signal).
+
+![Holding Comparison](screenshots/holding_comparison.png)
+
+### Options Integration
+Add option holdings (CSP, CC, long calls/puts) with expiration tracking. The system recommends optimal option strategies based on IV percentile, market regime, and technical setup.
+
+![Add Option Modal](screenshots/add_option_modal.png)
+
 ## Core Innovation: Walk-Forward Optimization (WFO)
 
 ### What is WFO?
